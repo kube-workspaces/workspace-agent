@@ -73,6 +73,10 @@ impl Session {
         self.holder.as_deref()
     }
 
+    pub fn id(&self) -> &str {
+        &self.session_id
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }

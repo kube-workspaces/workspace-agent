@@ -32,6 +32,7 @@ dependencies = [
  "kw-core",
  "kw-platform",
  "kw-protocol",
+ "kw-transport",
  "serde_json",
 ]
 
@@ -58,6 +59,16 @@ dependencies = [
 name = "kw-protocol"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kw-transport"
+version = "0.1.0"
+dependencies = [
+ "kw-core",
+ "kw-protocol",
  "serde",
  "serde_json",
 ]

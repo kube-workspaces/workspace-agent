@@ -17,6 +17,10 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--max-sessions N] [--max-idle-secs N]");
+    eprintln!(
+        "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
+    );
     std::process::exit(code);
 }
 
@@ -99,6 +103,108 @@ fn main() {
                 Ok(beats) => println!("daemon exited after {beats} beats"),
                 Err(error) => {
                     eprintln!("daemon: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("serve") => {
+            let workspace_uid = flag_value(&args, "--workspace-uid").unwrap_or_else(|| {
+                eprintln!("serve: --workspace-uid is required");
+                usage(2);
+            });
+            let workspace_generation =
+                flag_value(&args, "--workspace-generation").unwrap_or_else(|| {
+                    eprintln!("serve: --workspace-generation is required");
+                    usage(2);
+                });
+            let port: u16 = flag_value(&args, "--port")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let max_sessions: u64 = flag_value(&args, "--max-sessions")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let max_idle_secs: u64 = flag_value(&args, "--max-idle-secs")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let server = kw_transport::Server::bind(
+                ("127.0.0.1", port),
+                workspace_uid,
+                workspace_generation,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("serve: bind failed: {error}");
+                std::process::exit(1);
+            });
+            let address = server.local_address().unwrap_or_else(|error| {
+                eprintln!("serve: no local address: {error}");
+                std::process::exit(1);
+            });
+            println!("listening {address}");
+            let mut served = 0u64;
+            let mut idle_since = std::time::Instant::now();
+            // Non-blocking accept would need polling scaffolding; instead the
+            // listener inherits no timeout and serve_one blocks, so max-idle
+            // is enforced between sessions only. Documented, not silent.
+            loop {
+                if max_sessions != 0 && served >= max_sessions {
+                    break;
+                }
+                if max_idle_secs != 0
+                    && served > 0
+                    && idle_since.elapsed().as_secs() >= max_idle_secs
+                {
+                    break;
+                }
+                match server.serve_one() {
+                    Ok(outcome) => {
+                        served += 1;
+                        idle_since = std::time::Instant::now();
+                        println!(
+                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={}",
+                            outcome.ended,
+                            outcome.control_frames,
+                            outcome.media_bytes,
+                            outcome.resize_acks,
+                            outcome.keyframes_forwarded
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("serve: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            println!("serve exited after {served} sessions");
+        }
+        Some("connect-test") => {
+            let server = flag_value(&args, "--server").unwrap_or_else(|| {
+                eprintln!("connect-test: --server ADDR is required");
+                usage(2);
+            });
+            let workspace_uid = flag_value(&args, "--workspace-uid").unwrap_or_else(|| {
+                eprintln!("connect-test: --workspace-uid is required");
+                usage(2);
+            });
+            let workspace_generation =
+                flag_value(&args, "--workspace-generation").unwrap_or_else(|| {
+                    eprintln!("connect-test: --workspace-generation is required");
+                    usage(2);
+                });
+            match kw_transport::client::run(&server, &workspace_uid, &workspace_generation) {
+                Ok(outcome) => {
+                    println!(
+                        "admitted={} resize_paired={} resize_reason={} server_hello={}",
+                        outcome.admitted,
+                        outcome.resize_paired,
+                        outcome.resize_reason,
+                        outcome.server_hello_ok
+                    );
+                    if !(outcome.admitted && outcome.resize_paired && outcome.server_hello_ok) {
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("connect-test: {error}");
                     std::process::exit(1);
                 }
             }

@@ -51,6 +51,11 @@ impl Handshake {
         if message.channel != Channel::Control {
             return Err(Reject::UnknownType);
         }
+        // All control traffic belongs to this socket group's claim, learned
+        // from our hello. A foreign session id is a different claim entirely.
+        if message.session_id != self.session.id() {
+            return Err(Reject::UnknownType);
+        }
         self.control_fence
             .admit(message.generation, message.sent_at_ns)?;
         Ok(())
@@ -175,6 +180,10 @@ impl Handshake {
 
     pub fn admitted(&self) -> bool {
         self.admitted
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session.id()
     }
 
     pub fn holder(&self) -> Option<&str> {
