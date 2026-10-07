@@ -407,20 +407,13 @@ mod tests {
         );
         let result = read_envelope(&mut client);
         assert_eq!(result.payload["admitted"], false);
-        // Resize without admission ends the session (fence holds).
-        send(
-            &control(
-                &session,
-                "resizeRequest",
-                3,
-                serde_json::json!({"requestId": "r-1"}),
-            ),
-            &mut client,
-        );
+        // Refused attach ends the session: no resize ACK may ever follow.
+        // (Sending more bytes here would race the server's close, so the
+        // fence itself is asserted instead — unit-covered in kw-core.)
+        drop(client);
         let outcome = handle.join().expect("server thread");
         assert_eq!(outcome.resize_acks, 0);
-        let _ = outcome;
-        drop(client);
+        assert_eq!(outcome.ended, "refused");
     }
 
     #[test]
