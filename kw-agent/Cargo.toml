@@ -1,0 +1,16 @@
+[package]
+name = "kw-agent"
+version = "0.1.0"
+description = "Workspace agent service binary (platform backends P0-gated)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kw-agent"
+path = "src/main.rs"
+
+[dependencies]
+kw-core = { path = "../kw-core" }
+kw-protocol = { path = "../kw-protocol" }

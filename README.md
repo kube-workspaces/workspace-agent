@@ -25,12 +25,18 @@ guest acceptance.
 |---|---|
 | `docs/protocol/kw-agent-v1.md` | Versioned wire-protocol spec (working name `kw-agent-v1`) |
 | `protocol/v1/vectors/` | Conformance fixtures (JSON) |
+| `kw-protocol/` | Protocol types + validation (Rust; parses every fixture) |
+| `kw-core/` | Session/seat, bounded queues, resize debounce (pure logic) |
+| `kw-agent/` | Service binary skeleton (platform stubs; backends P0-gated) |
 | `tools/validate_fixtures.py` | Fixture validator (no dependencies) |
 | `tools/test_validate_fixtures.py` | Validator unit tests |
 
 ## Checks
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
 python3 tools/validate_fixtures.py
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```

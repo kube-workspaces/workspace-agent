@@ -10,13 +10,16 @@ generic, public-safe code and docs only.
 ## Commands
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
 python3 tools/validate_fixtures.py          # validate protocol fixtures
 python3 -m unittest discover -s tools -p 'test_*.py'  # unit tests
 ```
 
-Rust guest-service CI (fmt/clippy/tests, Windows + Linux jobs) is added
-after P0 freezes the language/media/dependency set. Do not add it early
-as an unpinned placeholder.
+Rust guest-service CI (fmt/clippy/tests, Windows + Linux jobs) is active
+(`.github/workflows/rust.yml`). Capture/input/display/audio backends remain
+P0-gated: `kw-agent` performs no privileged operations yet.
 
 ## Conventions
 
