@@ -121,7 +121,8 @@ mod inner {
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT,
         MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
         MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
-        MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_VERSION,
+        MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+        MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -178,6 +179,10 @@ mod inner {
         )?;
         hr(
             line!(),
+            input.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, ((1u64) << 32) | 1),
+        )?;
+        hr(
+            line!(),
             input.SetUINT32(&MF_MT_DEFAULT_STRIDE, settings.width),
         )?;
         let output = hr(line!(), MFCreateMediaType())?;
@@ -212,6 +217,14 @@ mod inner {
         hr(
             line!(),
             output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, settings.max_keyframe_spacing),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, ((1u64) << 32) | 1),
         )?;
         // Output type first: this MFT validates the input/output pair
         // eagerly and reports TYPE_NOT_SET when the input arrives first.
