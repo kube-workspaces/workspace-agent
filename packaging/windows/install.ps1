@@ -44,7 +44,9 @@ foreach ($account in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
 }
 Set-Acl -LiteralPath $DataDir -AclObject $acl
 
-# One-use enrollment token, consumed on first daemon start.
+# One-use enrollment token, consumed on first daemon start. Written BOM-less:
+# PowerShell 5.1 `Set-Content -Encoding UTF8` emits a BOM (the agent tolerates
+# one, but do not rely on it).
 $bytes = New-Object byte[] 32
 [void][Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
 $token = [ordered]@{
@@ -53,7 +55,10 @@ $token = [ordered]@{
     workspaceGeneration = $WorkspaceGeneration
     expiresAt = [int64](Get-Date -UFormat %s) + $TokenHours * 3600
 }
-$token | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $DataDir 'enrollment-token.json') -Encoding UTF8
+[System.IO.File]::WriteAllText(
+    (Join-Path $DataDir 'enrollment-token.json'),
+    ($token | ConvertTo-Json),
+    (New-Object System.Text.UTF8Encoding $false))
 
 $action = New-ScheduledTaskAction -Execute (Join-Path $BinDir 'kw-agent.exe') `
     -Argument "daemon --workspace-uid `"$WorkspaceUid`" --workspace-generation `"$WorkspaceGeneration`" --data-dir `"$DataDir`""

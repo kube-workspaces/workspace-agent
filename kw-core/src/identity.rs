@@ -127,7 +127,12 @@ pub fn enroll(
         return Ok(identity);
     }
     let text = std::fs::read_to_string(token_path(data_dir)).map_err(|_| EnrollError::Invalid)?;
-    let token: EnrollmentToken = serde_json::from_str(&text).map_err(|_| EnrollError::Invalid)?;
+    // Tolerate a UTF-8 BOM (Windows PowerShell 5.1 `Set-Content -Encoding
+    // UTF8` emits one). The installer writes BOM-less UTF-8; this keeps
+    // enrollment robust against hand-staged tokens too.
+    let token: EnrollmentToken =
+        serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text))
+            .map_err(|_| EnrollError::Invalid)?;
     check_token(&token, workspace_uid, workspace_generation, now_secs)?;
     let identity = Identity {
         agent_key_hex: generate_key_hex()?,
@@ -230,6 +235,17 @@ mod tests {
             "restart preserves identity"
         );
         assert_ne!(first.agent_key_hex, "00".repeat(32), "key is random");
+    }
+
+    #[test]
+    fn enroll_tolerates_utf8_bom() {
+        // Windows PowerShell 5.1 `Set-Content -Encoding UTF8` emits a BOM.
+        let dir = scratch("bom");
+        let mut text = String::from("\u{feff}");
+        text.push_str(&serde_json::to_string(&token()).expect("token json"));
+        std::fs::write(token_path(&dir), text).expect("stage token");
+        let identity = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls despite BOM");
+        assert_eq!(identity.agent_key_hex.len(), 64);
     }
 
     #[test]
