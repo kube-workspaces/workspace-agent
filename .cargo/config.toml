@@ -1,0 +1,5 @@
+# Windows GNU cross toolchain (MinGW-w64). Native MSVC link.exe is not
+# required; CI builds Windows on windows-latest with the default MSVC
+# toolchain, while this config lets Linux check cross-builds the same way.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

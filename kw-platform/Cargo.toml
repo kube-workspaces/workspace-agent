@@ -1,0 +1,24 @@
+[package]
+name = "kw-platform"
+version = "0.1.0"
+description = "OS backends: capability inventory first, capture/media P0-gated"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }

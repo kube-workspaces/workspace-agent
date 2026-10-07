@@ -29,3 +29,8 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: cargo run -p kw-agent --locked -- --version
+      # Windows runners have real inbox APIs: --hello must emit valid JSON.
+      - if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- --hello > hello.json
+      - if: matrix.os == 'windows-latest'
+        run: python -c "import json; d=json.load(open('hello.json')); assert d['protocol']=='kw-agent-v1', d"

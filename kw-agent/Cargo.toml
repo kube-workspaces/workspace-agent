@@ -13,4 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 kw-core = { path = "../kw-core" }
+kw-platform = { path = "../kw-platform" }
 kw-protocol = { path = "../kw-protocol" }
+serde_json = "1"
