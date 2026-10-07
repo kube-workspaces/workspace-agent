@@ -258,22 +258,18 @@ mod inner {
             hr(line!(), sample.SetSampleTime(index as i64 * step_100ns))?;
             hr(line!(), sample.SetSampleDuration(step_100ns))?;
             hr(line!(), encoder.ProcessInput(0, &sample, 0))?;
-            drain(&encoder, &mut chunks, false)?;
+            drain(&encoder, &mut chunks)?;
         }
         hr(
             line!(),
             encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
         )?;
-        drain(&encoder, &mut chunks, true)?;
+        drain(&encoder, &mut chunks)?;
         hr(line!(), MFShutdown())?;
         Ok(chunks)
     }
 
-    unsafe fn drain(
-        encoder: &IMFTransform,
-        chunks: &mut Vec<Chunk>,
-        at_end: bool,
-    ) -> Result<(), Error> {
+    unsafe fn drain(encoder: &IMFTransform, chunks: &mut Vec<Chunk>) -> Result<(), Error> {
         loop {
             let mut buffer = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
@@ -286,9 +282,9 @@ mod inner {
             let mut status = 0u32;
             match encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) {
                 Ok(()) => {}
-                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT && !at_end => {
-                    return Ok(())
-                }
+                // Nothing more to emit right now: mid-stream it means feed
+                // more input; at end-of-stream it means fully drained.
+                Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
                 Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     // Encoder renegotiated its output type mid-stream; accept
                     // the new type and keep draining. Visible in chunk
