@@ -1,12 +1,10 @@
-//! WASAPI loopback capture backend.
+//! WASAPI loopback capture backend plus pure-Rust Opus voice codec.
 //!
-//! Captures the default render endpoint's mix: endpoint → client → mix
-//! format → shared loopback init → packet pump. Silence is reported, never
-//! hidden — an idle room is the expected case without playback.
-//!
-//! Only Windows is implemented; other platforms return [`Error::Gated`].
-//! Content routing (console session) is a P2 session-helper concern, proven
-//! out of scope by the session-0 tone test.
+//! Capture: default render endpoint's mix (see [`capture_loopback`]).
+//! Codec: 48kHz stereo 20ms Opus via `opus-rs` (no C, no FFI) — see [`opus`].
+//! Silence is reported, never hidden.
+
+pub mod opus;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +26,8 @@ pub enum Error {
     /// No active render endpoint to tap.
     NoEndpoint,
     Os(u32),
+    /// Codec rejected input or failed internally (carries no audio).
+    Codec(String),
 }
 
 impl std::fmt::Display for Error {
@@ -36,6 +36,7 @@ impl std::fmt::Display for Error {
             Error::Gated(what) => write!(f, "audio backend P0-gated: {what}"),
             Error::NoEndpoint => write!(f, "no active render endpoint"),
             Error::Os(code) => write!(f, "wasapi call failed: 0x{code:08x}"),
+            Error::Codec(what) => write!(f, "opus codec: {what}"),
         }
     }
 }

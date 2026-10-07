@@ -42,6 +42,7 @@ dependencies = [
 name = "kw-audio"
 version = "0.1.0"
 dependencies = [
+ "opus-rs",
  "serde",
  "windows",
 ]
@@ -102,6 +103,12 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1880f411a21320dcb546c8f38f05ffb75643362ee0235437487999ed543e26ae"
 
 [[package]]
 name = "proc-macro2"

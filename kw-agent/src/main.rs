@@ -270,9 +270,10 @@ fn main() {
             }
         }
         Some("audio-test") => {
-            // Loopback capture trial. Silence is an honest outcome (nothing
-            // plays); a missing endpoint is environmental unless
-            // --require-endpoint is given. Only backend failure exits nonzero.
+            // Loopback capture trial plus Opus self-check. Silence is an
+            // honest outcome (nothing plays); a missing endpoint is
+            // environmental unless --require-endpoint is given. Only backend
+            // failure exits nonzero.
             let seconds: u64 = flag_value(&args, "--seconds")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(2);
@@ -297,6 +298,40 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            // Opus self-check needs no hardware: silence + tone round-trip.
+            let mut encoder = kw_audio::opus::Encoder::new().unwrap_or_else(|error| {
+                eprintln!("audio-test: {error}");
+                std::process::exit(1);
+            });
+            let mut decoder = kw_audio::opus::Decoder::new().unwrap_or_else(|error| {
+                eprintln!("audio-test: {error}");
+                std::process::exit(1);
+            });
+            let mut opus_bytes = 0usize;
+            for index in 0..5u32 {
+                let mut pcm =
+                    vec![0.0f32; kw_audio::opus::FRAME_SAMPLES * kw_audio::opus::CHANNELS];
+                if index > 0 {
+                    for (i, sample) in pcm.iter_mut().enumerate() {
+                        let t = (i / kw_audio::opus::CHANNELS) as f32;
+                        *sample = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * t / 48_000.0).sin();
+                    }
+                }
+                let packet = encoder.encode_frame(&pcm).unwrap_or_else(|error| {
+                    eprintln!("audio-test: {error}");
+                    std::process::exit(1);
+                });
+                let mut back =
+                    vec![0.0f32; kw_audio::opus::FRAME_SAMPLES * kw_audio::opus::CHANNELS];
+                decoder
+                    .decode_into(&packet, &mut back)
+                    .unwrap_or_else(|error| {
+                        eprintln!("audio-test: {error}");
+                        std::process::exit(1);
+                    });
+                opus_bytes += packet.len();
+            }
+            println!("opus=selfcheck-ok bytes={opus_bytes}");
         }
         _ => usage(2),
     }
