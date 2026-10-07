@@ -213,6 +213,9 @@ mod inner {
             line!(),
             output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, settings.max_keyframe_spacing),
         )?;
+        // Output type first: this MFT validates the input/output pair
+        // eagerly and reports TYPE_NOT_SET when the input arrives first.
+        hr(line!(), encoder.SetOutputType(0, &output, 0))?;
         hr(line!(), encoder.SetInputType(0, &input, 0))?;
         hr(line!(), encoder.GetOutputStreamInfo(0))?;
         let mut chunks = Vec::new();
