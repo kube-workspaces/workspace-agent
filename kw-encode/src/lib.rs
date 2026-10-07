@@ -128,8 +128,8 @@ mod inner {
         COINIT_MULTITHREADED,
     };
 
-    fn hr<T>(result: Result<T, windows::core::Error>) -> Result<T, Error> {
-        result.map_err(|e| Error::Os(e.code().0 as u32))
+    fn hr<T>(line: u32, result: Result<T, windows::core::Error>) -> Result<T, Error> {
+        result.map_err(|e| Error::Stream(format!("line {line}: 0x{:08x}", e.code().0 as u32)))
     }
 
     pub fn encode_nv12(settings: &Settings, frames: &[Vec<u8>]) -> Result<Vec<Chunk>, Error> {
@@ -145,60 +145,111 @@ mod inner {
         frames: &[Vec<u8>],
         frame_bytes: usize,
     ) -> Result<Vec<Chunk>, Error> {
-        hr(MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))?;
-        let encoder: IMFTransform = hr(CoCreateInstance(
-            &CLSID_MSH264EncoderMFT,
-            Option::<&windows::core::IUnknown>::None,
-            CLSCTX_INPROC_SERVER,
-        ))?;
+        hr(line!(), MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))?;
+        let encoder: IMFTransform = hr(
+            line!(),
+            CoCreateInstance(
+                &CLSID_MSH264EncoderMFT,
+                Option::<&windows::core::IUnknown>::None,
+                CLSCTX_INPROC_SERVER,
+            ),
+        )?;
 
-        let input = hr(MFCreateMediaType())?;
-        hr(input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video))?;
-        hr(input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12))?;
-        hr(input.SetUINT64(
-            &MF_MT_FRAME_SIZE,
-            ((settings.width as u64) << 32) | settings.height as u64,
-        ))?;
-        hr(input.SetUINT64(&MF_MT_FRAME_RATE, ((settings.fps as u64) << 32) | 1))?;
-        hr(input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32))?;
-        hr(input.SetUINT32(&MF_MT_DEFAULT_STRIDE, settings.width))?;
-        let output = hr(MFCreateMediaType())?;
-        hr(output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video))?;
-        hr(output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264))?;
-        hr(output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32))?;
-        hr(output.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4.0 as u32))?;
-        hr(output.SetUINT64(
-            &MF_MT_FRAME_SIZE,
-            ((settings.width as u64) << 32) | settings.height as u64,
-        ))?;
-        hr(output.SetUINT64(&MF_MT_FRAME_RATE, ((settings.fps as u64) << 32) | 1))?;
-        hr(output.SetUINT32(&MF_MT_AVG_BITRATE, settings.bitrate_bps))?;
-        hr(output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, settings.max_keyframe_spacing))?;
-        hr(encoder.SetInputType(0, &input, 0))?;
-        hr(encoder.GetOutputStreamInfo(0))?;
+        let input = hr(line!(), MFCreateMediaType())?;
+        hr(
+            line!(),
+            input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video),
+        )?;
+        hr(line!(), input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12))?;
+        hr(
+            line!(),
+            input.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                ((settings.width as u64) << 32) | settings.height as u64,
+            ),
+        )?;
+        hr(
+            line!(),
+            input.SetUINT64(&MF_MT_FRAME_RATE, ((settings.fps as u64) << 32) | 1),
+        )?;
+        hr(
+            line!(),
+            input.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32),
+        )?;
+        hr(
+            line!(),
+            input.SetUINT32(&MF_MT_DEFAULT_STRIDE, settings.width),
+        )?;
+        let output = hr(line!(), MFCreateMediaType())?;
+        hr(
+            line!(),
+            output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video),
+        )?;
+        hr(line!(), output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264))?;
+        hr(
+            line!(),
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4.0 as u32),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                ((settings.width as u64) << 32) | settings.height as u64,
+            ),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT64(&MF_MT_FRAME_RATE, ((settings.fps as u64) << 32) | 1),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT32(&MF_MT_AVG_BITRATE, settings.bitrate_bps),
+        )?;
+        hr(
+            line!(),
+            output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, settings.max_keyframe_spacing),
+        )?;
+        hr(line!(), encoder.SetInputType(0, &input, 0))?;
+        hr(line!(), encoder.GetOutputStreamInfo(0))?;
         let mut chunks = Vec::new();
-        hr(encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0))?;
-        hr(encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))?;
+        hr(
+            line!(),
+            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
+        )?;
+        hr(
+            line!(),
+            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
+        )?;
         let step_100ns: i64 = 10_000_000 / settings.fps as i64;
         for (index, frame) in frames.iter().enumerate() {
-            let buffer = hr(MFCreateMemoryBuffer(frame_bytes as u32))?;
+            let buffer = hr(line!(), MFCreateMemoryBuffer(frame_bytes as u32))?;
             let mut locked: *mut u8 = std::ptr::null_mut();
             let mut max = 0u32;
             let mut current = 0u32;
-            hr(buffer.Lock(&mut locked, Some(&mut max), Some(&mut current)))?;
+            hr(
+                line!(),
+                buffer.Lock(&mut locked, Some(&mut max), Some(&mut current)),
+            )?;
             std::ptr::copy_nonoverlapping(frame.as_ptr(), locked, frame_bytes);
-            hr(buffer.Unlock())?;
-            hr(buffer.SetCurrentLength(frame_bytes as u32))?;
-            let sample = hr(MFCreateSample())?;
-            hr(sample.AddBuffer(&buffer))?;
-            hr(sample.SetSampleTime(index as i64 * step_100ns))?;
-            hr(sample.SetSampleDuration(step_100ns))?;
-            hr(encoder.ProcessInput(0, &sample, 0))?;
+            hr(line!(), buffer.Unlock())?;
+            hr(line!(), buffer.SetCurrentLength(frame_bytes as u32))?;
+            let sample = hr(line!(), MFCreateSample())?;
+            hr(line!(), sample.AddBuffer(&buffer))?;
+            hr(line!(), sample.SetSampleTime(index as i64 * step_100ns))?;
+            hr(line!(), sample.SetSampleDuration(step_100ns))?;
+            hr(line!(), encoder.ProcessInput(0, &sample, 0))?;
             drain(&encoder, &mut chunks, false)?;
         }
-        hr(encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0))?;
+        hr(
+            line!(),
+            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+        )?;
         drain(&encoder, &mut chunks, true)?;
-        hr(MFShutdown())?;
+        hr(line!(), MFShutdown())?;
         Ok(chunks)
     }
 
@@ -212,9 +263,9 @@ mod inner {
                 dwStreamID: 0,
                 ..Default::default()
             };
-            let backing = hr(MFCreateMemoryBuffer(4 * 1024 * 1024))?;
-            let sample = hr(MFCreateSample())?;
-            hr(sample.AddBuffer(&backing))?;
+            let backing = hr(line!(), MFCreateMemoryBuffer(4 * 1024 * 1024))?;
+            let sample = hr(line!(), MFCreateSample())?;
+            hr(line!(), sample.AddBuffer(&backing))?;
             buffer.pSample = std::mem::ManuallyDrop::new(Some(sample));
             let mut status = 0u32;
             match encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) {
@@ -239,9 +290,12 @@ mod inner {
             let contiguous = sample
                 .ConvertToContiguousBuffer()
                 .map_err(|e| Error::Stream(format!("contiguous: {e:?}")))?;
-            hr(contiguous.Lock(&mut locked, Some(&mut max), Some(&mut current)))?;
+            hr(
+                line!(),
+                contiguous.Lock(&mut locked, Some(&mut max), Some(&mut current)),
+            )?;
             let bytes = std::slice::from_raw_parts(locked, current as usize).to_vec();
-            hr(contiguous.Unlock())?;
+            hr(line!(), contiguous.Unlock())?;
             let types = super::nal_types(&bytes);
             let timestamp = sample
                 .GetSampleTime()
