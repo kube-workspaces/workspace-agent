@@ -31,6 +31,16 @@ $ErrorActionPreference = 'Stop'
 
 $exe = Join-Path $PSScriptRoot 'kw-agent.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "kw-agent.exe not found next to install.ps1" }
+
+# Idempotent reinstall: stop a running previous version first (the task holds
+# the binary open while the daemon runs).
+if (Get-ScheduledTask -TaskName 'workspace-agent' -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName 'workspace-agent' -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-ScheduledTask -TaskName 'workspace-agent').State -ne 'Ready' -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+    }
+}
 New-Item -ItemType Directory -Force -Path $BinDir, $DataDir | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $BinDir 'kw-agent.exe') -Force
 
