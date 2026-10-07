@@ -32,7 +32,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// One display mode from the OS mode list.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct DisplayMode {
     pub width: u32,
     pub height: u32,
@@ -41,7 +41,7 @@ pub struct DisplayMode {
 }
 
 /// One attached output and its OS mode list.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct OutputInfo {
     pub name: String,
     pub attached: bool,
@@ -51,7 +51,7 @@ pub struct OutputInfo {
 }
 
 /// One graphics adapter: identity, memory, D3D11 reachability, outputs.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct AdapterInfo {
     pub description: String,
     pub vendor_id: u32,
@@ -65,7 +65,7 @@ pub struct AdapterInfo {
 
 /// Capability inventory for `hello`. Matches the spec's hello fields that
 /// are measurable without enrollment or streaming.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Inventory {
     pub agent_version: String,
     pub platform: String,
