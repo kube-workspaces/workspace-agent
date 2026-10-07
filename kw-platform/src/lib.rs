@@ -33,6 +33,7 @@ impl std::error::Error for Error {}
 
 /// One display mode from the OS mode list.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DisplayMode {
     pub width: u32,
     pub height: u32,
@@ -42,6 +43,7 @@ pub struct DisplayMode {
 
 /// One attached output and its OS mode list.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutputInfo {
     pub name: String,
     pub attached: bool,
@@ -52,6 +54,7 @@ pub struct OutputInfo {
 
 /// One graphics adapter: identity, memory, D3D11 reachability, outputs.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdapterInfo {
     pub description: String,
     pub vendor_id: u32,
@@ -66,6 +69,7 @@ pub struct AdapterInfo {
 /// Capability inventory for `hello`. Matches the spec's hello fields that
 /// are measurable without enrollment or streaming.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub agent_version: String,
     pub platform: String,
@@ -369,5 +373,38 @@ mod tests {
                 "linux capture/audio/display adapters (P5)"
             ))
         );
+    }
+
+    #[test]
+    fn inventory_serializes_camel_case() {
+        // The wire spec uses camelCase (sessionId, vendorId, ...). A rename
+        // regression here would fork the protocol silently.
+        let value = serde_json::to_value(super::Inventory {
+            agent_version: "x".into(),
+            platform: "windows-amd64".into(),
+            d3d11_warp_ok: true,
+            adapters: vec![super::AdapterInfo {
+                description: "Intel".into(),
+                vendor_id: 0x8086,
+                device_id: 0x3ea5,
+                dedicated_vram_bytes: 1,
+                software: false,
+                d3d11_ok: true,
+                d3d11_level: 0xb000,
+                outputs: vec![],
+            }],
+            audio_render_endpoints: vec![],
+            software_h264_encoders: vec![],
+        })
+        .expect("serializes");
+        assert_eq!(
+            value["vendorId"],
+            serde_json::Value::Null,
+            "top level has no vendorId"
+        );
+        assert_eq!(value["adapters"][0]["vendorId"], 0x8086);
+        assert_eq!(value["adapters"][0]["deviceId"], 0x3ea5);
+        assert_eq!(value["adapters"][0]["d3d11Ok"], true);
+        assert!(value["adapters"][0].get("vendor_id").is_none());
     }
 }
