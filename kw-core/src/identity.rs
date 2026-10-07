@@ -124,6 +124,24 @@ pub fn enroll(
     now_secs: u64,
 ) -> Result<Identity, EnrollError> {
     if let Some(identity) = load(data_dir)? {
+        // Restart path: keep the stable identity. A staged token for the
+        // SAME binding is spent (a reinstall staging a fresh token must not
+        // leave live tokens at rest); anything else is left for diagnosis.
+        if let Ok(text) = std::fs::read_to_string(token_path(data_dir)) {
+            let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            if let Ok(token) = serde_json::from_str::<EnrollmentToken>(body) {
+                if check_token(
+                    &token,
+                    &identity.workspace_uid,
+                    &identity.workspace_generation,
+                    now_secs,
+                )
+                .is_ok()
+                {
+                    let _ = std::fs::remove_file(token_path(data_dir));
+                }
+            }
+        }
         return Ok(identity);
     }
     let text = std::fs::read_to_string(token_path(data_dir)).map_err(|_| EnrollError::Invalid)?;
@@ -246,6 +264,49 @@ mod tests {
         std::fs::write(token_path(&dir), text).expect("stage token");
         let identity = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls despite BOM");
         assert_eq!(identity.agent_key_hex.len(), 64);
+    }
+
+    #[test]
+    fn reinstall_consumes_same_binding_token() {
+        let dir = scratch("reinstall");
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&token()).expect("token json"),
+        )
+        .expect("stage token");
+        let first = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls");
+        // A reinstall stages a fresh token for the same binding.
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&token()).expect("token json"),
+        )
+        .expect("stage token");
+        let second = enroll(&dir, "ws-1", "gen-1", 1500).expect("reuses");
+        assert_eq!(first.agent_key_hex, second.agent_key_hex);
+        assert!(!token_path(&dir).exists(), "spent token consumed");
+    }
+
+    #[test]
+    fn foreign_token_survives_reuse_for_diagnosis() {
+        let dir = scratch("foreign");
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&token()).expect("token json"),
+        )
+        .expect("stage token");
+        let first = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls");
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&EnrollmentToken {
+                workspace_uid: "other".into(),
+                ..token()
+            })
+            .expect("token json"),
+        )
+        .expect("stage token");
+        let second = enroll(&dir, "ws-1", "gen-1", 1500).expect("reuses");
+        assert_eq!(first.agent_key_hex, second.agent_key_hex);
+        assert!(token_path(&dir).exists(), "foreign token left alone");
     }
 
     #[test]
