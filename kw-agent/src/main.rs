@@ -22,7 +22,7 @@ fn usage(code: i32) -> ! {
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
     );
     eprintln!("  kw-agent encode-test [--width W] [--height H] [--frames N] [--bitrate-bps B]");
-    eprintln!("  kw-agent audio-test [--seconds N]");
+    eprintln!("  kw-agent audio-test [--seconds N] [--require-endpoint]");
     std::process::exit(code);
 }
 
@@ -271,10 +271,12 @@ fn main() {
         }
         Some("audio-test") => {
             // Loopback capture trial. Silence is an honest outcome (nothing
-            // plays); only backend failure exits nonzero.
+            // plays); a missing endpoint is environmental unless
+            // --require-endpoint is given. Only backend failure exits nonzero.
             let seconds: u64 = flag_value(&args, "--seconds")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(2);
+            let require = args.iter().any(|arg| arg == "--require-endpoint");
             match kw_audio::capture_loopback(seconds) {
                 Ok(capture) => {
                     println!(
@@ -286,6 +288,9 @@ fn main() {
                         capture.frames,
                         capture.silent
                     );
+                }
+                Err(kw_audio::Error::NoEndpoint) if !require => {
+                    println!("no active render endpoint (environment)");
                 }
                 Err(error) => {
                     eprintln!("audio-test: {error}");
