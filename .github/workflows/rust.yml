@@ -37,3 +37,6 @@ jobs:
       # The inbox H.264 MFT must encode synthetic frames on Windows.
       - if: matrix.os == 'windows-latest'
         run: cargo run -p kw-agent --locked -- encode-test --frames 30
+      # WASAPI loopback must initialize on Windows (silence is an ok outcome).
+      - if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- audio-test --seconds 2

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kw-protocol", "kw-core", "kw-platform", "kw-transport", "kw-encode", "kw-agent"]
+members = ["kw-protocol", "kw-core", "kw-platform", "kw-transport", "kw-encode", "kw-audio", "kw-agent"]
 resolver = "2"
 
 [workspace.package]

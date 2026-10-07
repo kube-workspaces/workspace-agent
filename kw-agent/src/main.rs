@@ -22,6 +22,7 @@ fn usage(code: i32) -> ! {
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
     );
     eprintln!("  kw-agent encode-test [--width W] [--height H] [--frames N] [--bitrate-bps B]");
+    eprintln!("  kw-agent audio-test [--seconds N]");
     std::process::exit(code);
 }
 
@@ -264,6 +265,30 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("encode-test: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("audio-test") => {
+            // Loopback capture trial. Silence is an honest outcome (nothing
+            // plays); only backend failure exits nonzero.
+            let seconds: u64 = flag_value(&args, "--seconds")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2);
+            match kw_audio::capture_loopback(seconds) {
+                Ok(capture) => {
+                    println!(
+                        "rate={} channels={} bits={} packets={} frames={} silent={}",
+                        capture.mix_rate,
+                        capture.mix_channels,
+                        capture.mix_bits,
+                        capture.packets,
+                        capture.frames,
+                        capture.silent
+                    );
+                }
+                Err(error) => {
+                    eprintln!("audio-test: {error}");
                     std::process::exit(1);
                 }
             }

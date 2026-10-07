@@ -12,6 +12,7 @@ name = "kw-agent"
 path = "src/main.rs"
 
 [dependencies]
+kw-audio = { path = "../kw-audio" }
 kw-core = { path = "../kw-core" }
 kw-encode = { path = "../kw-encode" }
 kw-platform = { path = "../kw-platform" }
