@@ -30,6 +30,7 @@ name = "kw-agent"
 version = "0.1.0"
 dependencies = [
  "kw-core",
+ "kw-encode",
  "kw-platform",
  "kw-protocol",
  "kw-transport",
@@ -44,6 +45,14 @@ dependencies = [
  "kw-protocol",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kw-encode"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "windows",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ fn usage(code: i32) -> ! {
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
     );
+    eprintln!("  kw-agent encode-test [--width W] [--height H] [--frames N] [--bitrate-bps B]");
     std::process::exit(code);
 }
 
@@ -205,6 +206,64 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("connect-test: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("encode-test") => {
+            // Synthetic NV12 gradient through the real software encoder.
+            // Proves the media pipeline without capture hardware or a session.
+            let settings = kw_encode::Settings {
+                width: flag_value(&args, "--width")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(320),
+                height: flag_value(&args, "--height")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(240),
+                fps: 30,
+                bitrate_bps: flag_value(&args, "--bitrate-bps")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(2_000_000),
+                max_keyframe_spacing: 30,
+            };
+            let frames: u32 = flag_value(&args, "--frames")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30);
+            let (width, height) = (settings.width as usize, settings.height as usize);
+            let mut input = Vec::with_capacity(frames as usize);
+            for index in 0..frames {
+                let mut frame = vec![128u8; width * height * 3 / 2];
+                for y in 0..height {
+                    for x in 0..width {
+                        frame[y * width + x] = (x + y + index as usize) as u8;
+                    }
+                }
+                input.push(frame);
+            }
+            match kw_encode::encode_nv12(&settings, &input) {
+                Ok(chunks) => {
+                    let total: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+                    let keyframes = chunks.iter().filter(|chunk| chunk.keyframe).count();
+                    let first_types: Vec<u8> = chunks
+                        .iter()
+                        .flat_map(|chunk| chunk.nal_types.clone())
+                        .take(8)
+                        .collect();
+                    println!(
+                        "chunks={n} bytes={total} keyframes={keyframes} first_nals={first_types:?}",
+                        n = chunks.len()
+                    );
+                    if !(first_types.contains(&7)
+                        && first_types.contains(&8)
+                        && keyframes > 0
+                        && total > 1024)
+                    {
+                        eprintln!("encode-test: output missing SPS/PPS/IDR or trivial");
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("encode-test: {error}");
                     std::process::exit(1);
                 }
             }

@@ -34,3 +34,6 @@ jobs:
         run: cargo run -p kw-agent --locked -- --hello > hello.json
       - if: matrix.os == 'windows-latest'
         run: python -c "import json; d=json.load(open('hello.json')); assert d['protocol']=='kw-agent-v1', d"
+      # The inbox H.264 MFT must encode synthetic frames on Windows.
+      - if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- encode-test --frames 30
