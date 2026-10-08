@@ -340,20 +340,13 @@ mod inner {
         /// created — two live MFTs never overlap. Returns trailing output
         /// of the old GOP, if any.
         unsafe fn rebuild(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
-            // TEMPORARY crash markers (STATUS_ACCESS_VIOLATION triage): each
-            // eprintln lands unbuffered in CI logs; the last visible marker
-            // precedes the faulting call. Removed once located.
             let mut trailing = Vec::new();
             if let Some(old) = self.encoder.take() {
                 drain(&old, &mut trailing)?;
-                eprintln!("MARK rebuild: drained");
                 hr(
                     line!(),
                     old.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
                 )?;
-                eprintln!("MARK rebuild: EOS sent");
-                drop(old);
-                eprintln!("MARK rebuild: old released");
             }
             let encoder: IMFTransform = hr(
                 line!(),
@@ -363,9 +356,8 @@ mod inner {
                     CLSCTX_INPROC_SERVER,
                 ),
             )?;
-            eprintln!("MARK rebuild: created");
             configure_types(&encoder, settings)?;
-            eprintln!("MARK rebuild: configured");
+            hr(line!(), encoder.GetOutputStreamInfo(0))?;
             hr(line!(), encoder.GetOutputStreamInfo(0))?;
             hr(
                 line!(),
@@ -375,7 +367,6 @@ mod inner {
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
             )?;
-            eprintln!("MARK rebuild: streaming");
             self.encoder = Some(encoder);
             self.settings = settings.clone();
             self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
@@ -676,10 +667,21 @@ mod tests {
                 .expect("streaming push works");
         }
         let frame = gradient(settings.width, settings.height, 5);
-        let forced = encoder
+        let mut post: Vec<Chunk> = encoder
             .push(&frame, 5 * step, true)
             .expect("forced-IDR push works");
-        let types: Vec<u8> = forced
+        // Fresh MFTs buffer lookahead before emitting: the IDR for the
+        // forced frame arrives within the next few inputs, not necessarily
+        // synchronously with it. Drain forward and judge the accumulation.
+        for index in 6..9i64 {
+            let frame = gradient(settings.width, settings.height, index as u8);
+            post.extend(
+                encoder
+                    .push(&frame, index * step, false)
+                    .expect("post-IDR push works"),
+            );
+        }
+        let types: Vec<u8> = post
             .iter()
             .flat_map(|chunk| chunk.nal_types.clone())
             .collect();
@@ -690,7 +692,7 @@ mod tests {
         );
         let trailing = encoder.finish().expect("finish drains");
         assert!(
-            !forced.is_empty() || !trailing.is_empty(),
+            !post.is_empty() || !trailing.is_empty(),
             "stream produced output"
         );
     }
@@ -711,13 +713,18 @@ mod tests {
         };
         encoder.reconfigure(&small).expect("mid-stream reconfigure");
         assert_eq!(encoder.settings().width, 160);
-        let frame = gradient(160, 120, 1);
-        let chunks = encoder
-            .push(&frame, step, true)
-            .expect("post-reconfigure push");
-        assert!(!chunks.is_empty(), "encoder emits at the new size");
+        let mut post = Vec::new();
+        for index in 1..4i64 {
+            let frame = gradient(160, 120, index as u8);
+            post.extend(
+                encoder
+                    .push(&frame, index * step, false)
+                    .expect("post-reconfigure push"),
+            );
+        }
+        assert!(!post.is_empty(), "encoder emits at the new size");
         let trailing = encoder.finish().expect("finish");
-        let total: usize = chunks
+        let total: usize = post
             .iter()
             .chain(trailing.iter())
             .map(|chunk| chunk.bytes.len())
