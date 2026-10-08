@@ -220,61 +220,67 @@ mod inner {
     /// Rebuilds are demand-paced (session starts, reconfigures, coalesced
     /// viewer demands), never per-frame.
     pub struct Stream {
-        // Option so rebuild/finish can release the old transform BEFORE the
-        // new one exists: two live MFT instances never overlap, and finish
-        // takes (rather than forgets) the last one. None only transiently
-        // inside these methods, never observed by callers.
-        encoder: Option<IMFTransform>,
+        // Field drop order is declaration order: the live transform goes
+        // first, then MF, then COM — always a legal teardown sequence.
+        current: Option<Mft>,
+        _mf: MfGuard,
+        _com: ComGuard,
         settings: Settings,
         frame_bytes: usize,
         step_100ns: i64,
         finished: bool,
     }
 
+    /// One streaming MFT instance. Replaced (never reconfigured in place):
+    /// the inbox software MFT does not survive mid-stream surgery, so a
+    /// fresh instance opens every GOP segment with SPS/PPS/IDR.
+    struct Mft {
+        encoder: IMFTransform,
+    }
+
+    /// CoInitializeEx owner: Uninitialize on drop. One per Stream.
+    struct ComGuard;
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    /// MFStartup owner: Shutdown on drop. One per Stream.
+    struct MfGuard;
+    impl Drop for MfGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = MFShutdown();
+            }
+        }
+    }
+
     impl Stream {
         pub fn new(settings: &Settings) -> Result<Self, Error> {
-            let frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
             let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            let built = unsafe { Self::build(settings, frame_bytes) };
-            if built.is_err() {
-                unsafe { CoUninitialize() };
-            }
-            built
-        }
-
-        unsafe fn build(settings: &Settings, frame_bytes: usize) -> Result<Self, Error> {
-            hr(line!(), MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))?;
-            let build_result: Result<Self, Error> = (|| {
-                let encoder: IMFTransform = hr(
-                    line!(),
-                    CoCreateInstance(
-                        &CLSID_MSH264EncoderMFT,
-                        Option::<&windows::core::IUnknown>::None,
-                        CLSCTX_INPROC_SERVER,
-                    ),
-                )?;
-                configure_types(&encoder, settings)?;
-                hr(line!(), encoder.GetOutputStreamInfo(0))?;
-                hr(
-                    line!(),
-                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
-                )?;
-                hr(
-                    line!(),
-                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
-                )?;
-                Ok(Self {
-                    encoder: Some(encoder),
-                    settings: settings.clone(),
-                    frame_bytes,
-                    step_100ns: 10_000_000 / settings.fps.max(1) as i64,
-                    finished: false,
-                })
-            })();
-            if build_result.is_err() {
-                hr(line!(), MFShutdown()).ok();
-            }
-            build_result
+            let com = ComGuard;
+            let mf = unsafe {
+                match hr(line!(), MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)) {
+                    Ok(()) => MfGuard,
+                    Err(error) => {
+                        drop(com);
+                        return Err(error);
+                    }
+                }
+            };
+            // `?` below drops guards in reverse order (MFShutdown, then
+            // CoUninitialize) — always balanced.
+            let current = unsafe { Mft::start(settings) }?;
+            Ok(Self {
+                current: Some(current),
+                _mf: mf,
+                _com: com,
+                settings: settings.clone(),
+                frame_bytes: settings.width as usize * settings.height as usize * 3 / 2,
+                step_100ns: 10_000_000 / settings.fps.max(1) as i64,
+                finished: false,
+            })
         }
 
         pub fn settings(&self) -> &Settings {
@@ -291,7 +297,7 @@ mod inner {
             timestamp_100ns: i64,
             force_idr: bool,
         ) -> Result<Vec<Chunk>, Error> {
-            if self.finished {
+            if self.finished || self.current.is_none() {
                 return Err(Error::Stream("push after finish".into()));
             }
             let mut chunks = Vec::new();
@@ -300,10 +306,10 @@ mod inner {
                 // behavior of this MFT). Trailing old-GOP output is valid
                 // P-frames against already-sent references — emitted, never
                 // dropped.
-                chunks.extend(unsafe { self.rebuild(&self.settings.clone()) }?);
+                chunks.extend(unsafe { self.replace(&self.settings.clone()) }?);
             }
             unsafe {
-                let encoder = self.encoder.as_ref().expect("live transform");
+                let encoder = &self.current.as_ref().expect("live transform").encoder;
                 let buffer = hr(line!(), MFCreateMemoryBuffer(self.frame_bytes as u32))?;
                 let mut locked: *mut u8 = std::ptr::null_mut();
                 let mut max = 0u32;
@@ -325,34 +331,67 @@ mod inner {
             }
         }
         pub fn reconfigure(&mut self, settings: &Settings) -> Result<(), Error> {
-            if self.finished {
+            if self.finished || self.current.is_none() {
                 return Err(Error::Stream("reconfigure after finish".into()));
             }
-            // Same rebuild path as forced IDR: drain under the old type,
-            // swap the pair between frames. The next push emits the new
-            // configuration; callers force an IDR alongside.
-            let trailing = unsafe { self.rebuild(settings) }?;
+            // Same replacement path as forced IDR: the next push emits the
+            // new configuration; callers force an IDR alongside.
+            let trailing = unsafe { self.replace(settings) }?;
             debug_assert!(
                 trailing.is_empty(),
-                "rebuild drain must not emit without new input"
+                "replacement drain must not emit without new input"
             );
             Ok(())
         }
 
-        /// Drain the old transform, release it fully, then stream a fresh
-        /// one under `settings` (COM/MF lifetime stays with the enclosing
-        /// Stream). The old instance is Released before the new one is
-        /// created — two live MFTs never overlap. Returns trailing output
-        /// of the old GOP, if any.
-        unsafe fn rebuild(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
+        /// Drain the live transform, release it fully, then stream a fresh
+        /// one under `settings`. The old instance (and its EOS signal) is
+        /// gone before the new one is created — two live MFTs never
+        /// overlap. Returns trailing output of the old GOP, if any.
+        unsafe fn replace(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
             let mut trailing = Vec::new();
-            if let Some(old) = self.encoder.take() {
-                drain(&old, &mut trailing)?;
+            if let Some(old) = self.current.take() {
+                drain(&old.encoder, &mut trailing)?;
                 hr(
                     line!(),
-                    old.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+                    old.encoder
+                        .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
                 )?;
+                // `old` drops here: Release runs before the new instance.
             }
+            let current = Mft::start(settings)?;
+            self.current = Some(current);
+            self.settings = settings.clone();
+            self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
+            self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
+            Ok(trailing)
+        }
+
+        pub fn finish(mut self) -> Result<Vec<Chunk>, Error> {
+            let current = self
+                .current
+                .take()
+                .ok_or_else(|| Error::Stream("finish without a live transform".into()))?;
+            let mut chunks = Vec::new();
+            unsafe {
+                hr(
+                    line!(),
+                    current
+                        .encoder
+                        .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+                )?;
+                drain(&current.encoder, &mut chunks)?;
+            }
+            self.finished = true;
+            // Guards drop here: MFShutdown, then CoUninitialize, in order.
+            Ok(chunks)
+        }
+    }
+
+    impl Mft {
+        /// Create, configure and start streaming one transform instance.
+        /// COM/MF lifetime stays with the enclosing Stream.
+        unsafe fn start(settings: &Settings) -> Result<Self, Error> {
             let encoder: IMFTransform = hr(
                 line!(),
                 CoCreateInstance(
@@ -363,7 +402,6 @@ mod inner {
             )?;
             configure_types(&encoder, settings)?;
             hr(line!(), encoder.GetOutputStreamInfo(0))?;
-            hr(line!(), encoder.GetOutputStreamInfo(0))?;
             hr(
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
@@ -372,30 +410,7 @@ mod inner {
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
             )?;
-            self.encoder = Some(encoder);
-            self.settings = settings.clone();
-            self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
-            self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
-            Ok(trailing)
-        }
-
-        pub fn finish(mut self) -> Result<Vec<Chunk>, Error> {
-            let encoder = self
-                .encoder
-                .take()
-                .ok_or_else(|| Error::Stream("finish without a live transform".into()))?;
-            let mut chunks = Vec::new();
-            unsafe {
-                hr(
-                    line!(),
-                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
-                )?;
-                drain(&encoder, &mut chunks)?;
-                hr(line!(), MFShutdown())?;
-                CoUninitialize();
-            }
-            self.finished = true;
-            Ok(chunks)
+            Ok(Self { encoder })
         }
     }
 
@@ -405,14 +420,14 @@ mod inner {
                 return;
             }
             // Abandoned mid-stream: signal EOS best-effort (unread output is
-            // dropped by design — no silent partial GOP), then release.
-            // Option content drops (Release) after this block either way.
+            // dropped by design — no silent partial GOP). Field order drops
+            // the transform first, then MF, then COM.
             unsafe {
-                if let Some(encoder) = self.encoder.as_ref() {
-                    let _ = encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                if let Some(current) = self.current.as_ref() {
+                    let _ = current
+                        .encoder
+                        .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
                 }
-                let _ = MFShutdown();
-                CoUninitialize();
             }
         }
     }
