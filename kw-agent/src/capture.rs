@@ -69,18 +69,24 @@ pub fn run(
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
     let mut index: u64 = 0;
     let mut next_tick = anchor;
+    let mut last_frame = None;
     loop {
         if gate.ended.load(Ordering::SeqCst) {
             break;
         }
-        let frame = match duplicator.capture(kw_platform::capture::DXGI_TIMEOUT_DEFAULT_MS) {
-            Ok(Some(frame)) => frame,
+        match duplicator.capture(kw_platform::capture::DXGI_TIMEOUT_DEFAULT_MS) {
+            Ok(Some(frame)) => last_frame = Some(frame),
+            // A fresh MFT buffers input before emitting its first access unit.
+            // An idle desktop must still give new viewers decodable pixels;
+            // reuse the last real capture at the bounded DXGI timeout cadence.
+            Ok(None) if last_frame.is_some() => {}
             Ok(None) => continue,
             Err(kw_platform::Error::SessionLost(_)) => {
                 eprintln!("capture: session lost, rebuilding duplicator");
                 match kw_platform::capture::Duplicator::new(0) {
                     Ok(fresh) => {
                         duplicator = fresh;
+                        last_frame = None;
                         let (w, h) = duplicator.padded_size();
                         if w != encoder.settings().width || h != encoder.settings().height {
                             if let Err(error) = encoder.reconfigure(&kw_encode::Settings {
@@ -107,7 +113,8 @@ pub fn run(
                 eprintln!("capture: {error}");
                 return;
             }
-        };
+        }
+        let frame = last_frame.as_ref().expect("real capture before encoding");
         // Pacing: present-driven would burst on activity; cadence keeps the
         // encoder (and viewers) at the negotiated frame rate.
         next_tick += cadence;
