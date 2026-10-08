@@ -215,7 +215,11 @@ mod inner {
     /// Rebuilds are demand-paced (session starts, reconfigures, coalesced
     /// viewer demands), never per-frame.
     pub struct Stream {
-        encoder: IMFTransform,
+        // Option so rebuild/finish can release the old transform BEFORE the
+        // new one exists: two live MFT instances never overlap, and finish
+        // takes (rather than forgets) the last one. None only transiently
+        // inside these methods, never observed by callers.
+        encoder: Option<IMFTransform>,
         settings: Settings,
         frame_bytes: usize,
         step_100ns: i64,
@@ -255,7 +259,7 @@ mod inner {
                     encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
                 )?;
                 Ok(Self {
-                    encoder,
+                    encoder: Some(encoder),
                     settings: settings.clone(),
                     frame_bytes,
                     step_100ns: 10_000_000 / settings.fps.max(1) as i64,
@@ -294,6 +298,7 @@ mod inner {
                 chunks.extend(unsafe { self.rebuild(&self.settings.clone()) }?);
             }
             unsafe {
+                let encoder = self.encoder.as_ref().expect("live transform");
                 let buffer = hr(line!(), MFCreateMemoryBuffer(self.frame_bytes as u32))?;
                 let mut locked: *mut u8 = std::ptr::null_mut();
                 let mut max = 0u32;
@@ -309,9 +314,8 @@ mod inner {
                 hr(line!(), sample.AddBuffer(&buffer))?;
                 hr(line!(), sample.SetSampleTime(timestamp_100ns))?;
                 hr(line!(), sample.SetSampleDuration(self.step_100ns))?;
-                hr(line!(), self.encoder.ProcessInput(0, &sample, 0))?;
-                let mut chunks = Vec::new();
-                drain(&self.encoder, &mut chunks)?;
+                hr(line!(), encoder.ProcessInput(0, &sample, 0))?;
+                drain(encoder, &mut chunks)?;
                 Ok(chunks)
             }
         }
@@ -330,17 +334,21 @@ mod inner {
             Ok(())
         }
 
-        /// Drain the old transform, drop it, and stream a fresh one under
-        /// `settings` (COM/MF lifetime stays with the enclosing Stream).
-        /// Returns trailing output of the old GOP, if any.
+        /// Drain the old transform, release it fully, then stream a fresh
+        /// one under `settings` (COM/MF lifetime stays with the enclosing
+        /// Stream). The old instance is Released before the new one is
+        /// created — two live MFTs never overlap. Returns trailing output
+        /// of the old GOP, if any.
         unsafe fn rebuild(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
             let mut trailing = Vec::new();
-            drain(&self.encoder, &mut trailing)?;
-            hr(
-                line!(),
-                self.encoder
-                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
-            )?;
+            if let Some(old) = self.encoder.take() {
+                drain(&old, &mut trailing)?;
+                hr(
+                    line!(),
+                    old.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+                )?;
+                // `old` drops here: Release runs before CoCreateInstance.
+            }
             let encoder: IMFTransform = hr(
                 line!(),
                 CoCreateInstance(
@@ -359,29 +367,29 @@ mod inner {
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
             )?;
-            self.encoder = encoder;
+            self.encoder = Some(encoder);
             self.settings = settings.clone();
             self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
             self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
             Ok(trailing)
         }
 
-        pub fn finish(self) -> Result<Vec<Chunk>, Error> {
-            // Suppress Drop (which would release the same objects): the
-            // resources move out logically here and are released below.
-            let mut this = std::mem::ManuallyDrop::new(self);
+        pub fn finish(mut self) -> Result<Vec<Chunk>, Error> {
+            let encoder = self
+                .encoder
+                .take()
+                .ok_or_else(|| Error::Stream("finish without a live transform".into()))?;
             let mut chunks = Vec::new();
             unsafe {
                 hr(
                     line!(),
-                    this.encoder
-                        .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
                 )?;
-                drain(&this.encoder, &mut chunks)?;
+                drain(&encoder, &mut chunks)?;
                 hr(line!(), MFShutdown())?;
                 CoUninitialize();
             }
-            this.finished = true;
+            self.finished = true;
             Ok(chunks)
         }
     }
@@ -393,10 +401,11 @@ mod inner {
             }
             // Abandoned mid-stream: signal EOS best-effort (unread output is
             // dropped by design — no silent partial GOP), then release.
+            // Option content drops (Release) after this block either way.
             unsafe {
-                let _ = self
-                    .encoder
-                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                if let Some(encoder) = self.encoder.as_ref() {
+                    let _ = encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                }
                 let _ = MFShutdown();
                 CoUninitialize();
             }

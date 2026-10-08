@@ -28,6 +28,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
+        env:
+          # Native crashes (STATUS_ACCESS_VIOLATION) are otherwise
+          # location-free; traces make them actionable.
+          RUST_BACKTRACE: 1
       - run: cargo run -p kw-agent --locked -- --version
       # Windows runners have real inbox APIs: --hello must emit valid JSON.
       - if: matrix.os == 'windows-latest'
