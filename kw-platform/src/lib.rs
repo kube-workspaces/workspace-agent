@@ -1,10 +1,15 @@
-//! OS backends. Only capability inventory exists so far; capture, input,
-//! audio streaming and display-mode management are P0-gated and return
-//! [`Error::Gated`].
+//! OS backends: capability inventory plus the Windows capture backend.
+//! Capture, input, display-mode and audio-streaming backends beyond DXGI
+//! duplication remain P0-gated and return [`Error::Gated`].
 //!
 //! [`inventory`] feeds the `hello` capability advertisement: real adapter,
 //! output, audio-endpoint and encoder data from inbox OS APIs — no drivers
 //! installed, no settings changed, no pixels saved.
+//!
+//! [`capture`] duplicates a desktop output into NV12 frames for the
+//! encoder. Session loss is reported, never hidden.
+
+pub mod capture;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +22,9 @@ pub enum Error {
     Os(u32),
     /// Expected data missing (e.g. no adapters enumerated at all).
     Empty,
+    /// A held session was revoked (mode change, lock, UAC, device
+    /// removal): rebuild the backend, do not end the session for it.
+    SessionLost(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -25,6 +33,7 @@ impl std::fmt::Display for Error {
             Error::Gated(what) => write!(f, "backend P0-gated: {what}"),
             Error::Os(code) => write!(f, "os call failed: 0x{code:08x}"),
             Error::Empty => write!(f, "no data enumerated"),
+            Error::SessionLost(what) => write!(f, "session revoked, rebuild: {what}"),
         }
     }
 }

@@ -5,6 +5,7 @@
 //! binary performs no capture, networking, input injection, mode changes or
 //! privileged operations.
 
+mod capture;
 mod daemon;
 mod platform;
 mod synthetic;
@@ -18,7 +19,7 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N]]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
     );
@@ -152,6 +153,12 @@ fn main() {
             // Absent by default: pure control plane, exactly as before.
             // Boolean flag (no value): present anywhere in argv enables it.
             let synthetic = args.iter().any(|arg| arg == "--synthetic-video");
+            let capture_video = args.iter().any(|arg| arg == "--capture-video");
+            if synthetic && capture_video {
+                eprintln!("serve: --synthetic-video and --capture-video are exclusive");
+                usage(2);
+            }
+            let video = synthetic || capture_video;
             let synth_settings = kw_encode::Settings {
                 width: 320,
                 height: 240,
@@ -199,6 +206,26 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+            let capture_fps: u32 = flag_value(&args, "--capture-fps")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30);
+            let capture_bitrate_bps: u32 = flag_value(&args, "--capture-bitrate-bps")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(2_000_000);
+            let capture_output: u32 = flag_value(&args, "--capture-output")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if capture_video {
+                println!(
+                    "capture video output {capture_output}@{capture_fps}fps {capture_bitrate_bps}bps"
+                );
+                // Fail fast on console visibility (not on pixels: the screen
+                // may legitimately be static at startup).
+                if let Err(error) = kw_platform::capture::Duplicator::new(capture_output) {
+                    eprintln!("serve: {error}");
+                    std::process::exit(2);
+                }
+            }
             let mut served = 0u64;
             let mut idle_since = std::time::Instant::now();
             // Non-blocking accept would need polling scaffolding; instead the
@@ -216,7 +243,7 @@ fn main() {
                 }
                 // Per-session media feed: fresh encoder, fresh GOP, fresh
                 // timestamps every session (joiners land on SPS/PPS/IDR).
-                let (gate, feed_rx, stats, encoder_thread) = if synthetic {
+                let (gate, feed_rx, stats, encoder_thread) = if video {
                     use std::sync::{mpsc, Arc};
                     let gate = Arc::new(kw_transport::MediaGate::default());
                     let stats = Arc::new(kw_transport::MediaStats::default());
@@ -225,14 +252,31 @@ fn main() {
                     let thread_gate = Arc::clone(&gate);
                     let thread_stats = Arc::clone(&stats);
                     let thread_settings = synth_settings.clone();
+                    let source = if capture_video {
+                        "capture"
+                    } else {
+                        "synthetic"
+                    };
                     let encoder_thread = std::thread::spawn(move || {
-                        synthetic::run(
-                            thread_settings,
-                            thread_gate,
-                            feed_tx,
-                            thread_stats,
-                            ready_tx,
-                        )
+                        if capture_video {
+                            capture::run(
+                                capture_output,
+                                capture_fps,
+                                capture_bitrate_bps,
+                                thread_gate,
+                                feed_tx,
+                                thread_stats,
+                                ready_tx,
+                            )
+                        } else {
+                            synthetic::run(
+                                thread_settings,
+                                thread_gate,
+                                feed_tx,
+                                thread_stats,
+                                ready_tx,
+                            )
+                        }
                     });
                     match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
                         Ok(Ok(())) => {}
@@ -241,7 +285,7 @@ fn main() {
                             std::process::exit(2);
                         }
                         Err(_) => {
-                            eprintln!("serve: synthetic encoder did not report readiness");
+                            eprintln!("serve: {source} video did not report readiness");
                             std::process::exit(2);
                         }
                     }
