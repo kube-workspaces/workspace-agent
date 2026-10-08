@@ -11,6 +11,7 @@ mod audio;
 mod capture;
 mod daemon;
 mod platform;
+mod resize;
 mod synthetic;
 
 fn usage(code: i32) -> ! {
@@ -20,6 +21,7 @@ fn usage(code: i32) -> ! {
         platform::describe()
     );
     eprintln!("usage:");
+    eprintln!("  serve --resize enables guest mode changes with --capture-video in the active console session");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
     eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
@@ -206,6 +208,12 @@ fn main() {
                             injector.release();
                         }
                     }
+                    fn status(&self) -> serde_json::Value {
+                        let state = kw_platform::input::session_state();
+                        serde_json::json!({"processSession": state.current,
+                            "activeConsoleSession": state.active_console,
+                            "canInject": state.can_inject()})
+                    }
                 }
                 println!("input injection enabled (session {:?})", state.current);
                 server.with_input(std::sync::Arc::new(InjectorInput(std::sync::Mutex::new(
@@ -225,6 +233,19 @@ fn main() {
             // Boolean flag (no value): present anywhere in argv enables it.
             let synthetic = args.iter().any(|arg| arg == "--synthetic-video");
             let capture_video = args.iter().any(|arg| arg == "--capture-video");
+            let resize_enabled = args.iter().any(|arg| arg == "--resize");
+            let resize_bridge = std::sync::Arc::new(resize::Bridge::default());
+            let server = if resize_enabled {
+                if !capture_video || !kw_platform::input::available() {
+                    eprintln!(
+                        "serve: --resize requires --capture-video in the active console session"
+                    );
+                    std::process::exit(2);
+                }
+                server.with_resize(resize_bridge.clone())
+            } else {
+                server
+            };
             if synthetic && capture_video {
                 eprintln!("serve: --synthetic-video and --capture-video are exclusive");
                 usage(2);
@@ -321,6 +342,8 @@ fn main() {
                 // Video and audio threads share one feed and one session
                 // clock (anchor); each fails its own readiness loudly.
                 let media = video || capture_audio;
+                let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel(1);
+                *resize_bridge.0.lock().expect("resize bridge") = Some(resize_tx);
                 let (gate, feed_rx, stats, media_threads) = if media {
                     use std::sync::{mpsc, Arc};
                     let gate = Arc::new(kw_transport::MediaGate::default());
@@ -353,6 +376,7 @@ fn main() {
                                     thread_stats,
                                     ready_tx,
                                     thread_anchor,
+                                    resize_rx,
                                 )
                             } else {
                                 synthetic::run(

@@ -34,18 +34,19 @@ pub fn run(
     stats: Arc<MediaStats>,
     ready: mpsc::Sender<Result<(), String>>,
     anchor: Instant,
+    resize: mpsc::Receiver<crate::resize::Request>,
 ) {
     let fps = fps.max(1);
-    let mut duplicator = match open_output(output_index) {
+    let mut duplicator = Some(match open_output(output_index) {
         Ok(duplicator) => duplicator,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
-    };
+    });
     let mut encoder = match kw_encode::StreamEncoder::new(&kw_encode::Settings {
-        width: duplicator.padded_size().0,
-        height: duplicator.padded_size().1,
+        width: duplicator.as_ref().expect("opened output").padded_size().0,
+        height: duplicator.as_ref().expect("opened output").padded_size().1,
         fps,
         bitrate_bps,
         max_keyframe_spacing: 60,
@@ -77,11 +78,79 @@ pub fn run(
     let mut index: u64 = 0;
     let mut next_tick = anchor;
     let mut last_frame = None;
+    let mut pending_resize: Option<(crate::resize::Request, kw_platform::display::Size)> = None;
     loop {
         if gate.ended.load(Ordering::SeqCst) {
             break;
         }
-        match duplicator.capture(kw_platform::capture::DXGI_TIMEOUT_DEFAULT_MS) {
+        if pending_resize
+            .as_ref()
+            .is_some_and(|(request, _)| Instant::now() >= request.deadline)
+        {
+            if let Some((request, _)) = pending_resize.take() {
+                let _ = request.reply.send(Err("display-idr-timeout".into()));
+            }
+        }
+        if pending_resize.is_none() {
+            if let Ok(request) = resize.try_recv() {
+                if Instant::now() >= request.deadline {
+                    let _ = request.reply.send(Err("display-resize-expired".into()));
+                    continue;
+                }
+                let changed = kw_platform::display::resize(
+                    output_index,
+                    kw_platform::display::Size {
+                        width: request.width,
+                        height: request.height,
+                    },
+                )
+                .and_then(|actual| {
+                    // DXGI allows one duplication per output per process;
+                    // release the old interface before opening its replacement.
+                    let _ = duplicator.take();
+                    let fresh = loop {
+                        match open_output(output_index) {
+                            Ok(fresh) => break fresh,
+                            Err(error) if Instant::now() >= request.deadline => return Err(error),
+                            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                        }
+                    };
+                    if fresh.size() != (actual.width, actual.height) {
+                        return Err("display-capture-mode-mismatch".into());
+                    }
+                    let (width, height) = fresh.padded_size();
+                    encoder
+                        .reconfigure(&kw_encode::Settings {
+                            width,
+                            height,
+                            fps,
+                            bitrate_bps,
+                            max_keyframe_spacing: 60,
+                        })
+                        .map_err(|error| format!("display-encoder-reconfigure:{error}"))?;
+                    duplicator = Some(fresh);
+                    last_frame = None;
+                    Ok(actual)
+                });
+                match changed {
+                    Ok(actual) => {
+                        pending_resize = Some((request, actual));
+                        gate.force_idr.store(true, Ordering::SeqCst);
+                    }
+                    Err(reason) => {
+                        let _ = request.reply.send(Err(reason));
+                        if duplicator.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        match duplicator
+            .as_mut()
+            .expect("opened output")
+            .capture(kw_platform::capture::DXGI_TIMEOUT_DEFAULT_MS)
+        {
             Ok(Some(frame)) => last_frame = Some(frame),
             // A fresh MFT buffers input before emitting its first access unit.
             // An idle desktop must still give new viewers decodable pixels;
@@ -90,11 +159,12 @@ pub fn run(
             Ok(None) => continue,
             Err(kw_platform::Error::SessionLost(_)) => {
                 eprintln!("capture: session lost, rebuilding duplicator");
-                match kw_platform::capture::Duplicator::new(0) {
+                let _ = duplicator.take();
+                match kw_platform::capture::Duplicator::new(output_index) {
                     Ok(fresh) => {
-                        duplicator = fresh;
+                        duplicator = Some(fresh);
                         last_frame = None;
-                        let (w, h) = duplicator.padded_size();
+                        let (w, h) = duplicator.as_ref().expect("rebuilt output").padded_size();
                         if w != encoder.settings().width || h != encoder.settings().height {
                             if let Err(error) = encoder.reconfigure(&kw_encode::Settings {
                                 width: w,
@@ -139,12 +209,33 @@ pub fn run(
                     if chunk.keyframe {
                         stats.keyframes_sent.fetch_add(1, Ordering::SeqCst);
                     }
+                    let confirmation = if chunk.keyframe && pending_resize.is_some() {
+                        let (written, received) = mpsc::channel();
+                        Some((written, received))
+                    } else {
+                        None
+                    };
                     let packet = MediaPacket {
                         kind: kw_transport::MediaKind::H264,
                         payload: chunk.bytes,
+                        written: confirmation.as_ref().map(|(written, _)| written.clone()),
                     };
                     if feed.send(packet).is_err() {
                         return;
+                    }
+                    if let Some((_, received)) = confirmation {
+                        if let Some((request, actual)) = pending_resize.take() {
+                            let remaining =
+                                request.deadline.saturating_duration_since(Instant::now());
+                            let result = received.recv_timeout(remaining)
+                                .map_err(|_| "display-idr-write-failed".to_owned())
+                                .map(|()| serde_json::json!({
+                                    "requested": {"width": request.width, "height": request.height},
+                                    "actual": {"width": actual.width, "height": actual.height},
+                                    "codecReconfigured": true, "idrSent": true,
+                                }));
+                            let _ = request.reply.send(result);
+                        }
                     }
                 }
             }
@@ -163,6 +254,7 @@ pub fn run(
             let _ = feed.send(MediaPacket {
                 kind: kw_transport::MediaKind::H264,
                 payload: chunk.bytes,
+                written: None,
             });
         }
     }

@@ -30,6 +30,7 @@ pub struct Injector {
     width: i32,
     height: i32,
     buttons: u8,
+    keys: std::collections::BTreeSet<u32>,
 }
 
 impl Injector {
@@ -39,14 +40,22 @@ impl Injector {
             width,
             height,
             buttons: 0,
+            keys: std::collections::BTreeSet::new(),
         })
     }
 
     pub fn key(&mut self, keysym: u32, down: bool) -> Result<(), String> {
-        platform::key(keysym, down)
+        platform::key(keysym, down)?;
+        if down {
+            self.keys.insert(keysym);
+        } else {
+            self.keys.remove(&keysym);
+        }
+        Ok(())
     }
 
     pub fn pointer(&mut self, x: i32, y: i32, buttons: u8) -> Result<(), String> {
+        (self.width, self.height) = platform::screen_metrics()?;
         platform::pointer(&mut self.buttons, self.width, self.height, x, y, buttons)
     }
 
@@ -58,6 +67,9 @@ impl Injector {
     /// disconnect cannot leave a button stuck down on the guest desktop.
     /// Best-effort: a failed release is not worth surfacing.
     pub fn release(&mut self) {
+        for keysym in std::mem::take(&mut self.keys) {
+            let _ = platform::key(keysym, false);
+        }
         platform::release(&mut self.buttons);
     }
 }
@@ -193,7 +205,7 @@ pub fn keysym_to_unicode(keysym: u32) -> Option<u32> {
         0x20..=0x7E | 0xA0..=0xFF => keysym,
         _ => return None,
     };
-    (cp != 0 && cp <= 0xFFFF).then_some(cp)
+    (cp != 0 && char::from_u32(cp).is_some()).then_some(cp)
 }
 
 /// Map a coordinate in `[0, extent)` onto the 0..65535 absolute range
@@ -352,7 +364,14 @@ mod platform {
             if !down {
                 flags |= KEYEVENTF_KEYUP;
             }
-            send(&[key_input(0, cp as u16, flags)])
+            let scalar = char::from_u32(cp).ok_or("input-invalid-unicode")?;
+            let mut units = [0u16; 2];
+            let inputs: Vec<_> = scalar
+                .encode_utf16(&mut units)
+                .iter()
+                .map(|&unit| key_input(0, unit, flags))
+                .collect();
+            send(&inputs)
         } else {
             Err(format!("input-unmapped-keysym: 0x{keysym:08x}"))
         }
@@ -469,6 +488,8 @@ mod tests {
         assert_eq!(keysym_to_unicode(0x00E9), Some(0xE9));
         assert_eq!(keysym_to_unicode(0x0100_0000), None);
         assert_eq!(keysym_to_unicode(0xFF0D), None);
+        assert_eq!(keysym_to_unicode(0x0101_F600), Some(0x1_F600));
+        assert_eq!(keysym_to_unicode(0x0100_D800), None);
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub fn run(
                     let packet = MediaPacket {
                         kind: kw_transport::MediaKind::H264,
                         payload: chunk.bytes,
+                        written: None,
                     };
                     if feed.send(packet).is_err() {
                         return;
@@ -108,6 +109,7 @@ pub fn run(
             let _ = feed.send(MediaPacket {
                 kind: kw_transport::MediaKind::H264,
                 payload: chunk.bytes,
+                written: None,
             });
         }
     }

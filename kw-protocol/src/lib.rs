@@ -60,7 +60,7 @@ pub const INPUT_MAX_WHEEL: i32 = 1000;
 /// Largest pointer coordinate accepted (well beyond any real desktop).
 pub const INPUT_MAX_COORD: i32 = 1_000_000;
 /// Largest X11 keysym accepted (Unicode keysyms live at `0x01000000 | cp`).
-pub const INPUT_MAX_KEYSYM: u32 = 0x0010_FFFF;
+pub const INPUT_MAX_KEYSYM: u32 = 0x0110_FFFF;
 
 /// Viewer→guest input. Fire-and-forget: latency matters more than an ack, so
 /// there is no result message; the guest counts and reports drops in
@@ -163,16 +163,52 @@ pub fn check_envelope(message: &Envelope) -> Result<(), Reject> {
 /// admitted controller and carries no privilege elevation.
 pub fn check_input(event: &InputEvent) -> Result<(), Reject> {
     let ok = match *event {
-        InputEvent::Key { keysym, .. } => keysym <= INPUT_MAX_KEYSYM,
+        InputEvent::Key { keysym, .. } => {
+            keysym <= 0x0010_FFFF
+                || (0x0100_0001..=INPUT_MAX_KEYSYM).contains(&keysym)
+                    && char::from_u32(keysym - 0x0100_0000).is_some()
+        }
         InputEvent::Pointer { x, y, .. } => {
             (0..=INPUT_MAX_COORD).contains(&x) && (0..=INPUT_MAX_COORD).contains(&y)
         }
-        InputEvent::Wheel { dx, dy } => dx.abs() <= INPUT_MAX_WHEEL && dy.abs() <= INPUT_MAX_WHEEL,
+        InputEvent::Wheel { dx, dy } => {
+            (-INPUT_MAX_WHEEL..=INPUT_MAX_WHEEL).contains(&dx)
+                && (-INPUT_MAX_WHEEL..=INPUT_MAX_WHEEL).contains(&dy)
+        }
     };
     if ok {
         Ok(())
     } else {
         Err(Reject::Malformed)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn signed_wheel_extremes_are_rejected_without_overflow() {
+    for delta in [i32::MIN, i32::MAX] {
+        assert_eq!(
+            check_input(&InputEvent::Wheel { dx: delta, dy: 0 }),
+            Err(Reject::Malformed)
+        );
+        assert_eq!(
+            check_input(&InputEvent::Wheel { dx: 0, dy: delta }),
+            Err(Reject::Malformed)
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unicode_keysyms_accept_scalars_and_reject_surrogates() {
+    for keysym in [0x0100_03BB, 0x0101_F600] {
+        assert!(check_input(&InputEvent::Key { keysym, down: true }).is_ok());
+    }
+    for keysym in [0x0100_0000, 0x0100_D800, 0x0020_0000, 0x0111_0000] {
+        assert_eq!(
+            check_input(&InputEvent::Key { keysym, down: true }),
+            Err(Reject::Malformed)
+        );
     }
 }
 

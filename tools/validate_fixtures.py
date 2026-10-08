@@ -16,7 +16,7 @@ MEDIA_TYPES = {"video", "audio"}
 # the Rust validator, or the two disagree about what the protocol allows.
 INPUT_MAX_WHEEL = 1000
 INPUT_MAX_COORD = 1_000_000
-INPUT_MAX_KEYSYM = 0x0010FFFF
+INPUT_MAX_KEYSYM = 0x0110FFFF
 
 
 def check_input(name, payload):
@@ -24,7 +24,10 @@ def check_input(name, payload):
     kind = payload.get("kind")
     if kind == "key":
         keysym = payload.get("keysym")
-        if not isinstance(keysym, int) or isinstance(keysym, bool) or not 0 <= keysym <= INPUT_MAX_KEYSYM:
+        if (not isinstance(keysym, int) or isinstance(keysym, bool)
+                or not (0 <= keysym <= 0x0010FFFF
+                        or 0x01000001 <= keysym <= INPUT_MAX_KEYSYM
+                        and not 0x0100D800 <= keysym <= 0x0100DFFF)):
             ok = fail(f"{name}: key keysym out of range") and False
         if not isinstance(payload.get("down"), bool):
             ok = fail(f"{name}: key down must be a boolean") and False

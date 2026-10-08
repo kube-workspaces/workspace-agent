@@ -141,6 +141,7 @@ pub fn run(
                     .send(MediaPacket {
                         kind: kw_transport::MediaKind::Opus,
                         payload: packet,
+                        written: None,
                     })
                     .is_err()
                 {

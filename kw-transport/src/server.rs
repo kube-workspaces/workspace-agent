@@ -63,6 +63,8 @@ pub struct MediaGate {
 pub struct MediaPacket {
     pub kind: MediaKind,
     pub payload: Vec<u8>,
+    /// Optional completion after this packet is actually written to the socket.
+    pub written: Option<mpsc::Sender<()>>,
 }
 
 /// Counters shared between the encoder thread (knows chunks) and the
@@ -97,6 +99,14 @@ pub trait Input: Send + Sync {
     /// Best-effort release of anything the backend is holding (mouse buttons).
     /// Called when a session ends so a disconnect cannot leave a button stuck.
     fn reset(&self) {}
+    fn status(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+}
+
+/// Resize includes the mode change, encoder rebuild and a delivered fresh IDR.
+pub trait Resize: Send + Sync {
+    fn resize(&self, width: u32, height: u32) -> Result<serde_json::Value, String>;
 }
 
 fn write_envelope(writer: &SharedWriter, message: &Envelope) -> Result<(), String> {
@@ -120,6 +130,7 @@ pub struct Server {
     agent_version: String,
     clipboard: Option<Arc<dyn Clipboard>>,
     input: Option<Arc<dyn Input>>,
+    resize: Option<Arc<dyn Resize>>,
 }
 
 impl Server {
@@ -136,6 +147,7 @@ impl Server {
             agent_version: env!("CARGO_PKG_VERSION").into(),
             clipboard: None,
             input: None,
+            resize: None,
         })
     }
 
@@ -156,6 +168,11 @@ impl Server {
         self
     }
 
+    pub fn with_resize(mut self, resize: Arc<dyn Resize>) -> Self {
+        self.resize = Some(resize);
+        self
+    }
+
     /// Serve exactly one connection, then return its outcome. The host loop
     /// decides whether to accept another (single-controller discipline means
     /// concurrent sessions are never multiplexed here).
@@ -170,6 +187,7 @@ impl Server {
             None,
             self.clipboard.as_deref(),
             self.input.as_deref(),
+            self.resize.as_deref(),
         ))
     }
 
@@ -193,6 +211,7 @@ impl Server {
             Some((gate, feed, stats)),
             self.clipboard.as_deref(),
             self.input.as_deref(),
+            self.resize.as_deref(),
         ))
     }
 }
@@ -238,6 +257,7 @@ fn serve_connection(
     media: Option<(Arc<MediaGate>, mpsc::Receiver<MediaPacket>, Arc<MediaStats>)>,
     clipboard: Option<&dyn Clipboard>,
     input: Option<&dyn Input>,
+    resize: Option<&dyn Resize>,
 ) -> SessionOutcome {
     let mut outcome = SessionOutcome::default();
     // The session claim is minted here and advertised in our hello; clients
@@ -295,6 +315,9 @@ fn serve_connection(
                             .fetch_add(packet.payload.len() as u64, Ordering::SeqCst);
                     }
                 }
+                if let Some(written) = packet.written {
+                    let _ = written.send(());
+                }
             }
         })
     });
@@ -310,10 +333,11 @@ fn serve_connection(
             "role": "controller-only",
             "capabilityEpoch": 1,
             "clipboardText": clipboard.is_some(),
+            "telemetryAvailable": true,
             // Honest capability flags: input reflects whether a backend is
             // wired; real guest resize lands with the display mode manager.
             "inputAvailable": input.is_some(),
-            "resizeAvailable": false,
+            "resizeAvailable": resize.is_some(),
         }),
     );
     if write_envelope(&writer, &hello).is_err() {
@@ -363,6 +387,7 @@ fn serve_connection(
                     &mut idr_signaled,
                     clipboard,
                     input,
+                    resize,
                 ) {
                     if outcome.ended.is_empty() {
                         outcome.ended = "refused".into();
@@ -412,6 +437,7 @@ fn serve_control(
     idr_signaled: &mut u64,
     clipboard: Option<&dyn Clipboard>,
     input: Option<&dyn Input>,
+    resize: Option<&dyn Resize>,
 ) -> bool {
     match message.message_type.as_str() {
         "clipboardGet" | "clipboardSet" => {
@@ -508,14 +534,25 @@ fn serve_control(
                 .to_owned();
             match handshake.resize_request(message) {
                 Ok(_paired) => {
-                    // No display backend yet: pair honestly, NACK the mode.
-                    let ack = envelope(
-                        "resizeAck",
-                        *sequence,
-                        handshake.session_id(),
-                        0,
-                        resize_nack(&id, "display-backend-p0-gated"),
-                    );
+                    let dimensions = message.payload["width"]
+                        .as_u64()
+                        .zip(message.payload["height"].as_u64())
+                        .filter(|(w, h)| (320..=8192).contains(w) && (200..=8192).contains(h));
+                    let mut payload = match resize {
+                        Some(backend) => match dimensions {
+                            Some((width, height)) => backend
+                                .resize(width as u32, height as u32)
+                                .unwrap_or_else(|reason| resize_nack(&id, &reason)),
+                            None => resize_nack(&id, "display-invalid-size"),
+                        },
+                        None => resize_nack(&id, "display-backend-p0-gated"),
+                    };
+                    payload["requestId"] = serde_json::json!(id);
+                    if let Some((width, height)) = dimensions {
+                        payload["requested"] =
+                            serde_json::json!({"width": width, "height": height});
+                    }
+                    let ack = envelope("resizeAck", *sequence, handshake.session_id(), 0, payload);
                     *sequence += 1;
                     outcome.resize_acks += 1;
                     write_envelope(writer, &ack).is_ok()
@@ -575,7 +612,26 @@ fn serve_control(
                 true
             }
         },
-        "telemetry" | "displayOwnership" | "capabilities" => true,
+        "telemetry" => {
+            if handshake.telemetry_request(message).is_err() {
+                return false;
+            }
+            let reply = envelope(
+                "telemetry",
+                *sequence,
+                handshake.session_id(),
+                0,
+                serde_json::json!({
+                    "inputEvents": outcome.input_events, "inputDropped": outcome.input_dropped,
+                    "resizeAcks": outcome.resize_acks,
+                    "inputAvailable": input.is_some(), "resizeAvailable": resize.is_some(),
+                    "session": input.map(|backend| backend.status()),
+                }),
+            );
+            *sequence += 1;
+            write_envelope(writer, &reply).is_ok()
+        }
+        "displayOwnership" | "capabilities" => true,
         "bye" => {
             outcome.ended = "peer-bye".into();
             false
@@ -819,18 +875,24 @@ mod tests {
         let session = attach_client(&mut client);
         // Feed two units post-admission; the client must receive both intact.
         for payload in [vec![0x11u8; 64], vec![0x22u8; 128]] {
+            let (written, completed) = mpsc::channel();
             tx.send(MediaPacket {
                 kind: MediaKind::H264,
                 payload: payload.clone(),
+                written: Some(written),
             })
             .expect("feed");
             let (kind, back) = read_media(&mut client);
             assert_eq!(kind, MediaKind::H264);
             assert_eq!(back, payload);
+            completed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("socket write completion");
         }
         tx.send(MediaPacket {
             kind: MediaKind::Opus,
             payload: vec![0x33; 24],
+            written: None,
         })
         .unwrap();
         let (kind, payload) = read_media(&mut client);
@@ -939,6 +1001,75 @@ mod tests {
         assert!(read_frame(&mut client).unwrap().is_none());
     }
 
+    struct TestResize;
+    impl Resize for TestResize {
+        fn resize(&self, width: u32, height: u32) -> Result<serde_json::Value, String> {
+            if width == 800 {
+                return Err("display-mode-unsupported".into());
+            }
+            Ok(serde_json::json!({
+                "actual": {"width": width, "height": height},
+                "codecReconfigured": true, "idrSent": true,
+            }))
+        }
+    }
+
+    #[test]
+    fn resize_ack_pairs_actual_mode_and_failure_reason() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_resize(Arc::new(TestResize));
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["resizeAvailable"], true);
+        let session = hello.session_id;
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket": test_ticket(&session)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        for (seq, width, reason) in [
+            (3, 1024, None),
+            (4, 800, Some("display-mode-unsupported")),
+            (5, 1, Some("display-invalid-size")),
+        ] {
+            let id = format!("resize-{seq}");
+            send(
+                &control(
+                    &session,
+                    "resizeRequest",
+                    seq,
+                    serde_json::json!({"requestId": id, "width": width, "height": 768}),
+                ),
+                &mut client,
+            );
+            let ack = read_envelope(&mut client);
+            assert_eq!(ack.message_type, "resizeAck");
+            assert_eq!(ack.payload["requestId"], id);
+            if let Some(reason) = reason {
+                assert_eq!(ack.payload["reason"], reason);
+                assert_eq!(ack.payload["idrSent"], false);
+            } else {
+                assert_eq!(ack.payload["actual"]["width"], width);
+                assert_eq!(ack.payload["requested"]["width"], width);
+                assert_eq!(ack.payload["codecReconfigured"], true);
+                assert_eq!(ack.payload["idrSent"], true);
+            }
+        }
+        send(
+            &control(&session, "bye", 6, serde_json::json!({})),
+            &mut client,
+        );
+        assert_eq!(handle.join().unwrap().resize_acks, 3);
+    }
+
     #[derive(Default)]
     struct RecordingInput {
         events: Mutex<Vec<String>>,
@@ -1028,7 +1159,15 @@ mod tests {
             &mut client,
         );
         send(
-            &control(&session, "bye", 7, serde_json::json!({})),
+            &control(&session, "telemetry", 7, serde_json::json!({})),
+            &mut client,
+        );
+        let telemetry = read_envelope(&mut client);
+        assert_eq!(telemetry.message_type, "telemetry");
+        assert_eq!(telemetry.payload["inputEvents"], 3);
+        assert_eq!(telemetry.payload["inputDropped"], 1);
+        send(
+            &control(&session, "bye", 8, serde_json::json!({})),
             &mut client,
         );
         let outcome = handle.join().expect("server thread");

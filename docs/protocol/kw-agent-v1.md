@@ -65,7 +65,8 @@ to a fresh IDR.
   reason and admits no input.
 - `input`: viewer→guest input, sent only by the admitted controller and only
   when `hello.inputAvailable` is true. Carries a `kind` tag:
-  `{"kind":"key","keysym":N,"down":bool}` (X11 keysym, up to `0x0010FFFF`),
+  `{"kind":"key","keysym":N,"down":bool}` (X11 keysym, named/legacy values
+  up to `0x0010FFFF` or `0x01000000 | scalar` for Unicode, excluding NUL/surrogates),
   `{"kind":"pointer","x":N,"y":N,"buttons":N}` (logical guest desktop
   coordinates, RFB-style button bitmask `0..255`), or
   `{"kind":"wheel","dx":N,"dy":N}` (steps, positive right/down, `|d| ≤ 1000`).
@@ -77,6 +78,13 @@ to a fresh IDR.
 - `resizeAck`: echoes `requestId`, reports requested vs actual dimensions
   or a machine-readable reason; sent within the bounded timeout. New codec
   config + IDR follows an actual mode change.
+  Windows opts in with `serve --capture-video --resize` in the interactive
+  console session. The selected capture output is changed temporarily (no
+  registry persistence); unsupported dimensions are NACKed. Success requires
+  capture/encoder reconstruction and a fresh IDR written to the socket before
+  the ACK. Requests are bounded to 320–8192 by 200–8192 pixels and a ten-second
+  response window. A failure after a mode change can leave that mode applied;
+  `codecReconfigured`/`idrSent` stay false unless the full pipeline completes.
 - `displayOwnership`: control-epoch grant/renew/release; input is released
   on disconnect, focus loss or epoch change.
 - Clipboard text is an additive capability: `hello.payload.clipboardText`
@@ -95,6 +103,11 @@ to a fresh IDR.
   are paired by request ID. Viewers discard late results and suppress echoes.
 - `telemetry`: timings/counters/capability reasons only. Never clipboard,
   input content or credentials.
+  With `hello.telemetryAvailable`, an admitted controller may request a
+  snapshot by sending an empty telemetry payload. Reply fields include
+  `inputEvents`, `inputDropped`, `resizeAcks` and optional process/active-console
+  session IDs and `canInject`. Native clients request this at most once a
+  second; content and keysyms are never included.
 - `bye`: orderly teardown with reason; receivers release held input and
   cancel the premium generation before any console fallback.
 
