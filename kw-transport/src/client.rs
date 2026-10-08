@@ -180,7 +180,7 @@ pub fn run_with_media(
     let mut media_frames = 0u64;
     let mut media_bytes = 0u64;
     let mut video = Vec::new();
-    let mut audio = Vec::new();
+    let mut audio_frames: Vec<Vec<u8>> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -192,7 +192,7 @@ pub fn run_with_media(
                 media_bytes += payload.len() as u64;
                 match kind {
                     crate::frame::MediaKind::H264 => video.extend_from_slice(&payload),
-                    crate::frame::MediaKind::Opus => audio.extend_from_slice(&payload),
+                    crate::frame::MediaKind::Opus => audio_frames.push(payload),
                 }
             }
             Ok(Frame::Control(_)) => {}
@@ -208,7 +208,14 @@ pub fn run_with_media(
         std::fs::write(path, &video).map_err(|e| format!("save video: {e}"))?;
     }
     if let Some(path) = &capture.save_audio {
-        std::fs::write(path, &audio).map_err(|e| format!("save audio: {e}"))?;
+        // Length-prefixed records (u32be len + packet): Opus packets have
+        // no self-delimiting, so concatenated saves would be undecodable.
+        let mut framed = Vec::new();
+        for packet in &audio_frames {
+            framed.extend_from_slice(&(packet.len() as u32).to_be_bytes());
+            framed.extend_from_slice(packet);
+        }
+        std::fs::write(path, &framed).map_err(|e| format!("save audio: {e}"))?;
     }
     send(
         &mut stream,

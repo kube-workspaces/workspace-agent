@@ -5,6 +5,7 @@
 //! binary performs no capture, networking, input injection, mode changes or
 //! privileged operations.
 
+mod audio;
 mod capture;
 mod daemon;
 mod platform;
@@ -19,7 +20,7 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
     );
@@ -215,6 +216,7 @@ fn main() {
             let capture_output: u32 = flag_value(&args, "--capture-output")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            let capture_audio = args.iter().any(|arg| arg == "--capture-audio");
             if capture_video {
                 println!(
                     "capture video output {capture_output}@{capture_fps}fps {capture_bitrate_bps}bps"
@@ -225,6 +227,9 @@ fn main() {
                     eprintln!("serve: {error}");
                     std::process::exit(2);
                 }
+            }
+            if capture_audio {
+                println!("capture audio loopback → 48kHz stereo Opus");
             }
             let mut served = 0u64;
             let mut idle_since = std::time::Instant::now();
@@ -243,55 +248,86 @@ fn main() {
                 }
                 // Per-session media feed: fresh encoder, fresh GOP, fresh
                 // timestamps every session (joiners land on SPS/PPS/IDR).
-                let (gate, feed_rx, stats, encoder_thread) = if video {
+                // Video and audio threads share one feed and one session
+                // clock (anchor); each fails its own readiness loudly.
+                let media = video || capture_audio;
+                let (gate, feed_rx, stats, media_threads) = if media {
                     use std::sync::{mpsc, Arc};
                     let gate = Arc::new(kw_transport::MediaGate::default());
                     let stats = Arc::new(kw_transport::MediaStats::default());
                     let (feed_tx, feed_rx) = mpsc::channel();
-                    let (ready_tx, ready_rx) = mpsc::channel();
-                    let thread_gate = Arc::clone(&gate);
-                    let thread_stats = Arc::clone(&stats);
-                    let thread_settings = synth_settings.clone();
-                    let source = if capture_video {
-                        "capture"
-                    } else {
-                        "synthetic"
-                    };
-                    let encoder_thread = std::thread::spawn(move || {
-                        if capture_video {
-                            capture::run(
-                                capture_output,
-                                capture_fps,
-                                capture_bitrate_bps,
-                                thread_gate,
-                                feed_tx,
-                                thread_stats,
-                                ready_tx,
-                            )
+                    let anchor = std::time::Instant::now();
+                    let mut threads = Vec::new();
+                    if video {
+                        let (ready_tx, ready_rx) = mpsc::channel();
+                        let thread_gate = Arc::clone(&gate);
+                        let thread_stats = Arc::clone(&stats);
+                        let thread_settings = synth_settings.clone();
+                        let thread_feed = feed_tx.clone();
+                        let thread_anchor = anchor;
+                        let source = if capture_video {
+                            "capture"
                         } else {
-                            synthetic::run(
-                                thread_settings,
-                                thread_gate,
-                                feed_tx,
-                                thread_stats,
-                                ready_tx,
-                            )
-                        }
-                    });
-                    match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            eprintln!("serve: {error}");
-                            std::process::exit(2);
-                        }
-                        Err(_) => {
-                            eprintln!("serve: {source} video did not report readiness");
-                            std::process::exit(2);
+                            "synthetic"
+                        };
+                        threads.push(std::thread::spawn(move || {
+                            if capture_video {
+                                capture::run(
+                                    capture_output,
+                                    capture_fps,
+                                    capture_bitrate_bps,
+                                    thread_gate,
+                                    thread_feed,
+                                    thread_stats,
+                                    ready_tx,
+                                    thread_anchor,
+                                )
+                            } else {
+                                synthetic::run(
+                                    thread_settings,
+                                    thread_gate,
+                                    thread_feed,
+                                    thread_stats,
+                                    ready_tx,
+                                    thread_anchor,
+                                )
+                            }
+                        }));
+                        match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("serve: {error}");
+                                std::process::exit(2);
+                            }
+                            Err(_) => {
+                                eprintln!("serve: {source} video did not report readiness");
+                                std::process::exit(2);
+                            }
                         }
                     }
-                    (Some(gate), Some(feed_rx), Some(stats), Some(encoder_thread))
+                    if capture_audio {
+                        let (ready_tx, ready_rx) = mpsc::channel();
+                        let thread_gate = Arc::clone(&gate);
+                        let thread_stats = Arc::clone(&stats);
+                        let thread_feed = feed_tx;
+                        threads.push(std::thread::spawn(move || {
+                            audio::run(thread_gate, thread_feed, thread_stats, ready_tx, anchor)
+                        }));
+                        match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("serve: {error}");
+                                std::process::exit(2);
+                            }
+                            Err(_) => {
+                                eprintln!("serve: capture audio did not report readiness");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    (Some(gate), Some(feed_rx), Some(stats), threads)
                 } else {
-                    (None, None, None, None)
+                    (None, None, None, Vec::new())
                 };
                 let result = match (gate, feed_rx, stats) {
                     (Some(gate), Some(feed_rx), Some(stats)) => {
@@ -299,7 +335,7 @@ fn main() {
                     }
                     _ => server.serve_one(),
                 };
-                if let Some(thread) = encoder_thread {
+                for thread in media_threads {
                     let _ = thread.join();
                 }
                 match result {
@@ -398,6 +434,74 @@ fn main() {
                     }
                 }
             }
+        }
+        Some("audio-check") => {
+            // Decode a framed Opus capture (u32be len + packet records, as
+            // written by connect-test --save-audio) and report what actually
+            // decodes: packet count, decoded samples, signal energy. An
+            // all-silent capture decodes cleanly with ~zero energy — silence
+            // is a valid outcome, undecodable bytes are not.
+            let file = flag_value(&args, "--file").unwrap_or_else(|| {
+                eprintln!("audio-check: --file PATH is required");
+                usage(2);
+            });
+            let raw = std::fs::read(&file).unwrap_or_else(|error| {
+                eprintln!("audio-check: cannot read {file}: {error}");
+                std::process::exit(1);
+            });
+            let mut packets = Vec::new();
+            let mut cursor = 0usize;
+            while cursor + 4 <= raw.len() {
+                let length = u32::from_be_bytes([
+                    raw[cursor],
+                    raw[cursor + 1],
+                    raw[cursor + 2],
+                    raw[cursor + 3],
+                ]) as usize;
+                cursor += 4;
+                if length == 0 || cursor + length > raw.len() {
+                    eprintln!("audio-check: truncated record at offset {}", cursor - 4);
+                    std::process::exit(1);
+                }
+                packets.push(raw[cursor..cursor + length].to_vec());
+                cursor += length;
+            }
+            if packets.is_empty() {
+                eprintln!("audio-check: no packets in {file}");
+                std::process::exit(1);
+            }
+            let mut decoder = kw_audio::opus::Decoder::new().unwrap_or_else(|error| {
+                eprintln!("audio-check: decoder unavailable: {error}");
+                std::process::exit(1);
+            });
+            let mut decoded_frames = 0u64;
+            let mut decoded_samples = 0u64;
+            let mut energy = 0f64;
+            for packet in &packets {
+                let mut pcm =
+                    vec![0f32; kw_audio::opus::FRAME_SAMPLES * kw_audio::opus::CHANNELS * 2];
+                match decoder.decode_into(packet, &mut pcm) {
+                    Ok(samples) if samples > 0 => {
+                        decoded_frames += 1;
+                        decoded_samples += samples as u64;
+                        for sample in pcm.iter().take(samples * kw_audio::opus::CHANNELS) {
+                            energy += (*sample as f64) * (*sample as f64);
+                        }
+                    }
+                    _ => {
+                        eprintln!("audio-check: undecodable packet ({} bytes)", packet.len());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let rms = (energy / decoded_samples.max(1) as f64).sqrt();
+            println!(
+                "packets={} decoded_frames={} decoded_samples={} rms={:.6}",
+                packets.len(),
+                decoded_frames,
+                decoded_samples,
+                rms
+            );
         }
         Some("encode-test") => {
             // Synthetic NV12 gradient through the real software encoder.

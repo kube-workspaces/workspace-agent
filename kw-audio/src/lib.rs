@@ -1,10 +1,16 @@
 //! WASAPI loopback capture backend plus pure-Rust Opus voice codec.
 //!
-//! Capture: default render endpoint's mix (see [`capture_loopback`]).
+//! Capture: default render endpoint's mix — bounded diagnostics via
+//! [`capture_loopback`], continuous streaming via [`tap::LoopbackTap`]
+//! (format normalization in [`tap`], 48kHz conversion in [`resample`]).
 //! Codec: 48kHz stereo 20ms Opus via `opus-rs` (no C, no FFI) — see [`opus`].
 //! Silence is reported, never hidden.
 
 pub mod opus;
+pub mod resample;
+pub mod tap;
+
+pub use tap::MixFormat;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +31,9 @@ pub enum Error {
     Gated(&'static str),
     /// No active render endpoint to tap.
     NoEndpoint,
+    /// The endpoint went away mid-stream (unplug, reroute, disable):
+    /// reopen the tap, do not fail the session for it.
+    DeviceLost,
     Os(u32),
     /// Codec rejected input or failed internally (carries no audio).
     Codec(String),
@@ -35,6 +44,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Gated(what) => write!(f, "audio backend P0-gated: {what}"),
             Error::NoEndpoint => write!(f, "no active render endpoint"),
+            Error::DeviceLost => write!(f, "audio endpoint lost, reopen the tap"),
             Error::Os(code) => write!(f, "wasapi call failed: 0x{code:08x}"),
             Error::Codec(what) => write!(f, "opus codec: {what}"),
         }

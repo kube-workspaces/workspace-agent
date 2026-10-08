@@ -22,7 +22,8 @@ pub fn open_output(output_index: u32) -> Result<kw_platform::capture::Duplicator
 /// Capture thread body: open, acquire → encode → feed until the session
 /// ends. The duplicator opens per session (fresh mode read every time);
 /// construction failure reports through `ready` so serve exits loudly
-/// instead of serving a blind session.
+/// instead of serving a blind session. Timestamps come from the shared
+/// session `anchor` (one clock for audio + video).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     output_index: u32,
@@ -32,6 +33,7 @@ pub fn run(
     feed: mpsc::Sender<MediaPacket>,
     stats: Arc<MediaStats>,
     ready: mpsc::Sender<Result<(), String>>,
+    anchor: Instant,
 ) {
     let fps = fps.max(1);
     let mut duplicator = match open_output(output_index) {
@@ -64,7 +66,6 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let anchor = Instant::now();
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
     let mut index: u64 = 0;
     let mut next_tick = anchor;

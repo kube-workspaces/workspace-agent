@@ -29,13 +29,15 @@ pub fn gradient_nv12(width: u32, height: u32, shift: u8) -> Vec<u8> {
 
 /// Encoder thread body. Signals construction outcome on `ready`, then paces
 /// frames at `fps` once admitted. Exits on session end, feed loss, or an
-/// encoder failure (logged, never silent).
+/// encoder failure (logged, never silent). Timestamps come from the shared
+/// session `anchor` so audio and video share one clock.
 pub fn run(
     settings: kw_encode::Settings,
     gate: Arc<MediaGate>,
     feed: mpsc::Sender<MediaPacket>,
     stats: Arc<MediaStats>,
     ready: mpsc::Sender<Result<(), String>>,
+    anchor: Instant,
 ) {
     let mut encoder = match kw_encode::StreamEncoder::new(&settings) {
         Ok(encoder) => {
@@ -55,7 +57,6 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let anchor = Instant::now();
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
     let mut index: u64 = 0;
     loop {
