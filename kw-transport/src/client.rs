@@ -46,13 +46,22 @@ fn send(stream: &mut TcpStream, message: &Envelope) -> Result<(), String> {
 }
 
 fn recv(stream: &mut TcpStream) -> Result<Envelope, String> {
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(15)))
-        .map_err(|e| format!("io: {e}"))?;
-    match read_frame(stream).map_err(|e| format!("frame: {e}"))? {
-        Some(Frame::Control(envelope)) => Ok(envelope),
-        Some(Frame::Media { .. }) => Err("unexpected media frame".into()),
-        None => Err("server closed".into()),
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("control response timed out".into());
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| format!("io: {e}"))?;
+        match read_frame(stream).map_err(|e| format!("frame: {e}"))? {
+            Some(Frame::Control(envelope)) => return Ok(envelope),
+            // Media and control share a stream; already-queued video/audio
+            // can arrive before a resize acknowledgement even after capture.
+            Some(Frame::Media { .. }) => continue,
+            None => return Err("server closed".into()),
+        }
     }
 }
 
@@ -241,4 +250,37 @@ pub fn run_with_media(
         media_frames,
         media_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{write_control, write_media, MediaKind};
+    use std::net::TcpListener;
+
+    #[test]
+    fn control_response_can_follow_interleaved_video_and_audio() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            write_media(&mut stream, MediaKind::H264, &[1, 2, 3]).unwrap();
+            write_media(&mut stream, MediaKind::Opus, &[4, 5]).unwrap();
+            write_control(
+                &mut stream,
+                &control(
+                    "session",
+                    "resizeAck",
+                    3,
+                    serde_json::json!({"requestId": "resize-1"}),
+                ),
+            )
+            .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let response = recv(&mut stream).unwrap();
+        assert_eq!(response.message_type, "resizeAck");
+        assert_eq!(response.payload["requestId"], "resize-1");
+        writer.join().unwrap();
+    }
 }

@@ -71,6 +71,12 @@ pub struct MediaStats {
 /// through one mutex so reference frames are never interleaved corrupt.
 type SharedWriter = Arc<Mutex<TcpStream>>;
 
+/// Console-session clipboard backend supplied by the guest executable.
+pub trait Clipboard: Send + Sync {
+    fn read_text(&self) -> Result<Option<String>, String>;
+    fn write_text(&self, text: &str) -> Result<(), String>;
+}
+
 fn write_envelope(writer: &SharedWriter, message: &Envelope) -> Result<(), String> {
     let mut guard = writer.lock().map_err(|e| format!("writer lock: {e}"))?;
     write_control(&mut *guard, message).map_err(|e| format!("{e}"))?;
@@ -90,6 +96,7 @@ pub struct Server {
     workspace_uid: String,
     workspace_generation: String,
     agent_version: String,
+    clipboard: Option<Arc<dyn Clipboard>>,
 }
 
 impl Server {
@@ -104,11 +111,17 @@ impl Server {
             workspace_uid,
             workspace_generation,
             agent_version: env!("CARGO_PKG_VERSION").into(),
+            clipboard: None,
         })
     }
 
     pub fn local_address(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    pub fn with_clipboard(mut self, clipboard: Arc<dyn Clipboard>) -> Self {
+        self.clipboard = Some(clipboard);
+        self
     }
 
     /// Serve exactly one connection, then return its outcome. The host loop
@@ -123,6 +136,7 @@ impl Server {
             &self.workspace_generation,
             &self.agent_version,
             None,
+            self.clipboard.as_deref(),
         ))
     }
 
@@ -144,6 +158,7 @@ impl Server {
             &self.workspace_generation,
             &self.agent_version,
             Some((gate, feed, stats)),
+            self.clipboard.as_deref(),
         ))
     }
 }
@@ -179,6 +194,7 @@ fn resize_nack(request_id: &str, reason: &str) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     stream: TcpStream,
     _peer: String,
@@ -186,6 +202,7 @@ fn serve_connection(
     workspace_generation: &str,
     agent_version: &str,
     media: Option<(Arc<MediaGate>, mpsc::Receiver<MediaPacket>, Arc<MediaStats>)>,
+    clipboard: Option<&dyn Clipboard>,
 ) -> SessionOutcome {
     let mut outcome = SessionOutcome::default();
     // The session claim is minted here and advertised in our hello; clients
@@ -242,6 +259,7 @@ fn serve_connection(
             "platform": std::env::consts::OS,
             "role": "controller-only",
             "capabilityEpoch": 1,
+            "clipboardText": clipboard.is_some(),
         }),
     );
     if write_envelope(&writer, &hello).is_err() {
@@ -289,6 +307,7 @@ fn serve_connection(
                     media_gate.as_deref(),
                     media_stats.as_deref(),
                     &mut idr_signaled,
+                    clipboard,
                 ) {
                     if outcome.ended.is_empty() {
                         outcome.ended = "refused".into();
@@ -326,8 +345,54 @@ fn serve_control(
     gate: Option<&MediaGate>,
     stats: Option<&MediaStats>,
     idr_signaled: &mut u64,
+    clipboard: Option<&dyn Clipboard>,
 ) -> bool {
     match message.message_type.as_str() {
+        "clipboardGet" | "clipboardSet" => {
+            if handshake.clipboard_request(message).is_err() {
+                return false;
+            }
+            let id = message.payload["requestId"].as_str().unwrap_or("");
+            let result = if id.is_empty() || id.len() > 128 {
+                Err("clipboard-invalid-request".to_owned())
+            } else if let Some(backend) = clipboard {
+                if message.message_type == "clipboardGet" {
+                    backend.read_text()
+                } else if let Some(text) = message.payload["text"].as_str() {
+                    if text.len() > 64 * 1024 || text.contains('\0') {
+                        Err("clipboard-invalid-text".to_owned())
+                    } else {
+                        backend.write_text(text).map(|()| None)
+                    }
+                } else {
+                    Err("clipboard-invalid-text".to_owned())
+                }
+            } else {
+                Err("clipboard-unavailable".to_owned())
+            };
+            let payload = match result {
+                Ok(text)
+                    if text
+                        .as_ref()
+                        .map_or(true, |text| text.len() <= 64 * 1024 && !text.contains('\0')) =>
+                {
+                    serde_json::json!({"requestId": id, "ok": true, "text": text})
+                }
+                Ok(_) => {
+                    serde_json::json!({"requestId": id, "ok": false, "reason": "clipboard-invalid-text"})
+                }
+                Err(reason) => serde_json::json!({"requestId": id, "ok": false, "reason": reason}),
+            };
+            let reply = envelope(
+                "clipboardResult",
+                *sequence,
+                handshake.session_id(),
+                0,
+                payload,
+            );
+            *sequence += 1;
+            write_envelope(writer, &reply).is_ok()
+        }
         "attach" => {
             let ticket: Result<Ticket, _> =
                 serde_json::from_value(message.payload["ticket"].clone());
@@ -678,6 +743,97 @@ mod tests {
         assert_eq!(outcome.video_frames_sent, 2);
         assert_eq!(outcome.video_bytes_sent, 192);
         assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[derive(Default)]
+    struct MemoryClipboard(Mutex<Option<String>>);
+    impl Clipboard for MemoryClipboard {
+        fn read_text(&self) -> Result<Option<String>, String> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn write_text(&self, text: &str) -> Result<(), String> {
+            *self.0.lock().unwrap() = Some(text.into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn clipboard_roundtrip_limits_and_empty_text() {
+        let backend = Arc::new(MemoryClipboard::default());
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_clipboard(backend.clone());
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let session = attach_client(&mut client);
+        let mut sequence = 3;
+        for text in ["PowerShell\r\nλ 🦀\t", ""] {
+            send(
+                &control(
+                    &session,
+                    "clipboardSet",
+                    sequence,
+                    serde_json::json!({"requestId": "set", "text": text}),
+                ),
+                &mut client,
+            );
+            assert_eq!(read_envelope(&mut client).payload["ok"], true);
+            sequence += 1;
+            send(
+                &control(
+                    &session,
+                    "clipboardGet",
+                    sequence,
+                    serde_json::json!({"requestId": "get"}),
+                ),
+                &mut client,
+            );
+            let reply = read_envelope(&mut client);
+            assert_eq!(reply.payload["requestId"], "get");
+            assert_eq!(reply.payload["text"], text);
+            sequence += 1;
+        }
+        send(
+            &control(
+                &session,
+                "clipboardSet",
+                sequence,
+                serde_json::json!({"requestId": "large", "text": "x".repeat(65537)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["ok"], false);
+        assert_eq!(backend.read_text().unwrap(), Some(String::new()));
+        send(
+            &control(&session, "bye", sequence + 1, serde_json::json!({})),
+            &mut client,
+        );
+        assert_eq!(handle.join().unwrap().ended, "peer-bye");
+    }
+
+    #[test]
+    fn clipboard_content_is_not_read_before_admission() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_clipboard(Arc::new(MemoryClipboard::default()));
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["clipboardText"], true);
+        send(
+            &control(
+                &hello.session_id,
+                "clipboardGet",
+                2,
+                serde_json::json!({"requestId": "private"}),
+            ),
+            &mut client,
+        );
+        let outcome = handle.join().unwrap();
+        assert_eq!(outcome.ended, "refused");
+        assert!(read_frame(&mut client).unwrap().is_none());
     }
 
     #[test]

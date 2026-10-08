@@ -58,12 +58,16 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(10));
     }
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
+    let mut tick = Instant::now();
     let mut index: u64 = 0;
     loop {
         if gate.ended.load(Ordering::SeqCst) {
             break;
         }
-        let tick = anchor + cadence * (index as u32 + 1);
+        // Admission can follow startup by minutes. Keep the shared anchor
+        // for timestamps, but never encode missed pre-admission frame slots.
+        // Slow encoding also skips missed slots rather than bursting to catch up.
+        tick = std::cmp::max(tick + cadence, Instant::now());
         let now = Instant::now();
         if tick > now {
             std::thread::sleep(tick - now);

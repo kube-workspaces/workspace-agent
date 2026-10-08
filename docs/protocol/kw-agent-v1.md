@@ -45,7 +45,8 @@ to a fresh IDR.
 ## Control messages
 
 `type` is one of: `hello`, `capabilities`, `attach`, `keyframeRequest`,
-`resizeRequest`, `resizeAck`, `displayOwnership`, `telemetry`, `bye`.
+`resizeRequest`, `resizeAck`, `clipboardGet`, `clipboardSet`,
+`clipboardResult`, `displayOwnership`, `telemetry`, `bye`.
 
 - `hello`: agent identity/version, image/profile compatibility, actual
   codec/profile/level, capture/output dimensions, audio endpoint state,
@@ -62,6 +63,20 @@ to a fresh IDR.
   config + IDR follows an actual mode change.
 - `displayOwnership`: control-epoch grant/renew/release; input is released
   on disconnect, focus loss or epoch change.
+- Clipboard text is an additive capability: `hello.payload.clipboardText`
+  must be true before a viewer requests it. The console-session guest opts
+  in with `serve --clipboard`; media is optional, so a clipboard-only
+  attachment can run beside the independent VNC console.
+- `clipboardGet`: admitted controller requests `{requestId}` (nonempty,
+  at most 128 UTF-8 bytes). `clipboardSet`: `{requestId, text}`; text is
+  Unicode, at most 65536 UTF-8 bytes, without embedded NUL. No files/images
+  and no automatic keypress or command execution.
+- `clipboardResult`: `{requestId, ok, text? , reason?}`. A successful get
+  returns text (including an empty string) or null if no text format is
+  available. A successful set returns null text. Errors report bounded
+  machine-readable reasons. Clipboard contents never enter telemetry/logs.
+  Reads and writes require admission and the ordinary control fence; results
+  are paired by request ID. Viewers discard late results and suppress echoes.
 - `telemetry`: timings/counters/capability reasons only. Never clipboard,
   input content or credentials.
 - `bye`: orderly teardown with reason; receivers release held input and

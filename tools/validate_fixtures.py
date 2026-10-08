@@ -7,7 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VECTORS = ROOT / "protocol" / "v1" / "vectors"
 CONTROL_TYPES = {"hello", "capabilities", "attach", "keyframeRequest",
-                 "resizeRequest", "resizeAck", "displayOwnership", "telemetry", "bye"}
+                 "resizeRequest", "resizeAck", "clipboardGet", "clipboardSet",
+                 "clipboardResult", "displayOwnership", "telemetry", "bye"}
 MEDIA_TYPES = {"video", "audio"}
 
 

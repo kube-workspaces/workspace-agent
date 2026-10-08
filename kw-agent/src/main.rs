@@ -144,6 +144,24 @@ fn main() {
                 eprintln!("serve: bind failed: {error}");
                 std::process::exit(1);
             });
+            let server = if args.iter().any(|arg| arg == "--clipboard") {
+                if !cfg!(target_os = "windows") {
+                    eprintln!("serve: clipboard backend unavailable on this platform");
+                    std::process::exit(2);
+                }
+                struct ConsoleClipboard;
+                impl kw_transport::Clipboard for ConsoleClipboard {
+                    fn read_text(&self) -> Result<Option<String>, String> {
+                        kw_platform::clipboard::read_text()
+                    }
+                    fn write_text(&self, text: &str) -> Result<(), String> {
+                        kw_platform::clipboard::write_text(text)
+                    }
+                }
+                server.with_clipboard(std::sync::Arc::new(ConsoleClipboard))
+            } else {
+                server
+            };
             let address = server.local_address().unwrap_or_else(|error| {
                 eprintln!("serve: no local address: {error}");
                 std::process::exit(1);

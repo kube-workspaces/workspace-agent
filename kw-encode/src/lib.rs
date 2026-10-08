@@ -522,7 +522,13 @@ mod inner {
             hr(line!(), sample.AddBuffer(&backing))?;
             buffer.pSample = std::mem::ManuallyDrop::new(Some(sample));
             let mut status = 0u32;
-            match encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) {
+            let result = encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status);
+            // The bindings deliberately use ManuallyDrop for these COM
+            // fields. Reclaim ownership BEFORE handling any HRESULT: even
+            // NEED_MORE_INPUT must release the caller's 4 MiB sample buffer.
+            let produced = std::mem::ManuallyDrop::take(&mut buffer.pSample);
+            drop(std::mem::ManuallyDrop::take(&mut buffer.pEvents));
+            match result {
                 Ok(()) => {}
                 // Nothing more to emit right now: mid-stream it means feed
                 // more input; at end-of-stream it means fully drained.
@@ -535,9 +541,7 @@ mod inner {
                 }
                 Err(error) => return Err(Error::Stream(format!("ProcessOutput: {error:?}"))),
             }
-            let produced = std::mem::ManuallyDrop::take(&mut buffer.pSample)
-                .ok_or_else(|| Error::Stream("output without sample".into()))?;
-            let sample = produced;
+            let sample = produced.ok_or_else(|| Error::Stream("output without sample".into()))?;
             let mut locked: *mut u8 = std::ptr::null_mut();
             let mut max = 0u32;
             let mut current = 0u32;
@@ -667,6 +671,52 @@ mod tests {
         );
         let total: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
         assert!(total > 1024, "nontrivial payload: {total} bytes");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sustained_stream_releases_output_buffers() {
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        fn private_bytes() -> usize {
+            let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+            let size = std::mem::size_of_val(&counters) as u32;
+            counters.cb = size;
+            unsafe {
+                GetProcessMemoryInfo(
+                    GetCurrentProcess(),
+                    (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                    size,
+                )
+                .expect("process memory counters");
+            }
+            counters.PrivateUsage
+        }
+
+        let settings = Settings::default();
+        let mut encoder = StreamEncoder::new(&settings).expect("construct");
+        let frame = gradient(settings.width, settings.height, 0);
+        let step = 10_000_000 / settings.fps as i64;
+        for index in 0..30 {
+            encoder.push(&frame, index * step, false).expect("warm up");
+        }
+        let baseline = private_bytes();
+        let mut emitted = 0;
+        for index in 30..630 {
+            emitted += encoder
+                .push(&frame, index * step, false)
+                .expect("sustained encode")
+                .len();
+            assert!(
+                private_bytes().saturating_sub(baseline) < 128 * 1024 * 1024,
+                "output-buffer memory grows during sustained encoding"
+            );
+        }
+        assert!(emitted > 0, "sustained stream emits video");
+        encoder.finish().expect("finish");
     }
 
     #[cfg(target_os = "windows")]

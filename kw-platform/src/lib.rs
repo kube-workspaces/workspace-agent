@@ -10,6 +10,7 @@
 //! encoder. Session loss is reported, never hidden.
 
 pub mod capture;
+pub mod clipboard;
 
 use serde::{Deserialize, Serialize};
 

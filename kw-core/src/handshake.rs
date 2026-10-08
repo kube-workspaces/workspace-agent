@@ -182,6 +182,20 @@ impl Handshake {
         self.admitted
     }
 
+    /// Named clipboard actions use the same admitted-session ordering fence
+    /// as other input. Reads are gated too: clipboard content is private.
+    pub fn clipboard_request(&mut self, message: &Envelope) -> Result<(), Reject> {
+        if !self.admitted
+            || !matches!(
+                message.message_type.as_str(),
+                "clipboardGet" | "clipboardSet"
+            )
+        {
+            return Err(Reject::UnknownType);
+        }
+        self.control(message)
+    }
+
     pub fn session_id(&self) -> &str {
         self.session.id()
     }
