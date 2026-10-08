@@ -33,6 +33,9 @@ import urllib.request
 
 PROTOCOL = "kw-agent-v1"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# The platform edge blocks non-browser User-Agents (observed: 403 error 1010
+# for Python-urllib). Identify as a browser client like the product frontend.
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) kw-agent-bridge-check/0.1"
 
 
 def b64url_decode(segment):
@@ -48,13 +51,23 @@ def decode_ticket(ticket_string):
 
 
 def api_call(api_base, namespace, name, action, token, session_id=None, timeout=10):
+    # The API requires a JSON body on these POSTs (Goa answers
+    # missing-payload to bodiless posts): {} for attach (name rides the
+    # path), session correlation for renew/release (also carried in the
+    # X-KW-Agent-Session header per the API contract).
+    if action == "attach" or not session_id:
+        body = b"{}"
+    else:
+        body = json.dumps({"session_id": session_id}).encode()
     url = (
         f"{api_base.rstrip('/')}/v1/workspaces/"
         f"{urllib.parse.quote(name)}/agent/{action}"
         f"?namespace={urllib.parse.quote(namespace)}"
     )
-    req = urllib.request.Request(url, data=b"", method="POST")
+    req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", USER_AGENT)
     if session_id:
         req.add_header("X-KW-Agent-Session", session_id)
     try:
@@ -76,7 +89,8 @@ def ws_connect(host, port, use_tls, path, token, timeout=15):
     req = (
         f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
         f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
-        f"Sec-WebSocket-Version: 13\r\nAuthorization: Bearer {token}\r\n\r\n"
+        f"Sec-WebSocket-Version: 13\r\nAuthorization: Bearer {token}\r\n"
+        f"User-Agent: {USER_AGENT}\r\n\r\n"
     )
     raw.sendall(req.encode())
     raw.settimeout(timeout)
