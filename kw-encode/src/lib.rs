@@ -340,14 +340,20 @@ mod inner {
         /// created — two live MFTs never overlap. Returns trailing output
         /// of the old GOP, if any.
         unsafe fn rebuild(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
+            // TEMPORARY crash markers (STATUS_ACCESS_VIOLATION triage): each
+            // eprintln lands unbuffered in CI logs; the last visible marker
+            // precedes the faulting call. Removed once located.
             let mut trailing = Vec::new();
             if let Some(old) = self.encoder.take() {
                 drain(&old, &mut trailing)?;
+                eprintln!("MARK rebuild: drained");
                 hr(
                     line!(),
                     old.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
                 )?;
-                // `old` drops here: Release runs before CoCreateInstance.
+                eprintln!("MARK rebuild: EOS sent");
+                drop(old);
+                eprintln!("MARK rebuild: old released");
             }
             let encoder: IMFTransform = hr(
                 line!(),
@@ -357,7 +363,9 @@ mod inner {
                     CLSCTX_INPROC_SERVER,
                 ),
             )?;
+            eprintln!("MARK rebuild: created");
             configure_types(&encoder, settings)?;
+            eprintln!("MARK rebuild: configured");
             hr(line!(), encoder.GetOutputStreamInfo(0))?;
             hr(
                 line!(),
@@ -367,6 +375,7 @@ mod inner {
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
             )?;
+            eprintln!("MARK rebuild: streaming");
             self.encoder = Some(encoder);
             self.settings = settings.clone();
             self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
