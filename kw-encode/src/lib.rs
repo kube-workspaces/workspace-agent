@@ -184,14 +184,11 @@ impl StreamEncoder {
 #[cfg(target_os = "windows")]
 mod inner {
     use super::*;
-    use windows::core::ComInterface as _;
-    use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncH264VLevel4, eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT,
-        CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFTransform, MFCreateMediaType,
-        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
-        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
-        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+        eAVEncH264VLevel4, eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT, IMFTransform,
+        MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown,
+        MFStartup, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+        MFSTARTUP_NOSOCKET, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT,
         MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
         MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
@@ -202,29 +199,23 @@ mod inner {
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
     };
-    use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL};
 
     fn hr<T>(line: u32, result: Result<T, windows::core::Error>) -> Result<T, Error> {
         result.map_err(|e| Error::Stream(format!("line {line}: 0x{:08x}", e.code().0 as u32)))
     }
 
-    /// VT_BOOL VARIANT for ICodecAPI calls (windows 0.52 has no From<bool>).
-    fn bool_variant(value: bool) -> VARIANT {
-        let mut variant = VARIANT::default();
-        unsafe {
-            let inner = &mut variant.Anonymous.Anonymous as *mut _ as *mut VARIANT_0_0;
-            (*inner).vt = VT_BOOL;
-            (*inner).Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
-        }
-        variant
-    }
-
     /// One persistent software MFT. Owns its COM/MF lifetime: Drop signals
     /// end-of-stream best-effort and releases everything. Construct and feed
     /// from a single thread (MTA apartment).
+    ///
+    /// Forced IDRs rebuild the transform instead of poking codec APIs: a
+    /// fresh software MFT always opens with SPS/PPS/IDR (verified), so the
+    /// IDR guarantee holds without depending on optional MFT properties
+    /// (the inbox software MFT rejects CODECAPI force-IDR mid-stream).
+    /// Rebuilds are demand-paced (session starts, reconfigures, coalesced
+    /// viewer demands), never per-frame.
     pub struct Stream {
         encoder: IMFTransform,
-        codec_api: Option<ICodecAPI>,
         settings: Settings,
         frame_bytes: usize,
         step_100ns: i64,
@@ -254,15 +245,6 @@ mod inner {
                     ),
                 )?;
                 configure_types(&encoder, settings)?;
-                // Force-IDR is load-bearing for keyframe requests and
-                // reconfigures: fail construction (not mid-stream) when the
-                // MFT cannot promise it.
-                let codec_api: Option<ICodecAPI> = encoder.cast().ok();
-                if codec_api.is_none() {
-                    return Err(Error::Configure(
-                        "MFT exposes no ICodecAPI for force-IDR".into(),
-                    ));
-                }
                 hr(line!(), encoder.GetOutputStreamInfo(0))?;
                 hr(
                     line!(),
@@ -274,7 +256,6 @@ mod inner {
                 )?;
                 Ok(Self {
                     encoder,
-                    codec_api,
                     settings: settings.clone(),
                     frame_bytes,
                     step_100ns: 10_000_000 / settings.fps.max(1) as i64,
@@ -304,17 +285,13 @@ mod inner {
             if self.finished {
                 return Err(Error::Stream("push after finish".into()));
             }
+            let mut chunks = Vec::new();
             if force_idr {
-                let api = self.codec_api.as_ref().ok_or_else(|| {
-                    Error::Configure("force-IDR unavailable on this encoder".into())
-                })?;
-                let value = bool_variant(true);
-                unsafe {
-                    hr(
-                        line!(),
-                        api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value),
-                    )?;
-                }
+                // Fresh transform: the next push emits SPS/PPS/IDR (verified
+                // behavior of this MFT). Trailing old-GOP output is valid
+                // P-frames against already-sent references — emitted, never
+                // dropped.
+                chunks.extend(unsafe { self.rebuild(&self.settings.clone()) }?);
             }
             unsafe {
                 let buffer = hr(line!(), MFCreateMemoryBuffer(self.frame_bytes as u32))?;
@@ -338,27 +315,55 @@ mod inner {
                 Ok(chunks)
             }
         }
-
         pub fn reconfigure(&mut self, settings: &Settings) -> Result<(), Error> {
             if self.finished {
                 return Err(Error::Stream("reconfigure after finish".into()));
             }
-            unsafe {
-                // Drain pending output under the old type, then swap both
-                // types between frames (legal while streaming). The next
-                // push emits the new configuration; callers force an IDR.
-                let mut trailing = Vec::new();
-                drain(&self.encoder, &mut trailing)?;
-                debug_assert!(
-                    trailing.is_empty(),
-                    "mid-stream drain must not emit without new input"
-                );
-                configure_types(&self.encoder, settings)?;
-                self.settings = settings.clone();
-                self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
-                self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
-                Ok(())
-            }
+            // Same rebuild path as forced IDR: drain under the old type,
+            // swap the pair between frames. The next push emits the new
+            // configuration; callers force an IDR alongside.
+            let trailing = unsafe { self.rebuild(settings) }?;
+            debug_assert!(
+                trailing.is_empty(),
+                "rebuild drain must not emit without new input"
+            );
+            Ok(())
+        }
+
+        /// Drain the old transform, drop it, and stream a fresh one under
+        /// `settings` (COM/MF lifetime stays with the enclosing Stream).
+        /// Returns trailing output of the old GOP, if any.
+        unsafe fn rebuild(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
+            let mut trailing = Vec::new();
+            drain(&self.encoder, &mut trailing)?;
+            hr(
+                line!(),
+                self.encoder
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+            )?;
+            let encoder: IMFTransform = hr(
+                line!(),
+                CoCreateInstance(
+                    &CLSID_MSH264EncoderMFT,
+                    Option::<&windows::core::IUnknown>::None,
+                    CLSCTX_INPROC_SERVER,
+                ),
+            )?;
+            configure_types(&encoder, settings)?;
+            hr(line!(), encoder.GetOutputStreamInfo(0))?;
+            hr(
+                line!(),
+                encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
+            )?;
+            hr(
+                line!(),
+                encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
+            )?;
+            self.encoder = encoder;
+            self.settings = settings.clone();
+            self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
+            self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
+            Ok(trailing)
         }
 
         pub fn finish(self) -> Result<Vec<Chunk>, Error> {

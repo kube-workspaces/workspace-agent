@@ -253,6 +253,10 @@ fn serve_connection(
         return outcome;
     }
     let mut sequence = 2u64;
+    // IDR acknowledgements the encoder has produced (via shared stats):
+    // each consumed keyframe re-arms the pending flag so repeated viewer
+    // demands keep working across a long session instead of latching once.
+    let mut idr_signaled = 0u64;
     loop {
         let frame = match read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
@@ -283,6 +287,8 @@ fn serve_connection(
                     &mut sequence,
                     &mut outcome,
                     media_gate.as_deref(),
+                    media_stats.as_deref(),
+                    &mut idr_signaled,
                 ) {
                     if outcome.ended.is_empty() {
                         outcome.ended = "refused".into();
@@ -318,6 +324,8 @@ fn serve_control(
     sequence: &mut u64,
     outcome: &mut SessionOutcome,
     gate: Option<&MediaGate>,
+    stats: Option<&MediaStats>,
+    idr_signaled: &mut u64,
 ) -> bool {
     match message.message_type.as_str() {
         "attach" => {
@@ -384,19 +392,31 @@ fn serve_control(
                 Err(_) => false,
             }
         }
-        "keyframeRequest" => match handshake.keyframe_request(message) {
-            Ok(forward) => {
-                if forward {
-                    outcome.keyframes_forwarded += 1;
-                    // The encoder consumes this into one forced IDR.
-                    if let Some(gate) = gate {
-                        gate.force_idr.store(true, Ordering::SeqCst);
-                    }
+        "keyframeRequest" => {
+            // Re-arm from produced IDRs first: without this, the pending
+            // flag latches after the first demand and later requests in a
+            // long session are silently absorbed.
+            if let Some(stats) = stats {
+                let produced = stats.keyframes_sent.load(Ordering::SeqCst);
+                if produced > *idr_signaled {
+                    handshake.keyframe_sent();
+                    *idr_signaled = produced;
                 }
-                true
             }
-            Err(_) => false,
-        },
+            match handshake.keyframe_request(message) {
+                Ok(forward) => {
+                    if forward {
+                        outcome.keyframes_forwarded += 1;
+                        // The encoder consumes this into one forced IDR.
+                        if let Some(gate) = gate {
+                            gate.force_idr.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
         "telemetry" | "displayOwnership" | "capabilities" => true,
         "bye" => {
             outcome.ended = "peer-bye".into();
@@ -697,5 +717,64 @@ mod tests {
         );
         let outcome = handle.join().expect("server thread");
         assert_eq!(outcome.keyframes_forwarded, 1);
+    }
+
+    #[test]
+    fn repeated_keyframe_demands_rearm_after_idr() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let gate = Arc::new(MediaGate::default());
+        let gate_probe = Arc::clone(&gate);
+        let stats = Arc::new(MediaStats::default());
+        let stats_probe = Arc::clone(&stats);
+        let (_tx, rx) = mpsc::channel();
+        let handle =
+            std::thread::spawn(move || server.serve_one_media(gate, rx, stats).expect("serve"));
+        let mut client = connect(port);
+        let session = attach_client(&mut client);
+        let mut sequence = 3u64;
+        let mut demand = |client: &mut TcpStream| {
+            send(
+                &control(&session, "keyframeRequest", sequence, serde_json::json!({})),
+                client,
+            );
+            sequence += 1;
+        };
+        // First demand raises the flag; the encoder consumes it.
+        demand(&mut client);
+        for _ in 0..100 {
+            if gate_probe.force_idr.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gate_probe.force_idr.load(Ordering::SeqCst));
+        // A second demand before any IDR is produced coalesces (no-op).
+        gate_probe.force_idr.store(false, Ordering::SeqCst);
+        demand(&mut client);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !gate_probe.force_idr.load(Ordering::SeqCst),
+            "unproduced demand must stay coalesced"
+        );
+        // Once the encoder reports the IDR, the next demand re-arms.
+        stats_probe.keyframes_sent.fetch_add(1, Ordering::SeqCst);
+        demand(&mut client);
+        for _ in 0..100 {
+            if gate_probe.force_idr.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            gate_probe.force_idr.load(Ordering::SeqCst),
+            "produced IDR must re-arm keyframe demands"
+        );
+        send(
+            &control(&session, "bye", 4, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(outcome.keyframes_forwarded, 2);
     }
 }
