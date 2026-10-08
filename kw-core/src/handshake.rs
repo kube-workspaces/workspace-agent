@@ -6,7 +6,7 @@
 //! unit test. Malformed input is rejected with [`Reject`], never silently
 //! reinterpreted.
 
-use kw_protocol::{check_envelope, Channel, Envelope, Reject, Ticket};
+use kw_protocol::{check_envelope, check_input, Channel, Envelope, InputEvent, Reject, Ticket};
 
 use crate::Session;
 
@@ -132,6 +132,21 @@ impl Handshake {
         } else {
             Ok(Ack::Stale)
         }
+    }
+
+    /// Admission-gated input from the exclusive controller. Applies the
+    /// ordinary control fence, then parses and bounds the event; the caller
+    /// injects on `Ok` and counts a drop otherwise. Input never carries
+    /// privilege and is fire-and-forget — there is no result message.
+    pub fn input(&mut self, message: &Envelope) -> Result<InputEvent, Reject> {
+        if !self.admitted || message.message_type != "input" {
+            return Err(Reject::UnknownType);
+        }
+        self.control(message)?;
+        let event: InputEvent =
+            serde_json::from_value(message.payload.clone()).map_err(|_| Reject::Malformed)?;
+        check_input(&event)?;
+        Ok(event)
     }
 
     /// Keyframe demand. Returns true when the encoder should be poked;
@@ -352,6 +367,49 @@ mod tests {
         assert!(handshake
             .keyframe_request(&envelope("control", "keyframeRequest", 3, json!({})))
             .is_err());
+    }
+
+    #[test]
+    fn input_requires_admission_and_validates_bounds() {
+        let mut handshake = admitted();
+        let key = envelope(
+            "control",
+            "input",
+            3,
+            json!({"kind": "key", "keysym": 0xFF0D, "down": true}),
+        );
+        assert_eq!(
+            handshake.input(&key),
+            Ok(InputEvent::Key {
+                keysym: 0xFF0D,
+                down: true
+            })
+        );
+        // Out-of-range keysym and unknown shapes are bounded errors, not
+        // session-ending faults.
+        let huge = envelope(
+            "control",
+            "input",
+            4,
+            json!({"kind": "key", "keysym": 0x0020_0000, "down": true}),
+        );
+        assert_eq!(handshake.input(&huge), Err(Reject::Malformed));
+        let junk = envelope("control", "input", 5, json!({"kind": "nope"}));
+        assert_eq!(handshake.input(&junk), Err(Reject::Malformed));
+        // The ordinary control fence still applies.
+        let regressed = envelope(
+            "control",
+            "input",
+            3,
+            json!({"kind": "pointer", "x": 1, "y": 2, "buttons": 0}),
+        );
+        assert_eq!(handshake.input(&regressed), Err(Reject::Replay));
+        // Unadmitted input is refused outright.
+        let mut fresh = Handshake::new("sess".into(), 7);
+        fresh
+            .hello(&envelope("control", "hello", 1, json!({})))
+            .expect("hello");
+        assert_eq!(fresh.input(&key), Err(Reject::UnknownType));
     }
 
     #[test]

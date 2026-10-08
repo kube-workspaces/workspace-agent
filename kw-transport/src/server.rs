@@ -8,7 +8,7 @@
 
 use crate::frame::{read_frame, write_control, write_media, Frame, MediaKind};
 use kw_core::{now_secs, Handshake};
-use kw_protocol::{Envelope, Reject, Ticket};
+use kw_protocol::{Envelope, InputEvent, Reject, Ticket};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -34,6 +34,11 @@ pub struct SessionOutcome {
     pub video_keyframes_sent: u64,
     pub audio_frames_sent: u64,
     pub audio_bytes_sent: u64,
+    /// Input events accepted and injected this session.
+    pub input_events: u64,
+    /// Input events dropped: no backend, malformed/replayed, or the OS call
+    /// failed. Counted and reported, never silently swallowed.
+    pub input_dropped: u64,
     /// Why the session ended.
     pub ended: String,
 }
@@ -81,6 +86,19 @@ pub trait Clipboard: Send + Sync {
     fn write_text(&self, text: &str) -> Result<(), String>;
 }
 
+/// Guest input backend supplied by the guest executable. Implementations may
+/// hold state (pressed buttons, target size), so they synchronize internally
+/// and expose `&self`. A backend is only wired when injection can actually
+/// reach the active console session (see `hello.inputAvailable`).
+pub trait Input: Send + Sync {
+    fn key(&self, keysym: u32, down: bool) -> Result<(), String>;
+    fn pointer(&self, x: i32, y: i32, buttons: u8) -> Result<(), String>;
+    fn wheel(&self, dx: i32, dy: i32) -> Result<(), String>;
+    /// Best-effort release of anything the backend is holding (mouse buttons).
+    /// Called when a session ends so a disconnect cannot leave a button stuck.
+    fn reset(&self) {}
+}
+
 fn write_envelope(writer: &SharedWriter, message: &Envelope) -> Result<(), String> {
     let mut guard = writer.lock().map_err(|e| format!("writer lock: {e}"))?;
     write_control(&mut *guard, message).map_err(|e| format!("{e}"))?;
@@ -101,6 +119,7 @@ pub struct Server {
     workspace_generation: String,
     agent_version: String,
     clipboard: Option<Arc<dyn Clipboard>>,
+    input: Option<Arc<dyn Input>>,
 }
 
 impl Server {
@@ -116,6 +135,7 @@ impl Server {
             workspace_generation,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             clipboard: None,
+            input: None,
         })
     }
 
@@ -125,6 +145,14 @@ impl Server {
 
     pub fn with_clipboard(mut self, clipboard: Arc<dyn Clipboard>) -> Self {
         self.clipboard = Some(clipboard);
+        self
+    }
+
+    /// Advertise and accept input injection (`hello.inputAvailable`). The host
+    /// must only wire a backend whose [`Input`] calls reach the visible
+    /// console session.
+    pub fn with_input(mut self, input: Arc<dyn Input>) -> Self {
+        self.input = Some(input);
         self
     }
 
@@ -141,6 +169,7 @@ impl Server {
             &self.agent_version,
             None,
             self.clipboard.as_deref(),
+            self.input.as_deref(),
         ))
     }
 
@@ -163,6 +192,7 @@ impl Server {
             &self.agent_version,
             Some((gate, feed, stats)),
             self.clipboard.as_deref(),
+            self.input.as_deref(),
         ))
     }
 }
@@ -207,6 +237,7 @@ fn serve_connection(
     agent_version: &str,
     media: Option<(Arc<MediaGate>, mpsc::Receiver<MediaPacket>, Arc<MediaStats>)>,
     clipboard: Option<&dyn Clipboard>,
+    input: Option<&dyn Input>,
 ) -> SessionOutcome {
     let mut outcome = SessionOutcome::default();
     // The session claim is minted here and advertised in our hello; clients
@@ -279,9 +310,9 @@ fn serve_connection(
             "role": "controller-only",
             "capabilityEpoch": 1,
             "clipboardText": clipboard.is_some(),
-            // Honest capability flags: input injection lands with the Windows
-            // session backend and real guest resize with the mode manager.
-            "inputAvailable": false,
+            // Honest capability flags: input reflects whether a backend is
+            // wired; real guest resize lands with the display mode manager.
+            "inputAvailable": input.is_some(),
             "resizeAvailable": false,
         }),
     );
@@ -331,6 +362,7 @@ fn serve_connection(
                     media_stats.as_deref(),
                     &mut idr_signaled,
                     clipboard,
+                    input,
                 ) {
                     if outcome.ended.is_empty() {
                         outcome.ended = "refused".into();
@@ -359,6 +391,9 @@ fn serve_connection(
         outcome.audio_frames_sent = stats.audio_frames_sent.load(Ordering::SeqCst);
         outcome.audio_bytes_sent = stats.audio_bytes_sent.load(Ordering::SeqCst);
     }
+    if let Some(input) = input {
+        input.reset();
+    }
     outcome
 }
 
@@ -376,6 +411,7 @@ fn serve_control(
     stats: Option<&MediaStats>,
     idr_signaled: &mut u64,
     clipboard: Option<&dyn Clipboard>,
+    input: Option<&dyn Input>,
 ) -> bool {
     match message.message_type.as_str() {
         "clipboardGet" | "clipboardSet" => {
@@ -512,10 +548,33 @@ fn serve_control(
                 Err(_) => false,
             }
         }
-        // Input is a registered control type; injection itself lands with the
-        // Windows backend (advertised as hello.inputAvailable). Until then the
-        // guest accepts and ignores it rather than tearing down the session.
-        "input" => true,
+        // Input is fire-and-forget: an admitted controller's event is injected
+        // (advertised via hello.inputAvailable). Malformed, replayed or failed
+        // events are counted drops, never session-ending faults — but input
+        // from an unadmitted peer tears the session down like any other gated
+        // control action.
+        "input" => match handshake.input(message) {
+            Ok(event) => {
+                let applied = match input {
+                    Some(backend) => match event {
+                        InputEvent::Key { keysym, down } => backend.key(keysym, down),
+                        InputEvent::Pointer { x, y, buttons } => backend.pointer(x, y, buttons),
+                        InputEvent::Wheel { dx, dy } => backend.wheel(dx, dy),
+                    },
+                    None => Err("input-unavailable".to_owned()),
+                };
+                match applied {
+                    Ok(()) => outcome.input_events += 1,
+                    Err(_) => outcome.input_dropped += 1,
+                }
+                true
+            }
+            Err(Reject::UnknownType) => false,
+            Err(_) => {
+                outcome.input_dropped += 1;
+                true
+            }
+        },
         "telemetry" | "displayOwnership" | "capabilities" => true,
         "bye" => {
             outcome.ended = "peer-bye".into();
@@ -878,6 +937,173 @@ mod tests {
         let outcome = handle.join().unwrap();
         assert_eq!(outcome.ended, "refused");
         assert!(read_frame(&mut client).unwrap().is_none());
+    }
+
+    #[derive(Default)]
+    struct RecordingInput {
+        events: Mutex<Vec<String>>,
+        reset: AtomicU64,
+    }
+    impl Input for RecordingInput {
+        fn key(&self, keysym: u32, down: bool) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("key:{keysym}:{down}"));
+            Ok(())
+        }
+        fn pointer(&self, x: i32, y: i32, buttons: u8) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("pointer:{x}:{y}:{buttons}"));
+            Ok(())
+        }
+        fn wheel(&self, dx: i32, dy: i32) -> Result<(), String> {
+            self.events.lock().unwrap().push(format!("wheel:{dx}:{dy}"));
+            Ok(())
+        }
+        fn reset(&self) {
+            self.reset.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn input_events_are_injected_and_counted() {
+        let backend = Arc::new(RecordingInput::default());
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_input(backend.clone());
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["inputAvailable"], true);
+        let session = hello.session_id.clone();
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket": test_ticket(&session)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        send(
+            &control(
+                &session,
+                "input",
+                3,
+                serde_json::json!({"kind": "key", "keysym": 0xFF0D, "down": true}),
+            ),
+            &mut client,
+        );
+        send(
+            &control(
+                &session,
+                "input",
+                4,
+                serde_json::json!({"kind": "pointer", "x": 10, "y": 20, "buttons": 1}),
+            ),
+            &mut client,
+        );
+        send(
+            &control(
+                &session,
+                "input",
+                5,
+                serde_json::json!({"kind": "wheel", "dx": 0, "dy": 2}),
+            ),
+            &mut client,
+        );
+        // Out-of-range input is a counted drop, not a session-ending fault.
+        send(
+            &control(
+                &session,
+                "input",
+                6,
+                serde_json::json!({"kind": "key", "keysym": 0x0020_0000, "down": false}),
+            ),
+            &mut client,
+        );
+        send(
+            &control(&session, "bye", 7, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(
+            *backend.events.lock().unwrap(),
+            vec![
+                "key:65293:true".to_owned(),
+                "pointer:10:20:1".to_owned(),
+                "wheel:0:2".to_owned(),
+            ]
+        );
+        assert_eq!(outcome.input_events, 3);
+        assert_eq!(outcome.input_dropped, 1);
+        assert_eq!(backend.reset.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[test]
+    fn input_without_backend_is_dropped_not_fatal() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["inputAvailable"], false);
+        let session = hello.session_id.clone();
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket": test_ticket(&session)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        // hello said no, so a misbehaving viewer's events are counted drops.
+        send(
+            &control(
+                &session,
+                "input",
+                3,
+                serde_json::json!({"kind": "key", "keysym": 0x61, "down": true}),
+            ),
+            &mut client,
+        );
+        send(
+            &control(&session, "bye", 4, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(outcome.input_events, 0);
+        assert_eq!(outcome.input_dropped, 1);
+        assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[test]
+    fn input_before_admission_ends_the_session() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        send(
+            &control(
+                &hello.session_id,
+                "input",
+                2,
+                serde_json::json!({"kind": "key", "keysym": 0x61, "down": true}),
+            ),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(outcome.ended, "refused");
+        assert_eq!(outcome.input_events, 0);
     }
 
     #[test]

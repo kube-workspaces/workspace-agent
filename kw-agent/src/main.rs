@@ -1,9 +1,11 @@
 //! Workspace agent service entry point (v0.1).
 //!
-//! Platform capture/input/display/audio backends are **P0-gated**: only
-//! capability inventory, enrollment and the heartbeat daemon exist. This
-//! binary performs no capture, networking, input injection, mode changes or
-//! privileged operations.
+//! Capture/display/audio backends are **P0-gated**: capability inventory,
+//! enrollment and the heartbeat daemon always exist. `serve` picks up the
+//! console-session clipboard (`--clipboard`) and interactive input injection
+//! (`--input`, only usable from the active console session) when available;
+//! the rest of this binary performs no capture, mode changes or privileged
+//! operations.
 
 mod audio;
 mod capture;
@@ -20,7 +22,7 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
     );
@@ -159,6 +161,56 @@ fn main() {
                     }
                 }
                 server.with_clipboard(std::sync::Arc::new(ConsoleClipboard))
+            } else {
+                server
+            };
+            // Interactive input injection. Windows confines SendInput to the
+            // caller's session, so only wire the backend when this process
+            // shares the active console session; otherwise fail fast instead
+            // of advertising capability we cannot deliver.
+            let server = if args.iter().any(|arg| arg == "--input") {
+                let state = kw_platform::input::session_state();
+                if !state.can_inject() {
+                    eprintln!(
+                        "serve: --input unavailable: process session {:?}, active console session {:?} (needs the interactive console session)",
+                        state.current, state.active_console
+                    );
+                    std::process::exit(2);
+                }
+                let injector = kw_platform::input::Injector::new().unwrap_or_else(|error| {
+                    eprintln!("serve: input backend unavailable: {error}");
+                    std::process::exit(2);
+                });
+                struct InjectorInput(std::sync::Mutex<kw_platform::input::Injector>);
+                impl kw_transport::Input for InjectorInput {
+                    fn key(&self, keysym: u32, down: bool) -> Result<(), String> {
+                        self.0
+                            .lock()
+                            .map_err(|e| format!("input lock: {e}"))?
+                            .key(keysym, down)
+                    }
+                    fn pointer(&self, x: i32, y: i32, buttons: u8) -> Result<(), String> {
+                        self.0
+                            .lock()
+                            .map_err(|e| format!("input lock: {e}"))?
+                            .pointer(x, y, buttons)
+                    }
+                    fn wheel(&self, dx: i32, dy: i32) -> Result<(), String> {
+                        self.0
+                            .lock()
+                            .map_err(|e| format!("input lock: {e}"))?
+                            .wheel(dx, dy)
+                    }
+                    fn reset(&self) {
+                        if let Ok(mut injector) = self.0.lock() {
+                            injector.release();
+                        }
+                    }
+                }
+                println!("input injection enabled (session {:?})", state.current);
+                server.with_input(std::sync::Arc::new(InjectorInput(std::sync::Mutex::new(
+                    injector,
+                ))))
             } else {
                 server
             };
@@ -362,7 +414,7 @@ fn main() {
                         served += 1;
                         idle_since = std::time::Instant::now();
                         println!(
-                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={} video_frames={} video_bytes={} video_keyframes={} audio_frames={} audio_bytes={}",
+                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={} video_frames={} video_bytes={} video_keyframes={} audio_frames={} audio_bytes={} input_events={} input_dropped={}",
                             outcome.ended,
                             outcome.control_frames,
                             outcome.media_bytes,
@@ -373,6 +425,8 @@ fn main() {
                             outcome.video_keyframes_sent,
                             outcome.audio_frames_sent,
                             outcome.audio_bytes_sent,
+                            outcome.input_events,
+                            outcome.input_dropped,
                         );
                     }
                     Err(error) => {

@@ -1,6 +1,7 @@
-//! OS backends: capability inventory plus the Windows capture backend.
-//! Capture, input, display-mode and audio-streaming backends beyond DXGI
-//! duplication remain P0-gated and return [`Error::Gated`].
+//! OS backends: capability inventory, the Windows capture backend, console
+//! clipboard and interactive input injection.
+//! Display-mode and audio-streaming backends beyond DXGI duplication remain
+//! P0-gated and return [`Error::Gated`].
 //!
 //! [`inventory`] feeds the `hello` capability advertisement: real adapter,
 //! output, audio-endpoint and encoder data from inbox OS APIs — no drivers
@@ -11,6 +12,7 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod input;
 
 use serde::{Deserialize, Serialize};
 
