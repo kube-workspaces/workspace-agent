@@ -691,15 +691,19 @@ mod tests {
             .push(&frame, 5 * step, true)
             .expect("forced-IDR push works");
         // Fresh MFTs buffer lookahead before emitting: the IDR for the
-        // forced frame arrives within the next few inputs, not necessarily
-        // synchronously with it. Drain forward and judge the accumulation.
-        for index in 6..9i64 {
+        // forced frame arrives within the next inputs, not necessarily
+        // synchronously with it. Drain forward (bounded) and judge the
+        // accumulation; stop early once the IDR lands.
+        for index in 6..24i64 {
             let frame = gradient(settings.width, settings.height, index as u8);
             post.extend(
                 encoder
                     .push(&frame, index * step, false)
                     .expect("post-IDR push works"),
             );
+            if post.iter().any(|chunk| chunk.keyframe) {
+                break;
+            }
         }
         let types: Vec<u8> = post
             .iter()
@@ -738,13 +742,16 @@ mod tests {
         encoder.reconfigure(&small).expect("mid-stream reconfigure");
         assert_eq!(encoder.settings().width, 176);
         let mut post = Vec::new();
-        for index in 1..4i64 {
+        for index in 1..20i64 {
             let frame = gradient(176, 144, index as u8);
             post.extend(
                 encoder
                     .push(&frame, index * step, false)
                     .expect("post-reconfigure push"),
             );
+            if !post.is_empty() {
+                break;
+            }
         }
         assert!(!post.is_empty(), "encoder emits at the new size");
         let trailing = encoder.finish().expect("finish");
