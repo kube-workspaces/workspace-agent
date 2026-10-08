@@ -279,6 +279,10 @@ fn serve_connection(
             "role": "controller-only",
             "capabilityEpoch": 1,
             "clipboardText": clipboard.is_some(),
+            // Honest capability flags: input injection lands with the Windows
+            // session backend and real guest resize with the mode manager.
+            "inputAvailable": false,
+            "resizeAvailable": false,
         }),
     );
     if write_envelope(&writer, &hello).is_err() {
@@ -508,6 +512,10 @@ fn serve_control(
                 Err(_) => false,
             }
         }
+        // Input is a registered control type; injection itself lands with the
+        // Windows backend (advertised as hello.inputAvailable). Until then the
+        // guest accepts and ignores it rather than tearing down the session.
+        "input" => true,
         "telemetry" | "displayOwnership" | "capabilities" => true,
         "bye" => {
             outcome.ended = "peer-bye".into();

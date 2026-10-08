@@ -36,6 +36,15 @@ class ValidatorTests(unittest.TestCase):
         message["sequence"] = -1
         self.assertFalse(validate_fixtures.check_envelope("keyframe", message))
 
+    def test_out_of_range_input_rejected(self):
+        payload = {"kind": "wheel", "dx": 0, "dy": validate_fixtures.INPUT_MAX_WHEEL + 1}
+        self.assertFalse(validate_fixtures.check_input("input-wheel", payload))
+        keysym = {"kind": "key", "keysym": validate_fixtures.INPUT_MAX_KEYSYM + 1, "down": True}
+        self.assertFalse(validate_fixtures.check_input("input", keysym))
+
+    def test_unknown_input_kind_rejected(self):
+        self.assertFalse(validate_fixtures.check_input("input", {"kind": "macro"}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,10 +6,44 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VECTORS = ROOT / "protocol" / "v1" / "vectors"
-CONTROL_TYPES = {"hello", "capabilities", "attach", "keyframeRequest",
-                 "resizeRequest", "resizeAck", "clipboardGet", "clipboardSet",
-                 "clipboardResult", "displayOwnership", "telemetry", "bye"}
+CONTROL_TYPES = {"hello", "capabilities", "attach", "attachResult", "input",
+                 "keyframeRequest", "resizeRequest", "resizeAck", "clipboardGet",
+                 "clipboardSet", "clipboardResult", "displayOwnership",
+                 "telemetry", "bye"}
 MEDIA_TYPES = {"video", "audio"}
+
+# Bounds mirrored from kw-protocol::{check_input, INPUT_*}: keep in step with
+# the Rust validator, or the two disagree about what the protocol allows.
+INPUT_MAX_WHEEL = 1000
+INPUT_MAX_COORD = 1_000_000
+INPUT_MAX_KEYSYM = 0x0010FFFF
+
+
+def check_input(name, payload):
+    ok = True
+    kind = payload.get("kind")
+    if kind == "key":
+        keysym = payload.get("keysym")
+        if not isinstance(keysym, int) or isinstance(keysym, bool) or not 0 <= keysym <= INPUT_MAX_KEYSYM:
+            ok = fail(f"{name}: key keysym out of range") and False
+        if not isinstance(payload.get("down"), bool):
+            ok = fail(f"{name}: key down must be a boolean") and False
+    elif kind == "pointer":
+        for field in ("x", "y"):
+            value = payload.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= INPUT_MAX_COORD:
+                ok = fail(f"{name}: pointer {field} out of range") and False
+        buttons = payload.get("buttons")
+        if not isinstance(buttons, int) or isinstance(buttons, bool) or not 0 <= buttons <= 255:
+            ok = fail(f"{name}: pointer buttons out of range") and False
+    elif kind == "wheel":
+        for field in ("dx", "dy"):
+            value = payload.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or abs(value) > INPUT_MAX_WHEEL:
+                ok = fail(f"{name}: wheel {field} out of range") and False
+    else:
+        ok = fail(f"{name}: unknown input kind {kind!r}") and False
+    return ok
 
 
 def fail(message):
@@ -60,6 +94,10 @@ def main():
     hello = messages.get("hello", {})
     if hello.get("payload", {}).get("role") != "controller-only":
         ok = fail("hello: first milestone must advertise controller-only") and False
+    hello_payload = hello.get("payload", {})
+    for field in ("inputAvailable", "resizeAvailable"):
+        if not isinstance(hello_payload.get(field), bool):
+            ok = fail(f"hello: {field} must be a boolean") and False
     request = messages.get("resize-request", {}).get("payload", {})
     ack = messages.get("resize-ack", {}).get("payload", {})
     if ack.get("requestId") != request.get("requestId") or not ack.get("requestId"):
@@ -73,6 +111,17 @@ def main():
     if not (ticket.get("decision") == "reject-expired"
             and ticket.get("ticket", {}).get("expiresAtNs", 1) <= messages["ticket-expiry"]["sentAtNs"]):
         ok = fail("ticket-expiry: expired ticket must be rejected") and False
+    for name, message in messages.items():
+        if message.get("type") != "input":
+            continue
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            ok = fail(f"{name}: input payload must be an object") and False
+        else:
+            ok = check_input(name, payload) and ok
+    attach_result = messages.get("attach-result", {}).get("payload", {})
+    if not isinstance(attach_result.get("admitted"), bool):
+        ok = fail("attach-result: admitted must be a boolean") and False
     print(f"checked {len(vectors)} vectors")
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1

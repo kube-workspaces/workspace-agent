@@ -58,6 +58,33 @@ fn vectors_parse_and_validate() {
     // First milestone is exclusive-controller only.
     let hello = &by_name["hello"];
     assert_eq!(hello.payload["role"], "controller-only");
+    assert!(hello.payload["inputAvailable"].is_boolean());
+    assert!(hello.payload["resizeAvailable"].is_boolean());
+
+    // An admitted attach produces a registered attachResult control type.
+    let attach_result = &by_name["attach-result"];
+    assert_eq!(attach_result.payload["admitted"], true);
+
+    // Input events parse with their kind tag and enforce bounded ranges.
+    for name in ["input", "input-pointer", "input-wheel"] {
+        let event: InputEvent = serde_json::from_value(by_name[name].payload.clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        check_input(&event).unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    assert_eq!(
+        check_input(&InputEvent::Wheel {
+            dx: INPUT_MAX_WHEEL + 1,
+            dy: 0
+        }),
+        Err(Reject::Malformed)
+    );
+    assert_eq!(
+        check_input(&InputEvent::Key {
+            keysym: INPUT_MAX_KEYSYM + 1,
+            down: true
+        }),
+        Err(Reject::Malformed)
+    );
 
     // Resize ACK echoes the request and reconfigures with a fresh IDR.
     let request_id = by_name["resize-request"].payload["requestId"].as_str();

@@ -44,18 +44,34 @@ to a fresh IDR.
 
 ## Control messages
 
-`type` is one of: `hello`, `capabilities`, `attach`, `keyframeRequest`,
-`resizeRequest`, `resizeAck`, `clipboardGet`, `clipboardSet`,
-`clipboardResult`, `displayOwnership`, `telemetry`, `bye`.
+`type` is one of: `hello`, `capabilities`, `attach`, `attachResult`, `input`,
+`keyframeRequest`, `resizeRequest`, `resizeAck`, `clipboardGet`,
+`clipboardSet`, `clipboardResult`, `displayOwnership`, `telemetry`, `bye`.
 
 - `hello`: agent identity/version, image/profile compatibility, actual
   codec/profile/level, capture/output dimensions, audio endpoint state,
-  cursor metadata, display-mode list, role/capabilities.
+  cursor metadata, display-mode list, role/capabilities. Capability booleans
+  `inputAvailable` and `resizeAvailable` state whether admitted input is
+  injected and whether a `resizeRequest` can actually change the guest mode;
+  a viewer must not send input or expect a real resize before the matching
+  flag is true.
 - `capabilities`: updated subset of `hello` fields; `capabilityEpoch`
   increases on every change.
 - `attach`: viewer presents a short-lived ticket (see below). Agent and
   proxy verify workspace UID, generation, session/participant, role,
   control epoch, audience and expiry before admitting input.
+- `attachResult`: `{admitted, reason?}`, sent in reply to `attach` in the
+  same session claim; a rejected attach carries a bounded machine-readable
+  reason and admits no input.
+- `input`: viewer→guest input, sent only by the admitted controller and only
+  when `hello.inputAvailable` is true. Carries a `kind` tag:
+  `{"kind":"key","keysym":N,"down":bool}` (X11 keysym, up to `0x0010FFFF`),
+  `{"kind":"pointer","x":N,"y":N,"buttons":N}` (logical guest desktop
+  coordinates, RFB-style button bitmask `0..255`), or
+  `{"kind":"wheel","dx":N,"dy":N}` (steps, positive right/down, `|d| ≤ 1000`).
+  Fire-and-forget: there is no per-event ack, the guest counts drops and
+  reports them in `telemetry`, and held input is released on disconnect,
+  focus loss or epoch change. No generic command execution.
 - `resizeRequest`: monotonically identified desired mode
   (`requestId`, width, height, DPR policy). Only the newest applies.
 - `resizeAck`: echoes `requestId`, reports requested vs actual dimensions

@@ -39,6 +39,8 @@ pub const CONTROL_TYPES: &[&str] = &[
     "hello",
     "capabilities",
     "attach",
+    "attachResult",
+    "input",
     "keyframeRequest",
     "resizeRequest",
     "resizeAck",
@@ -52,6 +54,29 @@ pub const CONTROL_TYPES: &[&str] = &[
 
 /// Media frame types.
 pub const MEDIA_TYPES: &[&str] = &["video", "audio"];
+
+/// Largest absolute wheel delta accepted in one [`InputEvent`].
+pub const INPUT_MAX_WHEEL: i32 = 1000;
+/// Largest pointer coordinate accepted (well beyond any real desktop).
+pub const INPUT_MAX_COORD: i32 = 1_000_000;
+/// Largest X11 keysym accepted (Unicode keysyms live at `0x01000000 | cp`).
+pub const INPUT_MAX_KEYSYM: u32 = 0x0010_FFFF;
+
+/// Viewer→guest input. Fire-and-forget: latency matters more than an ack, so
+/// there is no result message; the guest counts and reports drops in
+/// `telemetry`. Only an admitted controller may send these, and the guest
+/// advertises `hello.payload.inputAvailable` before a viewer sends any.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum InputEvent {
+    /// Key press/release by X11 keysym (client layouts map to keysyms).
+    Key { keysym: u32, down: bool },
+    /// Pointer position in guest desktop coordinates plus the RFB-style
+    /// button bitmask (bit 0 left, 1 middle, 2 right; reserved wider).
+    Pointer { x: i32, y: i32, buttons: u8 },
+    /// Wheel steps, positive right/down.
+    Wheel { dx: i32, dy: i32 },
+}
 
 /// Message envelope. Every frame on either channel carries this.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -96,6 +121,8 @@ pub enum Reject {
     Protocol,
     /// Unknown message type for the channel.
     UnknownType,
+    /// Payload outside its declared bounds (e.g. an input event).
+    Malformed,
     /// `(generation, sequence)` already seen or regressed.
     Replay,
     /// Ticket expired, wrong audience/session, or demoted epoch.
@@ -107,6 +134,7 @@ impl std::fmt::Display for Reject {
         match self {
             Reject::Protocol => write!(f, "unsupported protocol or version"),
             Reject::UnknownType => write!(f, "unknown message type for channel"),
+            Reject::Malformed => write!(f, "malformed payload"),
             Reject::Replay => write!(f, "replayed or regressed sequence"),
             Reject::Ticket => write!(f, "ticket rejected"),
         }
@@ -128,6 +156,24 @@ pub fn check_envelope(message: &Envelope) -> Result<(), Reject> {
         return Err(Reject::UnknownType);
     }
     Ok(())
+}
+
+/// Enforce the bounded ranges of an input event. Aliasing or privilege
+/// sequencing is deliberately out of scope: input is only accepted from an
+/// admitted controller and carries no privilege elevation.
+pub fn check_input(event: &InputEvent) -> Result<(), Reject> {
+    let ok = match *event {
+        InputEvent::Key { keysym, .. } => keysym <= INPUT_MAX_KEYSYM,
+        InputEvent::Pointer { x, y, .. } => {
+            (0..=INPUT_MAX_COORD).contains(&x) && (0..=INPUT_MAX_COORD).contains(&y)
+        }
+        InputEvent::Wheel { dx, dy } => dx.abs() <= INPUT_MAX_WHEEL && dy.abs() <= INPUT_MAX_WHEEL,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Reject::Malformed)
+    }
 }
 
 /// Per-channel ordering fence. Accepts strictly increasing
