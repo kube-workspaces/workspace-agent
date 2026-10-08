@@ -122,6 +122,12 @@ pub fn run(
             };
             let (packet_format, bytes, _) = batch;
             debug_assert_eq!(packet_format, format, "mix format is per-tap stable");
+            // Keep the native tap drained while waiting for a viewer, but do
+            // not encode/queue pre-admission audio. Otherwise a new attachment
+            // replays sound from before it connected and the queue grows idle.
+            if !gate.admitted.load(Ordering::SeqCst) {
+                continue;
+            }
             let pcm = match kw_audio::tap::pcm_to_f32(&bytes, format) {
                 Ok(pcm) => pcm,
                 Err(error) => return PumpEnd::Fatal(format!("mix decode failed: {error}")),

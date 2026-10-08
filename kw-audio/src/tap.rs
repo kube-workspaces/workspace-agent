@@ -135,8 +135,8 @@ mod platform {
     use windows::Win32::Foundation::{BOOL, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-        MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
+        MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -220,10 +220,14 @@ mod platform {
         /// `Ok(None)` on wait timeout (silence gap, not an error); device
         /// removal surfaces as [`Error::DeviceLost`] so the host reopens.
         pub fn read(&self, timeout_ms: u32) -> Result<Option<(MixFormat, Vec<u8>, u32)>, Error> {
-            if unsafe { WaitForSingleObject(self.event, timeout_ms) } != WAIT_OBJECT_0 {
-                return Ok(None);
+            // Drain already queued packets before waiting for another event.
+            let mut available = unsafe { self.capture.GetNextPacketSize() }.map_err(device_lost)?;
+            if available == 0 {
+                if unsafe { WaitForSingleObject(self.event, timeout_ms) } != WAIT_OBJECT_0 {
+                    return Ok(None);
+                }
+                available = unsafe { self.capture.GetNextPacketSize() }.map_err(device_lost)?;
             }
-            let available = unsafe { self.capture.GetNextPacketSize() }.map_err(device_lost)?;
             if available == 0 {
                 return Ok(None);
             }
@@ -238,8 +242,15 @@ mod platform {
             {
                 return Err(Error::DeviceLost);
             }
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data, count as usize * self.frame_bytes).to_vec()
+            let length = count as usize * self.frame_bytes;
+            let bytes = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || length == 0 {
+                // WASAPI may return a null pointer for a silent packet.
+                vec![0u8; length]
+            } else if data.is_null() {
+                let _ = unsafe { self.capture.ReleaseBuffer(count) };
+                return Err(Error::Os(0));
+            } else {
+                unsafe { std::slice::from_raw_parts(data, length).to_vec() }
             };
             if unsafe { self.capture.ReleaseBuffer(count) }.is_err() {
                 return Err(Error::Os(0));

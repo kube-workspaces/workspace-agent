@@ -512,7 +512,8 @@ fn main() {
                     }
                 }
             }
-            let rms = (energy / decoded_samples.max(1) as f64).sqrt();
+            let rms =
+                (energy / (decoded_samples.max(1) * kw_audio::opus::CHANNELS as u64) as f64).sqrt();
             println!(
                 "packets={} decoded_frames={} decoded_samples={} rms={:.6}",
                 packets.len(),
