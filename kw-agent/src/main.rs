@@ -14,7 +14,7 @@ mod synthetic;
 fn usage(code: i32) -> ! {
     eprintln!(
         "kw-agent {} ({})",
-        env!("CARGO_PKG_VERSION"),
+        kw_protocol::AGENT_VERSION,
         platform::describe()
     );
     eprintln!("usage:");
@@ -39,7 +39,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {
-            println!("kw-agent {}", env!("CARGO_PKG_VERSION"));
+            println!("kw-agent {}", kw_protocol::AGENT_VERSION);
         }
         Some("--platform") => {
             let info = platform::info();

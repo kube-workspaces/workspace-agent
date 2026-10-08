@@ -1,0 +1,60 @@
+<!-- Kube Workspaces agent unsigned Windows MSI (WiX v4/v5, `wix build`).
+//
+// What this is: a per-machine files-only installer for install hygiene
+// (Add/Remove entry, clean upgrade/uninstall). It is explicitly NOT a trust
+// fix: the MSI is built unsigned and SmartScreen warns the same as the zip.
+// Signed MSI stays budget-blocked (tracking/future/code-signing-and-notarisation.md).
+//
+// Scope note (load-bearing): the agent runs machine-wide, so this package is
+// perMachine and installs to Program Files\workspace-agent — the same
+// directory install.ps1 uses. It deliberately does NOT enroll the workspace,
+// write an enrollment token or register the startup task: enrollment material
+// is per-guest (image recipe / first-boot media), never a release artifact.
+//
+// Layout contract:
+//   - kw-agent.exe plus the enrollment scripts install in INSTALLDIR.
+//   - No Start Menu shortcut: this is a background guest agent, not a GUI app.
+//   - Uninstall never touches %ProgramData%\workspace-agent (agent identity
+//     and status live there and must survive upgrade/uninstall).
+//   - UpgradeCode below is stable FOREVER: changing it orphans installed
+//     products from the MajorUpgrade path. ProductCode is auto (* per build);
+//     ProductVersion comes from -d ProductVersion= (sanitized X.Y.Z by
+//     build-msi.ps1; MSI has no semver).
+//
+// Payload harvesting: build-msi.ps1 generates the PayloadFiles fragment from
+// the staged tag-archive contents. Contract with the generator: the agent
+// exe's File Id is AgentExe.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Kube Workspaces Agent"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Kube Workspaces"
+           UpgradeCode="f72bb43e-dba8-4dbb-a963-b201e6c0d885"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Kube Workspaces Agent is already installed." />
+    <Media Id="1" Cabinet="workspace-agent.cab" EmbedCab="yes" />
+
+    <!-- Recorded install location: Add/Remove Programs shows it. MUST be a
+         SetProperty after CostFinalize, never a Property-table row: ARP
+         values from the Property table reach the uninstall key literally,
+         so Value="[INSTALLDIR]" there registers the text "[INSTALLDIR]"
+         instead of the directory (the bug desktop-client shipped once). -->
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLDIR]"
+                 After="CostFinalize" Sequence="both" />
+    <Property Id="INSTALLDIR" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="workspace-agent" />
+    </StandardDirectory>
+
+    <Feature Id="ProductFeature" Title="Kube Workspaces Agent" Level="1">
+      <ComponentGroupRef Id="PayloadFiles" />
+    </Feature>
+
+    <!-- Standard welcome/progress/exit dialogs (WixToolset.UI.wixext). No
+         custom artwork: an unsigned console utility does not need a banner
+         budget, and no icon is bundled on purpose (no assets/ in this repo). -->
+    <UIRef Id="WixUI_Minimal" />
+  </Package>
+</Wix>

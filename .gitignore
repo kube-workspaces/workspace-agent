@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 target/
 dist/
+bin/
 *.exe
 .DS_Store

@@ -13,11 +13,14 @@ integration. No live-environment details belong here.
 
 ## Status
 
-P1 scaffolding: versioned protocol spec (`docs/protocol/kw-agent-v1.md`)
-and conformance fixtures with a validator. No guest implementation yet;
-P0 proof gates (capture, audio endpoint, signed display driver, transport
-choice) remain open in tracking. Do not treat fixtures or CI green as
-guest acceptance.
+Native interactive premium tier in progress (session detection, guest
+input injection, real guest resize, telemetry), tracked privately in
+`kube-workspaces/tracking`. Versioned protocol spec
+(`docs/protocol/kw-agent-v1.md`) and conformance fixtures with a
+validator are in place; CI, release archives and the unsigned Windows
+MSI pipeline are active. P0 proof gates (capture, audio endpoint,
+signed display driver, transport choice) remain open in tracking. Do
+not treat fixtures or CI green as guest acceptance.
 
 ## Layout
 
@@ -30,15 +33,15 @@ guest acceptance.
 | `kw-agent/` | Service binary skeleton (platform stubs; backends P0-gated) |
 | `tools/validate_fixtures.py` | Fixture validator (no dependencies) |
 | `tools/test_validate_fixtures.py` | Validator unit tests |
+| `Makefile` | `lint` / `test` / `package` targets used by CI |
+| `scripts/verify-release-archives.py` | Release archive contract check |
+| `packaging/windows/` | Unsigned MSI (WiX) build, verify and lifecycle test |
 
 ## Checks
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-python3 tools/validate_fixtures.py
-python3 -m unittest discover -s tools -p 'test_*.py'
+make lint
+make test
 ```
 
 ## License

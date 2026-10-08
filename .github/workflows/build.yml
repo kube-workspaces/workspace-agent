@@ -1,0 +1,461 @@
+name: Build
+
+# Produce downloadable workspace-agent release artifacts.
+#
+# Shape mirrors the desktop-client Build workflow (same org conventions):
+# every push to main uploads one archive per target to the workflow run, and
+# pushing a `v*` tag additionally publishes those archives plus the unsigned
+# Windows MSI as a GitHub Release.
+#
+# Rust needs no cgo-style per-OS toolchain split, so each target is built
+# natively in the `build` matrix (Windows/amd64 with MSVC, Linux/amd64 and
+# Linux/arm64 on their own runners — no cross-compilation). The `assemble`
+# job stages and archives the downloaded binaries on one Linux runner, the
+# `msi` job builds the unsigned per-arch Windows MSI (WiX) from the assembled
+# archive, and on a `v*` tag the `release` job publishes archives + MSI with
+# checksums recomputed after MSI creation (MSI creation changes bytes).
+#
+# Version is `git describe` everywhere and is baked into the binary at
+# compile time via KW_AGENT_VERSION (see kw-protocol::AGENT_VERSION), so
+# `kw-agent --version`, the hello payload and the archive names agree.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-amd64
+            runs-on: windows-latest
+            bin: kw-agent.exe
+          - target: linux-amd64
+            runs-on: ubuntu-24.04
+            bin: kw-agent
+          - target: linux-arm64
+            runs-on: ubuntu-24.04-arm
+            bin: kw-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Full history so `git describe` can name the build after the last
+          # tag rather than falling back to a bare sha.
+          fetch-depth: 0
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        env:
+          KW_AGENT_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release --locked -p kw-agent
+
+      # The version reported by the binary must be the version the archive
+      # will carry; a mismatch means the env did not reach the build.
+      - name: Verify the binary reports the resolved version
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/release/${{ matrix.bin }}"
+          got="$("$bin" --version)"
+          echo "reported version: $got"
+          test "$got" = "kw-agent ${{ steps.version.outputs.version }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  # Stage and archive all three targets in one place: the packaging shell
+  # (tar/zip/sha256sum, make package) belongs on the Linux runner that owns
+  # SHA256SUMS, exactly like desktop-client's assemble job.
+  assemble:
+    name: Package archives
+    runs-on: ubuntu-24.04
+    needs: [build]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+
+      # One download per target so each binary lands at bin/<target>/ where
+      # `make package` expects it (artifact root holds the bare file).
+      - name: Download windows/amd64 binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-windows-amd64
+          path: bin/windows-amd64
+
+      - name: Download linux/amd64 binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-linux-amd64
+          path: bin/linux-amd64
+
+      - name: Download linux/arm64 binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-linux-arm64
+          path: bin/linux-arm64
+
+      - name: Package archives
+        run: make package VERSION=${{ steps.version.outputs.version }}
+
+      - name: Verify the release archive contract
+        run: python3 scripts/verify-release-archives.py dist '${{ steps.version.outputs.version }}'
+
+      # An archive member must be runnable and report the version it was
+      # built with — the contract the guest image recipe depends on.
+      - name: Verify the packaged Linux binary runs
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/workspace-agent-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" -C /tmp
+          got=$(/tmp/workspace-agent-linux-amd64/kw-agent --version)
+          echo "reported version: $got"
+          test "$got" = "kw-agent ${{ steps.version.outputs.version }}"
+
+      - name: Upload linux/amd64 archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-agent-linux-amd64
+          path: dist/workspace-agent-*-linux-amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload linux/arm64 archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-agent-linux-arm64
+          path: dist/workspace-agent-*-linux-arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload windows/amd64 archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: workspace-agent-windows-amd64
+          path: dist/workspace-agent-*-windows-amd64.zip
+          if-no-files-found: error
+
+  # Unsigned Windows MSI (install hygiene only — NOT a trust fix). Built from
+  # the assembled archive on a Windows runner (WiX needs Windows). Runs on
+  # every push so a broken .wxs breaks the build, not the release; only tag
+  # pushes publish (see the release job). The MSI places files only: agent
+  # enrollment and the scheduled task stay with install.ps1 (image recipe),
+  # never with a release artifact. When Authenticode is funded, a sign step
+  # slots in here before upload.
+  msi:
+    name: Unsigned MSI
+    runs-on: windows-latest
+    needs: [assemble]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        # On a release tag the MSI metadata (file name, ProductVersion) must
+        # come from the tag itself, never from a describe string that could
+        # drift. Dev builds keep git describe (sanitized to 0.0.0 by the
+        # build script).
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guard release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if ! [[ "${{ steps.version.outputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::MSI release version must be an exact tag, got '${{ steps.version.outputs.version }}'"
+            exit 1
+          fi
+
+      - name: Download assembled Windows archive
+        uses: actions/download-artifact@v8
+        with:
+          name: workspace-agent-windows-amd64
+          path: archive
+          github-token: ${{ github.token }}
+
+      - name: Setup .NET for WiX
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install pinned WiX
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build unsigned MSI
+        shell: pwsh
+        run: |
+          $zip = Get-Item 'archive/workspace-agent-${{ steps.version.outputs.version }}-windows-amd64.zip'
+          $stage = Join-Path $env:RUNNER_TEMP "msi-stage"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          Expand-Archive $zip.FullName -DestinationPath $stage -Force
+          $inner = Get-Item (Join-Path $stage 'workspace-agent-windows-amd64')
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          & packaging/windows/build-msi.ps1 `
+            -Version '${{ steps.version.outputs.version }}' `
+            -Arch amd64 `
+            -StagingDir $inner.FullName `
+            -OutFile "out/workspace-agent-${{ steps.version.outputs.version }}-windows-amd64.msi"
+
+      - name: Test MSI lifecycle
+        shell: pwsh
+        run: |
+          & packaging/windows/test-msi.ps1 -StagingDir "$env:RUNNER_TEMP/msi-stage/workspace-agent-windows-amd64"
+
+      - name: Upload installer logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-test-logs
+          path: ${{ runner.temp }}/msi-lifecycle/*.log
+          if-no-files-found: ignore
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-windows-amd64
+          path: out/*.msi
+          if-no-files-found: error
+
+  checksums:
+    name: Verify final distribution
+    runs-on: ubuntu-24.04
+    needs: [assemble, msi]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: workspace-agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download MSI
+        uses: actions/download-artifact@v8
+        with:
+          pattern: msi-windows-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check all four artifacts
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum *.tar.gz *.zip *.msi > SHA256SUMS)
+          python3 scripts/verify-release-archives.py dist "$(git describe --tags --always --dirty)" --require-msi
+          {
+            echo '### workspace-agent distribution'
+            echo 'Three archives plus the unsigned Windows MSI, covered by SHA256SUMS.'
+            echo 'The MSI places files only; enrollment and the startup task stay with install.ps1.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    # Only for tag pushes. Tags are created deliberately, never by automation.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checksums]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download assembled archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: workspace-agent-*
+          path: dist
+          merge-multiple: true
+          github-token: ${{ github.token }}
+
+      # Checksums are (re)computed AFTER the MSI lands in dist/, same rule
+      # as future signing: MSI creation (or signing) changes bytes, so
+      # checksums computed before are wrong.
+      - name: Download unsigned MSI
+        uses: actions/download-artifact@v8
+        with:
+          pattern: msi-windows-*
+          path: msi
+          github-token: ${{ github.token }}
+
+      - name: Stage MSI and recompute checksums
+        run: |
+          set -euo pipefail
+          cp msi/msi-windows-*/*.msi dist/
+          ls dist/*.msi
+          (cd dist && sha256sum *.tar.gz *.zip *.msi > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Verify release archive contract
+        run: python3 scripts/verify-release-archives.py dist '${{ github.ref_name }}' --require-msi
+
+      # The generator lives in the deploy repo so all kube-workspaces
+      # repositories classify commits the same way. It is authoritative for the
+      # "Summary" preamble and the categorised commit list; the download and
+      # install text below is agent-specific.
+      - name: Fetch the release-notes generator
+        run: |
+          curl -fsSLo /tmp/release-notes.sh \
+            https://raw.githubusercontent.com/kube-workspaces/deploy/main/scripts/release-notes.sh
+          chmod +x /tmp/release-notes.sh
+
+      - name: Compose release notes
+        env:
+          VERSION: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/$REPO/releases/download/$VERSION"
+          {
+            echo "Baked-in guest agent for Kube Workspaces VM workspaces (\`kw-agent\`):"
+            echo "the \`kw-agent-v1\` protocol, DXGI desktop capture, H.264/Opus media,"
+            echo "Windows text clipboard and the framed transport behind the proxy's"
+            echo "\`/agent/\` bridge."
+            echo
+            echo "## Download"
+            echo
+            echo "| Platform | Architecture | File |"
+            echo "|---|---|---|"
+            echo "| Linux | x86_64 | [\`workspace-agent-$VERSION-linux-amd64.tar.gz\`]($base/workspace-agent-$VERSION-linux-amd64.tar.gz) |"
+            echo "| Linux | arm64 | [\`workspace-agent-$VERSION-linux-arm64.tar.gz\`]($base/workspace-agent-$VERSION-linux-arm64.tar.gz) |"
+            echo "| Windows | x86_64 | [\`workspace-agent-$VERSION-windows-amd64.zip\`]($base/workspace-agent-$VERSION-windows-amd64.zip) |"
+            echo "| Windows | x86_64 | **unsigned MSI** [\`workspace-agent-$VERSION-windows-amd64.msi\`]($base/workspace-agent-$VERSION-windows-amd64.msi) |"
+            echo
+            echo "Verify with [\`SHA256SUMS\`]($base/SHA256SUMS): \`sha256sum -c SHA256SUMS\`"
+            echo
+            echo "## Install"
+            echo
+            echo "**Linux** — extract and run:"
+            echo
+            echo '```bash'
+            echo "tar -xzf workspace-agent-$VERSION-linux-amd64.tar.gz"
+            echo "cd workspace-agent-linux-amd64"
+            echo "./kw-agent --help"
+            echo '```'
+            echo
+            echo "**Windows** — the zip carries \`install.ps1\` (admin) which copies the"
+            echo "binary to \`%ProgramFiles%\\workspace-agent\`, writes a one-use enrollment"
+            echo "token for the target workspace and registers the startup task:"
+            echo
+            echo '```powershell'
+            echo ".\\install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>"
+            echo '```'
+            echo
+            echo "The \`.msi\` is an **unsigned files-only installer** (Add/Remove entry,"
+            echo "install/upgrade/uninstall to \`Program Files\\workspace-agent\`); enrollment"
+            echo "and the startup task still come from \`install.ps1\` or the workspace image"
+            echo "recipe. Silent install: \`msiexec /i workspace-agent-$VERSION-windows-amd64.msi /qn\`."
+            echo
+            echo "> **These binaries are not code-signed.** Windows SmartScreen will warn:"
+            echo "> choose \"More info\" → \"Run anyway\". Signing and notarisation are not yet"
+            echo "> set up."
+            echo
+            echo "The wire protocol (\`kw-agent-v1\`) is versioned separately from the package"
+            echo "version; the guest image pins its own agent build."
+            echo
+          } > /tmp/release-notes.md
+
+          # Version-specific section: the same preamble and categorised
+          # "What's Changed" list the component repos publish. --skip-upgrade
+          # drops the Helm upgrade block, which does not apply to a binary.
+          # The very first tag has no previous tag to range over; say so
+          # instead of failing the job.
+          from="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+          if [ -n "$from" ]; then
+            /tmp/release-notes.sh --repo workspace-agent \
+              --from "$from" --to HEAD --version "$VERSION" --skip-upgrade \
+              > /tmp/changelog.md
+            cat /tmp/changelog.md >> /tmp/release-notes.md
+          else
+            {
+              echo "## What's Changed"
+              echo
+              echo "First release: there is no previous tag to compare against."
+              echo
+            } >> /tmp/release-notes.md
+          fi
+
+          {
+            echo
+            echo "## Known caveats"
+            echo
+            echo "This is an early release. Secure-desktop input (UAC/Ctrl+Alt+Del) and"
+            echo "guest display resize depend on the running Windows session and display"
+            echo "driver; failures are reported honestly rather than faked. Please report"
+            echo "what you find."
+          } >> /tmp/release-notes.md
+          cat /tmp/release-notes.md
+
+      # Idempotent: a re-pushed tag (amended commit) re-triggers this job with a
+      # release already present, and `gh release create` then fails. Edit the
+      # release and clobber-upload the assets instead of erroring.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file /tmp/release-notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/release-notes.md
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.msi dist/SHA256SUMS --clobber

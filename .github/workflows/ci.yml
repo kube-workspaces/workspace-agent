@@ -1,15 +1,92 @@
-name: ci
+name: CI
+
+# Build and test on both real OSes (platform backends are cfg-gated, so a
+# cross-link proves nothing about DXGI/WASAPI behaviour), plus the Python
+# fixture validator that guards the wire contract.
+
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+
 jobs:
-  fixtures:
-    runs-on: ubuntu-latest
+  test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+        env:
+          # Native crashes (STATUS_ACCESS_VIOLATION) are otherwise
+          # location-free; traces make them actionable.
+          RUST_BACKTRACE: 1
+
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/debug/kw-agent
+          [ -x "$bin" ] || bin="$bin.exe"
+          "$bin" --version
+          "$bin" --version | grep -F "kw-agent 0.1.0"
+
+      # Windows runners have real inbox APIs: --hello must emit valid JSON,
+      # the inbox H.264 MFT must encode synthetic frames, and WASAPI must
+      # initialize (silence is an ok outcome).
+      - name: Hello JSON
+        if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- --hello > hello.json
+
+      - name: Assert hello protocol
+        if: matrix.os == 'windows-latest'
+        run: python -c "import json; d=json.load(open('hello.json')); assert d['protocol']=='kw-agent-v1', d"
+
+      - name: Encode smoke test
+        if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- encode-test --frames 30
+
+      - name: Audio smoke test
+        if: matrix.os == 'windows-latest'
+        run: cargo run -p kw-agent --locked -- audio-test --seconds 2
+
+  fixtures:
+    name: Protocol fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python3 tools/validate_fixtures.py
-      - run: python3 -m unittest discover -s tools -p 'test_*.py'
+
+      - name: Validate fixtures
+        run: python3 tools/validate_fixtures.py
+
+      - name: Fixture validator tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py'

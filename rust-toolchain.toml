@@ -1,0 +1,5 @@
+# Pinned for reproducible CI and local builds. Bump deliberately: every
+# workflow installs exactly this channel, so the pin is the contract.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

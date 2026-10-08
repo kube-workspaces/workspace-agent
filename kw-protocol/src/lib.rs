@@ -15,6 +15,17 @@ pub const PROTOCOL: &str = "kw-agent-v1";
 /// Currently accepted protocol version. Unknown versions are rejected.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Build version reported by `kw-agent --version` and the release archives.
+///
+/// Release builds set `KW_AGENT_VERSION` at compile time (Makefile / CI pass
+/// the `git describe` string or the release tag), so the binary, the archive
+/// names and `SHA256SUMS` all agree. A plain local `cargo build` leaves the
+/// variable unset and falls back to the crate version.
+pub static AGENT_VERSION: &str = match option_env!("KW_AGENT_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 /// Message channel. Media and control are separately bounded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
