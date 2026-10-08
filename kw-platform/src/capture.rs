@@ -82,10 +82,10 @@ pub fn bgra_to_nv12_padded(bgra: &[u8], width: u32, height: u32, stride: usize) 
 }
 
 #[cfg(target_os = "windows")]
-pub use self::platform::{Duplicator, DXGI_TIMEOUT_DEFAULT_MS};
+pub use self::platform::{DisplayAwake, Duplicator, DXGI_TIMEOUT_DEFAULT_MS};
 
 #[cfg(not(target_os = "windows"))]
-pub use self::platform::{Duplicator, DXGI_TIMEOUT_DEFAULT_MS};
+pub use self::platform::{DisplayAwake, Duplicator, DXGI_TIMEOUT_DEFAULT_MS};
 
 #[cfg(target_os = "windows")]
 mod platform {
@@ -110,6 +110,40 @@ mod platform {
     /// Default acquire wait: returns regularly so session loss and shutdown
     /// are noticed promptly even on a static screen.
     pub const DXGI_TIMEOUT_DEFAULT_MS: u32 = 100;
+
+    /// Hold the display idle timer only while an admitted viewer streams.
+    /// Restores this thread's prior request at teardown; no power-plan edits.
+    pub struct DisplayAwake {
+        previous: windows::Win32::System::Power::EXECUTION_STATE,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl DisplayAwake {
+        pub fn new() -> Result<Self, Error> {
+            use windows::Win32::System::Power::{
+                SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+            };
+            let previous = unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+            };
+            if previous.0 == 0 {
+                return Err(Error::Os(0));
+            }
+            Ok(Self {
+                previous,
+                _thread: std::marker::PhantomData,
+            })
+        }
+    }
+
+    impl Drop for DisplayAwake {
+        fn drop(&mut self) {
+            use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
+            unsafe {
+                SetThreadExecutionState(self.previous | ES_CONTINUOUS);
+            }
+        }
+    }
 
     fn os(error: windows::core::Error) -> Error {
         Error::Os(error.code().0 as u32)
@@ -298,6 +332,13 @@ mod platform {
 
     #[allow(dead_code)]
     pub const DXGI_TIMEOUT_DEFAULT_MS: u32 = 100;
+
+    pub struct DisplayAwake;
+    impl DisplayAwake {
+        pub fn new() -> Result<Self, Error> {
+            Err(Error::Gated("non-Windows display idle requests"))
+        }
+    }
 
     // Wired by the serve capture source (next increment); until then the
     // stub exists so shared code compiles on every platform.

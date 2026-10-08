@@ -273,7 +273,9 @@ fn main() {
                     use std::sync::{mpsc, Arc};
                     let gate = Arc::new(kw_transport::MediaGate::default());
                     let stats = Arc::new(kw_transport::MediaStats::default());
-                    let (feed_tx, feed_rx) = mpsc::channel();
+                    // Bounded backpressure: never accumulate minutes of media
+                    // while a viewer's network stops draining the socket.
+                    let (feed_tx, feed_rx) = mpsc::sync_channel(64);
                     let anchor = std::time::Instant::now();
                     let mut threads = Vec::new();
                     if video {
@@ -326,10 +328,9 @@ fn main() {
                     if capture_audio {
                         let (ready_tx, ready_rx) = mpsc::channel();
                         let thread_gate = Arc::clone(&gate);
-                        let thread_stats = Arc::clone(&stats);
                         let thread_feed = feed_tx;
                         threads.push(std::thread::spawn(move || {
-                            audio::run(thread_gate, thread_feed, thread_stats, ready_tx, anchor)
+                            audio::run(thread_gate, thread_feed, ready_tx, anchor)
                         }));
                         match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
                             Ok(Ok(())) => {}
@@ -361,7 +362,7 @@ fn main() {
                         served += 1;
                         idle_since = std::time::Instant::now();
                         println!(
-                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={} video_frames={} video_bytes={} video_keyframes={}",
+                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={} video_frames={} video_bytes={} video_keyframes={} audio_frames={} audio_bytes={}",
                             outcome.ended,
                             outcome.control_frames,
                             outcome.media_bytes,
@@ -370,6 +371,8 @@ fn main() {
                             outcome.video_frames_sent,
                             outcome.video_bytes_sent,
                             outcome.video_keyframes_sent,
+                            outcome.audio_frames_sent,
+                            outcome.audio_bytes_sent,
                         );
                     }
                     Err(error) => {

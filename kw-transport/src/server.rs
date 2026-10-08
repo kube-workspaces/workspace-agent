@@ -32,15 +32,17 @@ pub struct SessionOutcome {
     pub video_bytes_sent: u64,
     /// Emitted frames carrying a fresh IDR (SPS/PPS refresh).
     pub video_keyframes_sent: u64,
+    pub audio_frames_sent: u64,
+    pub audio_bytes_sent: u64,
     /// Why the session ended.
     pub ended: String,
 }
 
 /// Cross-thread media gate for one served session. Created per session by
 /// the host (kw-agent): the encoder thread and the socket writer thread
-/// share it with the control loop. Slow-viewer isolation (bounded queues,
-/// drop-to-IDR) is Phase-4 work; until then a stalled socket back-pressures
-/// the encoder thread — documented, never silent.
+/// share it with the control loop. The host uses a bounded media queue and
+/// socket writes time out; congestion back-pressures the encoder rather than
+/// arbitrarily dropping encoded reference frames. Drop-to-IDR is later work.
 #[derive(Debug, Default)]
 pub struct MediaGate {
     /// Set on successful attach; the writer thread idles before this.
@@ -65,6 +67,8 @@ pub struct MediaStats {
     pub frames_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub keyframes_sent: AtomicU64,
+    pub audio_frames_sent: AtomicU64,
+    pub audio_bytes_sent: AtomicU64,
 }
 
 /// Shared socket writer: control replies and the media thread serialize
@@ -214,6 +218,9 @@ fn serve_connection(
     reader
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
+    if let Ok(guard) = writer.lock() {
+        let _ = guard.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    }
     // Media writer thread (media sessions only): idles until admission, then
     // relays encoder packets as binary frames. Ends on session close or a
     // broken socket; the control loop below outlives it either way.
@@ -239,12 +246,24 @@ fn serve_connection(
                     Err(_) => break,
                 };
                 if write_media(&mut *guard, packet.kind, &packet.payload).is_err() {
+                    gate.ended.store(true, Ordering::SeqCst);
+                    let _ = guard.shutdown(std::net::Shutdown::Both);
                     break;
                 }
-                stats.frames_sent.fetch_add(1, Ordering::SeqCst);
-                stats
-                    .bytes_sent
-                    .fetch_add(packet.payload.len() as u64, Ordering::SeqCst);
+                match packet.kind {
+                    MediaKind::H264 => {
+                        stats.frames_sent.fetch_add(1, Ordering::SeqCst);
+                        stats
+                            .bytes_sent
+                            .fetch_add(packet.payload.len() as u64, Ordering::SeqCst);
+                    }
+                    MediaKind::Opus => {
+                        stats.audio_frames_sent.fetch_add(1, Ordering::SeqCst);
+                        stats
+                            .audio_bytes_sent
+                            .fetch_add(packet.payload.len() as u64, Ordering::SeqCst);
+                    }
+                }
             }
         })
     });
@@ -314,6 +333,11 @@ fn serve_connection(
                     }
                     break;
                 }
+                if message.message_type == "attach" && handshake.admitted() {
+                    // Bound anonymous handshakes, not a valid readonly media
+                    // viewer that has no reason to send input every 30 seconds.
+                    let _ = reader.set_read_timeout(None);
+                }
             }
         }
     }
@@ -321,13 +345,15 @@ fn serve_connection(
     if let Some(gate) = media_gate.as_deref() {
         gate.ended.store(true, Ordering::SeqCst);
     }
+    if let Some(thread) = media_thread {
+        let _ = thread.join();
+    }
     if let Some(stats) = media_stats.as_deref() {
         outcome.video_frames_sent = stats.frames_sent.load(Ordering::SeqCst);
         outcome.video_bytes_sent = stats.bytes_sent.load(Ordering::SeqCst);
         outcome.video_keyframes_sent = stats.keyframes_sent.load(Ordering::SeqCst);
-    }
-    if let Some(thread) = media_thread {
-        let _ = thread.join();
+        outcome.audio_frames_sent = stats.audio_frames_sent.load(Ordering::SeqCst);
+        outcome.audio_bytes_sent = stats.audio_bytes_sent.load(Ordering::SeqCst);
     }
     outcome
 }
@@ -735,6 +761,14 @@ mod tests {
             assert_eq!(kind, MediaKind::H264);
             assert_eq!(back, payload);
         }
+        tx.send(MediaPacket {
+            kind: MediaKind::Opus,
+            payload: vec![0x33; 24],
+        })
+        .unwrap();
+        let (kind, payload) = read_media(&mut client);
+        assert_eq!(kind, MediaKind::Opus);
+        assert_eq!(payload.len(), 24);
         send(
             &control(&session, "bye", 3, serde_json::json!({})),
             &mut client,
@@ -742,6 +776,8 @@ mod tests {
         let outcome = handle.join().expect("server thread");
         assert_eq!(outcome.video_frames_sent, 2);
         assert_eq!(outcome.video_bytes_sent, 192);
+        assert_eq!(outcome.audio_frames_sent, 1);
+        assert_eq!(outcome.audio_bytes_sent, 24);
         assert_eq!(outcome.ended, "peer-bye");
     }
 

@@ -6,7 +6,7 @@
 //! reopens the tap boundedly; anything else ends audio for the session
 //! while video/control continue (degraded, never silent).
 
-use kw_transport::{MediaGate, MediaPacket, MediaStats};
+use kw_transport::{MediaGate, MediaPacket};
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -20,23 +20,14 @@ const MAX_REOPENS: u32 = 10;
 /// linkage (residual pipeline offsets are measured, not assumed).
 pub fn run(
     gate: Arc<MediaGate>,
-    feed: mpsc::Sender<MediaPacket>,
-    stats: Arc<MediaStats>,
+    feed: mpsc::SyncSender<MediaPacket>,
     ready: mpsc::Sender<Result<(), String>>,
     anchor: Instant,
 ) {
     let mut announced = false;
     let mut reopens = 0u32;
     loop {
-        match pump(
-            &gate,
-            &feed,
-            &stats,
-            anchor,
-            &mut announced,
-            &ready,
-            reopens,
-        ) {
+        match pump(&gate, &feed, anchor, &mut announced, &ready, reopens) {
             PumpEnd::Done => return,
             PumpEnd::Reopen => {
                 reopens += 1;
@@ -63,8 +54,7 @@ pub fn run(
     #[allow(clippy::too_many_arguments)]
     fn pump(
         gate: &Arc<MediaGate>,
-        feed: &mpsc::Sender<MediaPacket>,
-        stats: &Arc<MediaStats>,
+        feed: &mpsc::SyncSender<MediaPacket>,
         anchor: Instant,
         announced: &mut bool,
         ready: &mpsc::Sender<Result<(), String>>,
@@ -147,10 +137,6 @@ pub fn run(
                         anchor.elapsed().as_secs_f64()
                     );
                 }
-                stats.frames_sent.fetch_add(1, Ordering::SeqCst);
-                stats
-                    .bytes_sent
-                    .fetch_add(packet.len() as u64, Ordering::SeqCst);
                 if feed
                     .send(MediaPacket {
                         kind: kw_transport::MediaKind::Opus,

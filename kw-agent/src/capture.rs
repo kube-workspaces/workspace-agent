@@ -30,7 +30,7 @@ pub fn run(
     fps: u32,
     bitrate_bps: u32,
     gate: Arc<MediaGate>,
-    feed: mpsc::Sender<MediaPacket>,
+    feed: mpsc::SyncSender<MediaPacket>,
     stats: Arc<MediaStats>,
     ready: mpsc::Sender<Result<(), String>>,
     anchor: Instant,
@@ -67,6 +67,13 @@ pub fn run(
         std::thread::sleep(Duration::from_millis(10));
     }
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
+    let _awake = match kw_platform::capture::DisplayAwake::new() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("capture: display idle request failed: {error}");
+            return;
+        }
+    };
     let mut index: u64 = 0;
     let mut next_tick = anchor;
     let mut last_frame = None;

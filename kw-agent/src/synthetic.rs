@@ -34,7 +34,7 @@ pub fn gradient_nv12(width: u32, height: u32, shift: u8) -> Vec<u8> {
 pub fn run(
     settings: kw_encode::Settings,
     gate: Arc<MediaGate>,
-    feed: mpsc::Sender<MediaPacket>,
+    feed: mpsc::SyncSender<MediaPacket>,
     stats: Arc<MediaStats>,
     ready: mpsc::Sender<Result<(), String>>,
     anchor: Instant,
