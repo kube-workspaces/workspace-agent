@@ -172,6 +172,10 @@ fn main() {
                         eprintln!("serve: --synthetic-size must be WxH (e.g. 640x480)");
                         usage(2);
                     }
+                    if width % 16 != 0 || height % 16 != 0 {
+                        eprintln!("serve: --synthetic-size must be macroblock-aligned (multiples of 16); the software MFT faults otherwise");
+                        usage(2);
+                    }
                     kw_encode::Settings {
                         width,
                         height,

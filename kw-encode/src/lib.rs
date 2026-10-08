@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 /// Encoder settings. Baseline profile + bounded GOP is the low-latency
 /// starting point; B-frame behavior is *measured* from output, not assumed.
+///
+/// Dimensions MUST be multiples of 16 (H.264 macroblocks): the inbox
+/// software MFT faults natively on unaligned sizes instead of refusing
+/// them, so capture layers pad/crop upstream and constructors of fixed
+/// profiles validate before touching the MFT.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Settings {
     pub width: u32,
@@ -706,16 +711,20 @@ mod tests {
         encoder
             .push(&frame, 0, false)
             .expect("pre-reconfigure push");
+        // Macroblock-aligned sizes only: the inbox MFT does not survive
+        // non-mod-16 dimensions (native fault, not a clean error), so the
+        // capture layer must pad/crop to alignment — asserted here, not
+        // assumed.
         let small = Settings {
-            width: 160,
-            height: 120,
+            width: 176,
+            height: 144,
             ..Settings::default()
         };
         encoder.reconfigure(&small).expect("mid-stream reconfigure");
-        assert_eq!(encoder.settings().width, 160);
+        assert_eq!(encoder.settings().width, 176);
         let mut post = Vec::new();
         for index in 1..4i64 {
-            let frame = gradient(160, 120, index as u8);
+            let frame = gradient(176, 144, index as u8);
             post.extend(
                 encoder
                     .push(&frame, index * step, false)
