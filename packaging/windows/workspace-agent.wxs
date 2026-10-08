@@ -25,7 +25,8 @@
 // the staged tag-archive contents. Contract with the generator: the agent
 // exe's File Id is AgentExe.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Kube Workspaces Agent"
            Language="1033"
            Version="$(var.ProductVersion)"
@@ -52,9 +53,12 @@
       <ComponentGroupRef Id="PayloadFiles" />
     </Feature>
 
-    <!-- Standard welcome/progress/exit dialogs (WixToolset.UI.wixext). No
-         custom artwork: an unsigned console utility does not need a banner
-         budget, and no icon is bundled on purpose (no assets/ in this repo). -->
-    <UIRef Id="WixUI_Minimal" />
+    <!-- Standard welcome/EULA/progress/exit dialogs (WixToolset.UI.wixext).
+         The platform-neutral set is referenced via ui:WixUI, which pulls in
+         the matching per-architecture custom actions; a direct UIRef to the
+         WixUI_ id fails WIX0094 in v4/v5. No custom artwork or icon: an
+         unsigned console utility does not need a banner budget, and no
+         assets/ directory is bundled on purpose. -->
+    <ui:WixUI Id="WixUI_Minimal" />
   </Package>
 </Wix>
