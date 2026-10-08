@@ -106,6 +106,26 @@ pub fn write_control(
     Ok(())
 }
 
+/// Write one media frame: kind tag + big-endian length + raw codec bytes
+/// (Annex-B H.264 access unit, or one Opus packet). Empty and oversized
+/// payloads are refused rather than truncated.
+pub fn write_media(
+    writer: &mut impl Write,
+    kind: MediaKind,
+    payload: &[u8],
+) -> Result<(), FrameError> {
+    if payload.is_empty() || payload.len() > MAX_MEDIA_BYTES {
+        return Err(FrameError::TooLarge);
+    }
+    writer.write_all(&[kind as u8]).map_err(FrameError::Io)?;
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .map_err(FrameError::Io)?;
+    writer.write_all(payload).map_err(FrameError::Io)?;
+    writer.flush().map_err(FrameError::Io)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,19 +154,34 @@ mod tests {
 
     #[test]
     fn media_round_trips_with_kind() {
-        let mut wire = vec![0x01];
-        wire.extend_from_slice(&3u32.to_be_bytes());
-        wire.extend_from_slice(&[9, 9, 9]);
+        let mut wire = Vec::new();
+        write_media(&mut wire, MediaKind::Opus, &[9, 9, 9]).unwrap();
+        // Tag byte must be the Opus kind, not control.
+        assert_eq!(wire[0], 0x02);
         match read_frame(&mut &wire[..])
             .expect("readable")
             .expect("frame")
         {
             Frame::Media { kind, payload } => {
-                assert_eq!(kind, MediaKind::H264);
+                assert_eq!(kind, MediaKind::Opus);
                 assert_eq!(payload, vec![9, 9, 9]);
             }
             Frame::Control(_) => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn write_media_refuses_empty_and_oversize() {
+        let mut wire = Vec::new();
+        assert!(matches!(
+            write_media(&mut wire, MediaKind::H264, &[]),
+            Err(FrameError::TooLarge)
+        ));
+        assert!(matches!(
+            write_media(&mut wire, MediaKind::H264, &vec![0u8; MAX_MEDIA_BYTES + 1]),
+            Err(FrameError::TooLarge)
+        ));
+        assert!(wire.is_empty(), "rejected frames write nothing");
     }
 
     #[test]

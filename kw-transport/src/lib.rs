@@ -18,4 +18,4 @@ pub mod server;
 
 pub use client::ClientOutcome;
 pub use frame::{MediaKind, MAX_CONTROL_BYTES, MAX_MEDIA_BYTES};
-pub use server::{Server, ServerEvent, SessionOutcome};
+pub use server::{MediaGate, MediaPacket, MediaStats, Server, ServerEvent, SessionOutcome};

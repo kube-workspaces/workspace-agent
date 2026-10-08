@@ -93,6 +93,7 @@ pub fn nal_types(bytes: &[u8]) -> Vec<u8> {
 
 /// Encode `frames` NV12 buffers (width*height*3/2 bytes each) at 30fps-style
 /// spacing derived from [`Settings::fps`]. Returns encoded chunks in order.
+/// Implemented over [`StreamEncoder`]: one persistent transform per call.
 pub fn encode_nv12(settings: &Settings, frames: &[Vec<u8>]) -> Result<Vec<Chunk>, Error> {
     // Cheap validation before touching any OS media stack.
     if settings.width == 0 || settings.height == 0 || settings.fps == 0 {
@@ -107,17 +108,90 @@ pub fn encode_nv12(settings: &Settings, frames: &[Vec<u8>]) -> Result<Vec<Chunk>
             )));
         }
     }
-    inner::encode_nv12(settings, frames)
+    let mut encoder = StreamEncoder::new(settings)?;
+    let step_100ns: i64 = 10_000_000 / settings.fps.max(1) as i64;
+    let mut chunks = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        chunks.extend(encoder.push(frame, index as i64 * step_100ns, false)?);
+    }
+    chunks.extend(encoder.finish()?);
+    Ok(chunks)
+}
+
+/// Persistent streaming H.264 encoder: one OS transform across many frames.
+///
+/// Constructed once (in the thread that feeds it — COM apartment rules),
+/// `push`ed per captured frame with caller timestamps, `finish`ed for the
+/// trailing GOP. `reconfigure` swaps dimensions/bitrate mid-stream for
+/// resize ACKs. Only Windows is implemented; other platforms fail
+/// construction with [`Error::Gated`] — never fake output.
+pub struct StreamEncoder {
+    state: inner::Stream,
+}
+
+impl StreamEncoder {
+    pub fn new(settings: &Settings) -> Result<Self, Error> {
+        if settings.width == 0 || settings.height == 0 || settings.fps == 0 {
+            return Err(Error::Configure("zero dimension or rate".into()));
+        }
+        Ok(Self {
+            state: inner::Stream::new(settings)?,
+        })
+    }
+
+    /// Encode one NV12 frame (`width*height*3/2` bytes). `timestamp_100ns`
+    /// is the caller (capture/A-V) clock; `force_idr` emits SPS/PPS/IDR for
+    /// this frame (keyframe requests, reconnects, reconfigures). Returns the
+    /// access units produced for this input (often zero or one).
+    pub fn push(
+        &mut self,
+        nv12: &[u8],
+        timestamp_100ns: i64,
+        force_idr: bool,
+    ) -> Result<Vec<Chunk>, Error> {
+        let expect = self.state.frame_bytes();
+        if nv12.len() != expect {
+            return Err(Error::Configure(format!(
+                "frame is {} bytes, expected {expect}",
+                nv12.len()
+            )));
+        }
+        self.state.push(nv12, timestamp_100ns, force_idr)
+    }
+
+    pub fn settings(&self) -> &Settings {
+        self.state.settings()
+    }
+
+    /// Swap dimensions/bitrate mid-stream (resize ACK path). Drains pending
+    /// output under the old type first; the next push emits the new
+    /// configuration followed by a fresh IDR.
+    pub fn reconfigure(&mut self, settings: &Settings) -> Result<(), Error> {
+        if settings.width == 0 || settings.height == 0 || settings.fps == 0 {
+            return Err(Error::Configure("zero dimension or rate".into()));
+        }
+        self.state.reconfigure(settings)
+    }
+
+    /// End the stream: trailing GOP output. Consumes the encoder; Drop after
+    /// an abandoned (non-finished) encoder only signals end-of-stream
+    /// best-effort and releases the OS objects.
+    pub fn finish(self) -> Result<Vec<Chunk>, Error> {
+        self.state.finish()
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod inner {
     use super::*;
+    use windows::core::ComInterface as _;
+    use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncH264VLevel4, eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT, IMFTransform,
-        MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown,
-        MFStartup, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-        MFSTARTUP_NOSOCKET, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+        eAVEncH264VLevel4, eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT,
+        CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFTransform, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
+        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT,
         MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
         MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
@@ -128,34 +202,206 @@ mod inner {
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
     };
+    use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL};
 
     fn hr<T>(line: u32, result: Result<T, windows::core::Error>) -> Result<T, Error> {
         result.map_err(|e| Error::Stream(format!("line {line}: 0x{:08x}", e.code().0 as u32)))
     }
 
-    pub fn encode_nv12(settings: &Settings, frames: &[Vec<u8>]) -> Result<Vec<Chunk>, Error> {
-        let frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        let result = unsafe { encode_inner(settings, frames, frame_bytes) };
-        unsafe { CoUninitialize() };
-        result
+    /// VT_BOOL VARIANT for ICodecAPI calls (windows 0.52 has no From<bool>).
+    fn bool_variant(value: bool) -> VARIANT {
+        let mut variant = VARIANT::default();
+        unsafe {
+            let inner = &mut variant.Anonymous.Anonymous as *mut _ as *mut VARIANT_0_0;
+            (*inner).vt = VT_BOOL;
+            (*inner).Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
+        }
+        variant
     }
 
-    unsafe fn encode_inner(
-        settings: &Settings,
-        frames: &[Vec<u8>],
+    /// One persistent software MFT. Owns its COM/MF lifetime: Drop signals
+    /// end-of-stream best-effort and releases everything. Construct and feed
+    /// from a single thread (MTA apartment).
+    pub struct Stream {
+        encoder: IMFTransform,
+        codec_api: Option<ICodecAPI>,
+        settings: Settings,
         frame_bytes: usize,
-    ) -> Result<Vec<Chunk>, Error> {
-        hr(line!(), MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))?;
-        let encoder: IMFTransform = hr(
-            line!(),
-            CoCreateInstance(
-                &CLSID_MSH264EncoderMFT,
-                Option::<&windows::core::IUnknown>::None,
-                CLSCTX_INPROC_SERVER,
-            ),
-        )?;
+        step_100ns: i64,
+        finished: bool,
+    }
 
+    impl Stream {
+        pub fn new(settings: &Settings) -> Result<Self, Error> {
+            let frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            let built = unsafe { Self::build(settings, frame_bytes) };
+            if built.is_err() {
+                unsafe { CoUninitialize() };
+            }
+            built
+        }
+
+        unsafe fn build(settings: &Settings, frame_bytes: usize) -> Result<Self, Error> {
+            hr(line!(), MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET))?;
+            let build_result: Result<Self, Error> = (|| {
+                let encoder: IMFTransform = hr(
+                    line!(),
+                    CoCreateInstance(
+                        &CLSID_MSH264EncoderMFT,
+                        Option::<&windows::core::IUnknown>::None,
+                        CLSCTX_INPROC_SERVER,
+                    ),
+                )?;
+                configure_types(&encoder, settings)?;
+                // Force-IDR is load-bearing for keyframe requests and
+                // reconfigures: fail construction (not mid-stream) when the
+                // MFT cannot promise it.
+                let codec_api: Option<ICodecAPI> = encoder.cast().ok();
+                if codec_api.is_none() {
+                    return Err(Error::Configure(
+                        "MFT exposes no ICodecAPI for force-IDR".into(),
+                    ));
+                }
+                hr(line!(), encoder.GetOutputStreamInfo(0))?;
+                hr(
+                    line!(),
+                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
+                )?;
+                hr(
+                    line!(),
+                    encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
+                )?;
+                Ok(Self {
+                    encoder,
+                    codec_api,
+                    settings: settings.clone(),
+                    frame_bytes,
+                    step_100ns: 10_000_000 / settings.fps.max(1) as i64,
+                    finished: false,
+                })
+            })();
+            if build_result.is_err() {
+                hr(line!(), MFShutdown()).ok();
+            }
+            build_result
+        }
+
+        pub fn settings(&self) -> &Settings {
+            &self.settings
+        }
+
+        pub fn frame_bytes(&self) -> usize {
+            self.frame_bytes
+        }
+
+        pub fn push(
+            &mut self,
+            frame: &[u8],
+            timestamp_100ns: i64,
+            force_idr: bool,
+        ) -> Result<Vec<Chunk>, Error> {
+            if self.finished {
+                return Err(Error::Stream("push after finish".into()));
+            }
+            if force_idr {
+                let api = self.codec_api.as_ref().ok_or_else(|| {
+                    Error::Configure("force-IDR unavailable on this encoder".into())
+                })?;
+                let value = bool_variant(true);
+                unsafe {
+                    hr(
+                        line!(),
+                        api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &value),
+                    )?;
+                }
+            }
+            unsafe {
+                let buffer = hr(line!(), MFCreateMemoryBuffer(self.frame_bytes as u32))?;
+                let mut locked: *mut u8 = std::ptr::null_mut();
+                let mut max = 0u32;
+                let mut current = 0u32;
+                hr(
+                    line!(),
+                    buffer.Lock(&mut locked, Some(&mut max), Some(&mut current)),
+                )?;
+                std::ptr::copy_nonoverlapping(frame.as_ptr(), locked, self.frame_bytes);
+                hr(line!(), buffer.Unlock())?;
+                hr(line!(), buffer.SetCurrentLength(self.frame_bytes as u32))?;
+                let sample = hr(line!(), MFCreateSample())?;
+                hr(line!(), sample.AddBuffer(&buffer))?;
+                hr(line!(), sample.SetSampleTime(timestamp_100ns))?;
+                hr(line!(), sample.SetSampleDuration(self.step_100ns))?;
+                hr(line!(), self.encoder.ProcessInput(0, &sample, 0))?;
+                let mut chunks = Vec::new();
+                drain(&self.encoder, &mut chunks)?;
+                Ok(chunks)
+            }
+        }
+
+        pub fn reconfigure(&mut self, settings: &Settings) -> Result<(), Error> {
+            if self.finished {
+                return Err(Error::Stream("reconfigure after finish".into()));
+            }
+            unsafe {
+                // Drain pending output under the old type, then swap both
+                // types between frames (legal while streaming). The next
+                // push emits the new configuration; callers force an IDR.
+                let mut trailing = Vec::new();
+                drain(&self.encoder, &mut trailing)?;
+                debug_assert!(
+                    trailing.is_empty(),
+                    "mid-stream drain must not emit without new input"
+                );
+                configure_types(&self.encoder, settings)?;
+                self.settings = settings.clone();
+                self.frame_bytes = settings.width as usize * settings.height as usize * 3 / 2;
+                self.step_100ns = 10_000_000 / settings.fps.max(1) as i64;
+                Ok(())
+            }
+        }
+
+        pub fn finish(self) -> Result<Vec<Chunk>, Error> {
+            // Suppress Drop (which would release the same objects): the
+            // resources move out logically here and are released below.
+            let mut this = std::mem::ManuallyDrop::new(self);
+            let mut chunks = Vec::new();
+            unsafe {
+                hr(
+                    line!(),
+                    this.encoder
+                        .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
+                )?;
+                drain(&this.encoder, &mut chunks)?;
+                hr(line!(), MFShutdown())?;
+                CoUninitialize();
+            }
+            this.finished = true;
+            Ok(chunks)
+        }
+    }
+
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            if self.finished {
+                return;
+            }
+            // Abandoned mid-stream: signal EOS best-effort (unread output is
+            // dropped by design — no silent partial GOP), then release.
+            unsafe {
+                let _ = self
+                    .encoder
+                    .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                let _ = MFShutdown();
+                CoUninitialize();
+            }
+        }
+    }
+
+    /// (Re)configure the MFT input/output pair. Output type first: this MFT
+    /// validates the pair eagerly and reports TYPE_NOT_SET when the input
+    /// arrives first.
+    unsafe fn configure_types(encoder: &IMFTransform, settings: &Settings) -> Result<(), Error> {
         let input = hr(line!(), MFCreateMediaType())?;
         hr(
             line!(),
@@ -226,47 +472,9 @@ mod inner {
             line!(),
             output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, ((1u64) << 32) | 1),
         )?;
-        // Output type first: this MFT validates the input/output pair
-        // eagerly and reports TYPE_NOT_SET when the input arrives first.
         hr(line!(), encoder.SetOutputType(0, &output, 0))?;
         hr(line!(), encoder.SetInputType(0, &input, 0))?;
-        hr(line!(), encoder.GetOutputStreamInfo(0))?;
-        let mut chunks = Vec::new();
-        hr(
-            line!(),
-            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
-        )?;
-        hr(
-            line!(),
-            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
-        )?;
-        let step_100ns: i64 = 10_000_000 / settings.fps as i64;
-        for (index, frame) in frames.iter().enumerate() {
-            let buffer = hr(line!(), MFCreateMemoryBuffer(frame_bytes as u32))?;
-            let mut locked: *mut u8 = std::ptr::null_mut();
-            let mut max = 0u32;
-            let mut current = 0u32;
-            hr(
-                line!(),
-                buffer.Lock(&mut locked, Some(&mut max), Some(&mut current)),
-            )?;
-            std::ptr::copy_nonoverlapping(frame.as_ptr(), locked, frame_bytes);
-            hr(line!(), buffer.Unlock())?;
-            hr(line!(), buffer.SetCurrentLength(frame_bytes as u32))?;
-            let sample = hr(line!(), MFCreateSample())?;
-            hr(line!(), sample.AddBuffer(&buffer))?;
-            hr(line!(), sample.SetSampleTime(index as i64 * step_100ns))?;
-            hr(line!(), sample.SetSampleDuration(step_100ns))?;
-            hr(line!(), encoder.ProcessInput(0, &sample, 0))?;
-            drain(&encoder, &mut chunks)?;
-        }
-        hr(
-            line!(),
-            encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
-        )?;
-        drain(&encoder, &mut chunks)?;
-        hr(line!(), MFShutdown())?;
-        Ok(chunks)
+        Ok(())
     }
 
     unsafe fn drain(encoder: &IMFTransform, chunks: &mut Vec<Chunk>) -> Result<(), Error> {
@@ -326,10 +534,41 @@ mod inner {
 mod inner {
     use super::*;
 
-    pub fn encode_nv12(_settings: &Settings, _frames: &[Vec<u8>]) -> Result<Vec<Chunk>, Error> {
-        // Non-Windows encoders (VAAPI/VideoToolbox/ffmpeg mappings) are
-        // separate P5/driver work. Report the gate; never fake output.
-        Err(Error::Gated("non-Windows software encode backends"))
+    /// Non-Windows streaming surface: construction always reports the gate
+    /// so callers (serve media threads) fail honestly instead of shipping
+    /// fake frames. Linux software encode (OpenH264/x264 mapping) is
+    /// separate P5/driver work.
+    pub struct Stream;
+
+    impl Stream {
+        pub fn new(_settings: &Settings) -> Result<Self, Error> {
+            Err(Error::Gated("non-Windows software encode backends"))
+        }
+
+        pub fn settings(&self) -> &Settings {
+            unreachable!("Stream::new is Gated off Windows")
+        }
+
+        pub fn frame_bytes(&self) -> usize {
+            unreachable!("Stream::new is Gated off Windows")
+        }
+
+        pub fn push(
+            &mut self,
+            _frame: &[u8],
+            _timestamp_100ns: i64,
+            _force_idr: bool,
+        ) -> Result<Vec<Chunk>, Error> {
+            Err(Error::Gated("non-Windows software encode backends"))
+        }
+
+        pub fn reconfigure(&mut self, _settings: &Settings) -> Result<(), Error> {
+            Err(Error::Gated("non-Windows software encode backends"))
+        }
+
+        pub fn finish(self) -> Result<Vec<Chunk>, Error> {
+            Err(Error::Gated("non-Windows software encode backends"))
+        }
     }
 }
 
@@ -394,6 +633,73 @@ mod tests {
         );
         let total: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
         assert!(total > 1024, "nontrivial payload: {total} bytes");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn force_idr_emits_keyframe_on_demand() {
+        // Wide GOP so no scheduled IDR interferes; the forced frame must
+        // carry SPS/PPS/IDR regardless of any extra MFT decisions.
+        let settings = Settings {
+            max_keyframe_spacing: 300,
+            ..Settings::default()
+        };
+        let mut encoder = StreamEncoder::new(&settings).expect("construct streaming encoder");
+        let step = 10_000_000 / settings.fps as i64;
+        for index in 0..5i64 {
+            let frame = gradient(settings.width, settings.height, index as u8);
+            encoder
+                .push(&frame, index * step, false)
+                .expect("streaming push works");
+        }
+        let frame = gradient(settings.width, settings.height, 5);
+        let forced = encoder
+            .push(&frame, 5 * step, true)
+            .expect("forced-IDR push works");
+        let types: Vec<u8> = forced
+            .iter()
+            .flat_map(|chunk| chunk.nal_types.clone())
+            .collect();
+        assert!(types.contains(&5), "forced frame must be an IDR: {types:?}");
+        assert!(
+            types.contains(&7) && types.contains(&8),
+            "forced IDR must refresh SPS/PPS for joiners: {types:?}"
+        );
+        let trailing = encoder.finish().expect("finish drains");
+        assert!(
+            !forced.is_empty() || !trailing.is_empty(),
+            "stream produced output"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn reconfigure_swaps_dimensions_mid_stream() {
+        let mut encoder = StreamEncoder::new(&Settings::default()).expect("construct");
+        let step = 10_000_000 / Settings::default().fps as i64;
+        let frame = gradient(320, 240, 0);
+        encoder
+            .push(&frame, 0, false)
+            .expect("pre-reconfigure push");
+        let small = Settings {
+            width: 160,
+            height: 120,
+            ..Settings::default()
+        };
+        encoder.reconfigure(&small).expect("mid-stream reconfigure");
+        assert_eq!(encoder.settings().width, 160);
+        let frame = gradient(160, 120, 1);
+        let chunks = encoder
+            .push(&frame, step, true)
+            .expect("post-reconfigure push");
+        assert!(!chunks.is_empty(), "encoder emits at the new size");
+        let trailing = encoder.finish().expect("finish");
+        let total: usize = chunks
+            .iter()
+            .chain(trailing.iter())
+            .map(|chunk| chunk.bytes.len())
+            .sum();
+        assert!(total > 0, "nontrivial post-reconfigure payload");
     }
 
     #[cfg(not(target_os = "windows"))]

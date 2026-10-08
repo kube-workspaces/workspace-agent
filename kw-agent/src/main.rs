@@ -7,6 +7,7 @@
 
 mod daemon;
 mod platform;
+mod synthetic;
 
 fn usage(code: i32) -> ! {
     eprintln!(
@@ -17,9 +18,9 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N]]");
     eprintln!(
-        "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
+        "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
     );
     eprintln!("  kw-agent encode-test [--width W] [--height H] [--frames N] [--bitrate-bps B]");
     eprintln!("  kw-agent audio-test [--seconds N] [--require-endpoint]");
@@ -146,6 +147,54 @@ fn main() {
                 std::process::exit(1);
             });
             println!("listening {address}");
+            // Synthetic video (media proof without capture hardware):
+            // per-session encoder thread through the real software MFT.
+            // Absent by default: pure control plane, exactly as before.
+            // Boolean flag (no value): present anywhere in argv enables it.
+            let synthetic = args.iter().any(|arg| arg == "--synthetic-video");
+            let synth_settings = kw_encode::Settings {
+                width: 320,
+                height: 240,
+                fps: flag_value(&args, "--synthetic-fps")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(30),
+                bitrate_bps: flag_value(&args, "--synthetic-bitrate-bps")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(2_000_000),
+                max_keyframe_spacing: 60,
+            };
+            let synth_settings = match flag_value(&args, "--synthetic-size").as_deref() {
+                Some(size) => {
+                    let mut parts = size.splitn(2, 'x');
+                    let width: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let height: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    if width == 0 || height == 0 {
+                        eprintln!("serve: --synthetic-size must be WxH (e.g. 640x480)");
+                        usage(2);
+                    }
+                    kw_encode::Settings {
+                        width,
+                        height,
+                        ..synth_settings
+                    }
+                }
+                None => synth_settings,
+            };
+            if synthetic {
+                println!(
+                    "synthetic video {}x{}@{}fps {}bps",
+                    synth_settings.width,
+                    synth_settings.height,
+                    synth_settings.fps,
+                    synth_settings.bitrate_bps
+                );
+                // Fail fast: a proof serve that cannot encode must not sit
+                // listening until the first viewer arrives to discover it.
+                if let Err(error) = kw_encode::StreamEncoder::new(&synth_settings) {
+                    eprintln!("serve: synthetic encoder unavailable: {error}");
+                    std::process::exit(2);
+                }
+            }
             let mut served = 0u64;
             let mut idle_since = std::time::Instant::now();
             // Non-blocking accept would need polling scaffolding; instead the
@@ -161,17 +210,64 @@ fn main() {
                 {
                     break;
                 }
-                match server.serve_one() {
+                // Per-session media feed: fresh encoder, fresh GOP, fresh
+                // timestamps every session (joiners land on SPS/PPS/IDR).
+                let (gate, feed_rx, stats, encoder_thread) = if synthetic {
+                    use std::sync::{mpsc, Arc};
+                    let gate = Arc::new(kw_transport::MediaGate::default());
+                    let stats = Arc::new(kw_transport::MediaStats::default());
+                    let (feed_tx, feed_rx) = mpsc::channel();
+                    let (ready_tx, ready_rx) = mpsc::channel();
+                    let thread_gate = Arc::clone(&gate);
+                    let thread_stats = Arc::clone(&stats);
+                    let thread_settings = synth_settings.clone();
+                    let encoder_thread = std::thread::spawn(move || {
+                        synthetic::run(
+                            thread_settings,
+                            thread_gate,
+                            feed_tx,
+                            thread_stats,
+                            ready_tx,
+                        )
+                    });
+                    match ready_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("serve: {error}");
+                            std::process::exit(2);
+                        }
+                        Err(_) => {
+                            eprintln!("serve: synthetic encoder did not report readiness");
+                            std::process::exit(2);
+                        }
+                    }
+                    (Some(gate), Some(feed_rx), Some(stats), Some(encoder_thread))
+                } else {
+                    (None, None, None, None)
+                };
+                let result = match (gate, feed_rx, stats) {
+                    (Some(gate), Some(feed_rx), Some(stats)) => {
+                        server.serve_one_media(gate, feed_rx, stats)
+                    }
+                    _ => server.serve_one(),
+                };
+                if let Some(thread) = encoder_thread {
+                    let _ = thread.join();
+                }
+                match result {
                     Ok(outcome) => {
                         served += 1;
                         idle_since = std::time::Instant::now();
                         println!(
-                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={}",
+                            "session ended={} control={} media_bytes={} resize_acks={} keyframes={} video_frames={} video_bytes={} video_keyframes={}",
                             outcome.ended,
                             outcome.control_frames,
                             outcome.media_bytes,
                             outcome.resize_acks,
-                            outcome.keyframes_forwarded
+                            outcome.keyframes_forwarded,
+                            outcome.video_frames_sent,
+                            outcome.video_bytes_sent,
+                            outcome.video_keyframes_sent,
                         );
                     }
                     Err(error) => {
@@ -196,22 +292,62 @@ fn main() {
                     eprintln!("connect-test: --workspace-generation is required");
                     usage(2);
                 });
-            match kw_transport::client::run(&server, &workspace_uid, &workspace_generation) {
-                Ok(outcome) => {
-                    println!(
-                        "admitted={} resize_paired={} resize_reason={} server_hello={}",
-                        outcome.admitted,
-                        outcome.resize_paired,
-                        outcome.resize_reason,
-                        outcome.server_hello_ok
-                    );
-                    if !(outcome.admitted && outcome.resize_paired && outcome.server_hello_ok) {
+            // Media phase (optional): capture stream bytes after admission.
+            // Absent by default: pure control exchange, exactly as before.
+            let media_seconds: u64 = flag_value(&args, "--media-seconds")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let print_outcome = |outcome: &kw_transport::ClientOutcome| {
+                println!(
+                    "admitted={} resize_paired={} resize_reason={} server_hello={} media_frames={} media_bytes={}",
+                    outcome.admitted,
+                    outcome.resize_paired,
+                    outcome.resize_reason,
+                    outcome.server_hello_ok,
+                    outcome.media_frames,
+                    outcome.media_bytes,
+                );
+            };
+            if media_seconds == 0 {
+                match kw_transport::client::run(&server, &workspace_uid, &workspace_generation) {
+                    Ok(outcome) => {
+                        print_outcome(&outcome);
+                        if !(outcome.admitted && outcome.resize_paired && outcome.server_hello_ok) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("connect-test: {error}");
                         std::process::exit(1);
                     }
                 }
-                Err(error) => {
-                    eprintln!("connect-test: {error}");
-                    std::process::exit(1);
+            } else {
+                let capture = kw_transport::client::MediaCapture {
+                    seconds: media_seconds,
+                    save_video: flag_value(&args, "--save-video"),
+                    save_audio: flag_value(&args, "--save-audio"),
+                };
+                match kw_transport::client::run_with_media(
+                    &server,
+                    &workspace_uid,
+                    &workspace_generation,
+                    &capture,
+                ) {
+                    Ok(outcome) => {
+                        print_outcome(&outcome);
+                        if !(outcome.admitted
+                            && outcome.resize_paired
+                            && outcome.server_hello_ok
+                            && outcome.media_frames > 0)
+                        {
+                            eprintln!("connect-test: no media flowed");
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("connect-test: {error}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

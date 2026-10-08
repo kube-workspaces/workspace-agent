@@ -6,11 +6,12 @@
 //! rejected without disturbing the holder. Control requests are answered;
 //! resize is honestly NACKed until the display backend lands.
 
-use crate::frame::{read_frame, write_control, Frame};
+use crate::frame::{read_frame, write_control, write_media, Frame, MediaKind};
 use kw_core::{now_secs, Handshake};
 use kw_protocol::{Envelope, Reject, Ticket};
-use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// What happened during one served connection (telemetry, no secrets).
 #[derive(Clone, Debug, Default)]
@@ -25,8 +26,55 @@ pub struct SessionOutcome {
     pub resize_acks: u64,
     /// Keyframe demands forwarded (coalesced).
     pub keyframes_forwarded: u64,
+    /// Video frames the guest streamed to the viewer this session.
+    pub video_frames_sent: u64,
+    /// Video bytes streamed this session.
+    pub video_bytes_sent: u64,
+    /// Emitted frames carrying a fresh IDR (SPS/PPS refresh).
+    pub video_keyframes_sent: u64,
     /// Why the session ended.
     pub ended: String,
+}
+
+/// Cross-thread media gate for one served session. Created per session by
+/// the host (kw-agent): the encoder thread and the socket writer thread
+/// share it with the control loop. Slow-viewer isolation (bounded queues,
+/// drop-to-IDR) is Phase-4 work; until then a stalled socket back-pressures
+/// the encoder thread — documented, never silent.
+#[derive(Debug, Default)]
+pub struct MediaGate {
+    /// Set on successful attach; the writer thread idles before this.
+    pub admitted: AtomicBool,
+    /// Set by keyframe_request; the encoder consumes it into one forced IDR.
+    pub force_idr: AtomicBool,
+    /// Set when the control loop ends; writer/encoder threads exit on it.
+    pub ended: AtomicBool,
+}
+
+/// One unit for the viewer: raw codec bytes (Annex-B H.264 access unit).
+#[derive(Debug)]
+pub struct MediaPacket {
+    pub kind: MediaKind,
+    pub payload: Vec<u8>,
+}
+
+/// Counters shared between the encoder thread (knows chunks) and the
+/// socket writer thread (knows bytes), merged into the outcome at close.
+#[derive(Debug, Default)]
+pub struct MediaStats {
+    pub frames_sent: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub keyframes_sent: AtomicU64,
+}
+
+/// Shared socket writer: control replies and the media thread serialize
+/// through one mutex so reference frames are never interleaved corrupt.
+type SharedWriter = Arc<Mutex<TcpStream>>;
+
+fn write_envelope(writer: &SharedWriter, message: &Envelope) -> Result<(), String> {
+    let mut guard = writer.lock().map_err(|e| format!("writer lock: {e}"))?;
+    write_control(&mut *guard, message).map_err(|e| format!("{e}"))?;
+    Ok(())
 }
 
 /// Events the host loop reports upward.
@@ -74,6 +122,28 @@ impl Server {
             &self.workspace_uid,
             &self.workspace_generation,
             &self.agent_version,
+            None,
+        ))
+    }
+
+    /// Serve one connection with a media feed: after admission, packets from
+    /// `feed` stream to the viewer as binary media frames while control
+    /// continues on the same socket. The host owns encoder construction and
+    /// pacing; the gate carries admitted/force-idr/ended across the threads.
+    pub fn serve_one_media(
+        &self,
+        gate: Arc<MediaGate>,
+        feed: mpsc::Receiver<MediaPacket>,
+        stats: Arc<MediaStats>,
+    ) -> Result<SessionOutcome, String> {
+        let (stream, peer) = self.listener.accept().map_err(|e| format!("accept: {e}"))?;
+        Ok(serve_connection(
+            stream,
+            peer.to_string(),
+            &self.workspace_uid,
+            &self.workspace_generation,
+            &self.agent_version,
+            Some((gate, feed, stats)),
         ))
     }
 }
@@ -115,6 +185,7 @@ fn serve_connection(
     workspace_uid: &str,
     workspace_generation: &str,
     agent_version: &str,
+    media: Option<(Arc<MediaGate>, mpsc::Receiver<MediaPacket>, Arc<MediaStats>)>,
 ) -> SessionOutcome {
     let mut outcome = SessionOutcome::default();
     // The session claim is minted here and advertised in our hello; clients
@@ -122,10 +193,44 @@ fn serve_connection(
     let session_id = format!("sess-{}", now_secs());
     let mut handshake = Handshake::new(session_id.clone(), 0);
     let mut reader = stream.try_clone().expect("clone reader");
-    let mut writer = stream;
+    let writer: SharedWriter = Arc::new(Mutex::new(stream));
     reader
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
+    // Media writer thread (media sessions only): idles until admission, then
+    // relays encoder packets as binary frames. Ends on session close or a
+    // broken socket; the control loop below outlives it either way.
+    let mut media_gate: Option<Arc<MediaGate>> = None;
+    let mut media_stats: Option<Arc<MediaStats>> = None;
+    let media_thread = media.map(|(gate, feed, stats)| {
+        media_gate = Some(Arc::clone(&gate));
+        media_stats = Some(Arc::clone(&stats));
+        let writer = Arc::clone(&writer);
+        std::thread::spawn(move || {
+            while !gate.ended.load(Ordering::SeqCst) {
+                if !gate.admitted.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                let packet = match feed.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(packet) => packet,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let mut guard = match writer.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                if write_media(&mut *guard, packet.kind, &packet.payload).is_err() {
+                    break;
+                }
+                stats.frames_sent.fetch_add(1, Ordering::SeqCst);
+                stats
+                    .bytes_sent
+                    .fetch_add(packet.payload.len() as u64, Ordering::SeqCst);
+            }
+        })
+    });
     // Speak first: hello with this session's claim ids.
     let hello = envelope(
         "hello",
@@ -139,7 +244,7 @@ fn serve_connection(
             "capabilityEpoch": 1,
         }),
     );
-    if write_control(&mut writer, &hello).is_err() {
+    if write_envelope(&writer, &hello).is_err() {
         outcome.ended = "hello-write-failed".into();
         return outcome;
     }
@@ -174,9 +279,10 @@ fn serve_connection(
                     &message,
                     workspace_uid,
                     workspace_generation,
-                    &mut writer,
+                    &writer,
                     &mut sequence,
                     &mut outcome,
+                    media_gate.as_deref(),
                 ) {
                     if outcome.ended.is_empty() {
                         outcome.ended = "refused".into();
@@ -187,6 +293,17 @@ fn serve_connection(
         }
     }
     handshake.close();
+    if let Some(gate) = media_gate.as_deref() {
+        gate.ended.store(true, Ordering::SeqCst);
+    }
+    if let Some(stats) = media_stats.as_deref() {
+        outcome.video_frames_sent = stats.frames_sent.load(Ordering::SeqCst);
+        outcome.video_bytes_sent = stats.bytes_sent.load(Ordering::SeqCst);
+        outcome.video_keyframes_sent = stats.keyframes_sent.load(Ordering::SeqCst);
+    }
+    if let Some(thread) = media_thread {
+        let _ = thread.join();
+    }
     outcome
 }
 
@@ -197,9 +314,10 @@ fn serve_control(
     message: &Envelope,
     workspace_uid: &str,
     workspace_generation: &str,
-    writer: &mut impl Write,
+    writer: &SharedWriter,
     sequence: &mut u64,
     outcome: &mut SessionOutcome,
+    gate: Option<&MediaGate>,
 ) -> bool {
     match message.message_type.as_str() {
         "attach" => {
@@ -233,10 +351,16 @@ fn serve_control(
                 decision,
             );
             *sequence += 1;
-            if write_control(writer, &reply).is_err() {
+            if write_envelope(writer, &reply).is_err() {
                 return false;
             }
-            handshake.admitted()
+            let admitted = handshake.admitted();
+            if admitted {
+                if let Some(gate) = gate {
+                    gate.admitted.store(true, Ordering::SeqCst);
+                }
+            }
+            admitted
         }
         "resizeRequest" => {
             let id = message.payload["requestId"]
@@ -255,7 +379,7 @@ fn serve_control(
                     );
                     *sequence += 1;
                     outcome.resize_acks += 1;
-                    write_control(writer, &ack).is_ok()
+                    write_envelope(writer, &ack).is_ok()
                 }
                 Err(_) => false,
             }
@@ -264,6 +388,10 @@ fn serve_control(
             Ok(forward) => {
                 if forward {
                     outcome.keyframes_forwarded += 1;
+                    // The encoder consumes this into one forced IDR.
+                    if let Some(gate) = gate {
+                        gate.force_idr.store(true, Ordering::SeqCst);
+                    }
                 }
                 true
             }
@@ -281,7 +409,7 @@ fn serve_control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     fn test_ticket(session_id: &str) -> serde_json::Value {
         serde_json::json!({
@@ -470,5 +598,104 @@ mod tests {
         drop(first);
         let outcome = handle.join().expect("server thread");
         assert_eq!(outcome.ended, "peer-closed");
+    }
+
+    fn read_media(stream: &mut TcpStream) -> (MediaKind, Vec<u8>) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        match read_frame(stream).expect("frame").expect("not eof") {
+            Frame::Media { kind, payload } => (kind, payload),
+            Frame::Control(envelope) => panic!("expected media, got {}", envelope.message_type),
+        }
+    }
+
+    fn attach_client(client: &mut TcpStream) -> String {
+        let hello = read_envelope(client);
+        assert_eq!(hello.message_type, "hello");
+        let session = hello.session_id.clone();
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket": test_ticket(&session)}),
+            ),
+            client,
+        );
+        let result = read_envelope(client);
+        assert_eq!(result.payload["admitted"], true);
+        session
+    }
+
+    #[test]
+    fn media_flows_after_admission_not_before() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let gate = Arc::new(MediaGate::default());
+        let stats = Arc::new(MediaStats::default());
+        let (tx, rx) = mpsc::channel();
+        let handle =
+            std::thread::spawn(move || server.serve_one_media(gate, rx, stats).expect("serve"));
+        let mut client = connect(port);
+        let session = attach_client(&mut client);
+        // Feed two units post-admission; the client must receive both intact.
+        for payload in [vec![0x11u8; 64], vec![0x22u8; 128]] {
+            tx.send(MediaPacket {
+                kind: MediaKind::H264,
+                payload: payload.clone(),
+            })
+            .expect("feed");
+            let (kind, back) = read_media(&mut client);
+            assert_eq!(kind, MediaKind::H264);
+            assert_eq!(back, payload);
+        }
+        send(
+            &control(&session, "bye", 3, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(outcome.video_frames_sent, 2);
+        assert_eq!(outcome.video_bytes_sent, 192);
+        assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[test]
+    fn keyframe_request_raises_force_idr() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let gate = Arc::new(MediaGate::default());
+        let gate_probe = Arc::clone(&gate);
+        let stats = Arc::new(MediaStats::default());
+        let (_tx, rx) = mpsc::channel();
+        let handle =
+            std::thread::spawn(move || server.serve_one_media(gate, rx, stats).expect("serve"));
+        let mut client = connect(port);
+        let session = attach_client(&mut client);
+        assert!(
+            !gate_probe.force_idr.load(Ordering::SeqCst),
+            "no demand before request"
+        );
+        send(
+            &control(&session, "keyframeRequest", 3, serde_json::json!({})),
+            &mut client,
+        );
+        // No reply by design; the flag is the contract.
+        for _ in 0..100 {
+            if gate_probe.force_idr.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            gate_probe.force_idr.load(Ordering::SeqCst),
+            "keyframe demand must raise force_idr for the encoder"
+        );
+        send(
+            &control(&session, "bye", 4, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().expect("server thread");
+        assert_eq!(outcome.keyframes_forwarded, 1);
     }
 }
