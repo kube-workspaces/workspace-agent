@@ -17,7 +17,7 @@ fn usage(code: i32) -> ! {
     eprintln!("usage:");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--max-sessions N] [--max-idle-secs N]");
+    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN"
     );
@@ -128,8 +128,12 @@ fn main() {
             let max_idle_secs: u64 = flag_value(&args, "--max-idle-secs")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            // Bind loopback by default (safe for loopback diagnostics); the
+            // cluster data path reaches the guest on its pod-network address,
+            // so proof/product serve passes --bind 0.0.0.0 explicitly.
+            let bind = flag_value(&args, "--bind").unwrap_or_else(|| "127.0.0.1".into());
             let server = kw_transport::Server::bind(
-                ("127.0.0.1", port),
+                (bind.as_str(), port),
                 workspace_uid,
                 workspace_generation,
             )
