@@ -62,6 +62,7 @@ package: ## Stage and archive release targets from bin/<target>/
 		stage="$(DIST_DIR)/$(PACKAGE_NAME)-$$os-$$arch"; \
 		rm -rf "$$stage"; mkdir -p "$$stage"; \
 		cp "$$src" "$$stage/"; \
+		chmod +x "$$stage/$$(basename "$$src")"; \
 		cp README.md LICENSE "$$stage/"; \
 		if [ "$$os" = windows ]; then \
 			cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 "$$stage/"; \

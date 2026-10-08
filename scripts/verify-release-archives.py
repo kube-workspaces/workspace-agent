@@ -29,6 +29,17 @@ def members_of(archive: Path, os_name: str) -> list[str]:
         return [e.name for e in entries if e.isfile()]
 
 
+def assert_binary_runnable(archive: Path, os_name: str) -> None:
+    # Artifact upload/download drops the executable bit, so `make package`
+    # must restore it; a tar member that cannot exec is not a usable agent.
+    if os_name == "windows" or archive.suffix == ".zip":
+        return
+    with tarfile.open(archive, "r:gz") as t:
+        member = next((m for m in t.getmembers() if m.name.endswith("/kw-agent")), None)
+        assert member is not None, f"{archive.name}: kw-agent missing"
+        assert member.mode & 0o111, f"{archive.name}: kw-agent is not executable"
+
+
 def verify(directory: Path, version: str, require_msi: bool = False) -> None:
     sums = {}
     for line in (directory / "SHA256SUMS").read_text().splitlines():
@@ -60,6 +71,7 @@ def verify(directory: Path, version: str, require_msi: bool = False) -> None:
             required |= {f"{root}/install.ps1", f"{root}/uninstall.ps1"}
         missing = required - set(members)
         assert not missing, f"{name}: missing members {sorted(missing)}"
+        assert_binary_runnable(archive, os_name)
         print(f"{name}: contract OK")
 
     # The unsigned Windows MSI ships alongside the archives (same release,
