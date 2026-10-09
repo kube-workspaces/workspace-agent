@@ -334,12 +334,13 @@ jobs:
         with:
           pattern: msi-windows-*
           path: msi
+          merge-multiple: true
           github-token: ${{ github.token }}
 
       - name: Stage MSI and recompute checksums
         run: |
           set -euo pipefail
-          cp msi/msi-windows-*/*.msi dist/
+          cp msi/*.msi dist/
           ls dist/*.msi
           (cd dist && sha256sum *.tar.gz *.zip *.msi > SHA256SUMS)
           cat dist/SHA256SUMS
