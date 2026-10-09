@@ -14,9 +14,15 @@ use std::time::{Duration, Instant};
 /// Open the console output now (fail-fast): a serve that cannot see the
 /// desktop must not sit listening until the first viewer discovers it.
 /// Returns the desktop size for encoder configuration.
-pub fn open_output(output_index: u32) -> Result<kw_platform::capture::Duplicator, String> {
-    kw_platform::capture::Duplicator::new(output_index)
-        .map_err(|error| format!("console capture unavailable: {error}"))
+pub fn open_output(
+    output_index: u32,
+    name: Option<&str>,
+) -> Result<kw_platform::capture::Duplicator, String> {
+    match name {
+        Some(name) => kw_platform::capture::Duplicator::new_named(name),
+        None => kw_platform::capture::Duplicator::new(output_index),
+    }
+    .map_err(|error| format!("console capture unavailable: {error}"))
 }
 
 /// Capture thread body: open, acquire → encode → feed until the session
@@ -27,6 +33,7 @@ pub fn open_output(output_index: u32) -> Result<kw_platform::capture::Duplicator
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     output_index: u32,
+    output_name: Option<String>,
     fps: u32,
     bitrate_bps: u32,
     gate: Arc<MediaGate>,
@@ -37,13 +44,21 @@ pub fn run(
     resize: mpsc::Receiver<crate::resize::Request>,
 ) {
     let fps = fps.max(1);
-    let mut duplicator = Some(match open_output(output_index) {
+    let mut duplicator = Some(match open_output(output_index, output_name.as_deref()) {
         Ok(duplicator) => duplicator,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     });
+    gate.capture_width.store(
+        duplicator.as_ref().expect("opened output").size().0,
+        Ordering::SeqCst,
+    );
+    gate.capture_height.store(
+        duplicator.as_ref().expect("opened output").size().1,
+        Ordering::SeqCst,
+    );
     let mut encoder = match kw_encode::StreamEncoder::new(&kw_encode::Settings {
         width: duplicator.as_ref().expect("opened output").padded_size().0,
         height: duplicator.as_ref().expect("opened output").padded_size().1,
@@ -97,8 +112,30 @@ pub fn run(
                     let _ = request.reply.send(Err("display-resize-expired".into()));
                     continue;
                 }
-                let changed = kw_platform::display::resize(
+                // Verify a prospective encoder before touching the guest mode.
+                // A codec size/level refusal must leave the current stream usable.
+                let mut prepared = match kw_encode::StreamEncoder::new(&kw_encode::Settings {
+                    width: kw_platform::capture::pad16(request.width),
+                    height: kw_platform::capture::pad16(request.height),
+                    fps,
+                    bitrate_bps,
+                    max_keyframe_spacing: 60,
+                }) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = request
+                            .reply
+                            .send(Err(format!("display-encoder-preflight:{error}")));
+                        continue;
+                    }
+                };
+                if Instant::now() >= request.deadline {
+                    let _ = request.reply.send(Err("display-resize-expired".into()));
+                    continue;
+                }
+                let changed = kw_platform::display::resize_selected(
                     output_index,
+                    output_name.as_deref(),
                     kw_platform::display::Size {
                         width: request.width,
                         height: request.height,
@@ -109,7 +146,7 @@ pub fn run(
                     // release the old interface before opening its replacement.
                     let _ = duplicator.take();
                     let fresh = loop {
-                        match open_output(output_index) {
+                        match open_output(output_index, output_name.as_deref()) {
                             Ok(fresh) => break fresh,
                             Err(error) if Instant::now() >= request.deadline => return Err(error),
                             Err(_) => std::thread::sleep(Duration::from_millis(50)),
@@ -119,15 +156,18 @@ pub fn run(
                         return Err("display-capture-mode-mismatch".into());
                     }
                     let (width, height) = fresh.padded_size();
-                    encoder
-                        .reconfigure(&kw_encode::Settings {
-                            width,
-                            height,
-                            fps,
-                            bitrate_bps,
-                            max_keyframe_spacing: 60,
-                        })
-                        .map_err(|error| format!("display-encoder-reconfigure:{error}"))?;
+                    if prepared.settings().width != width || prepared.settings().height != height {
+                        prepared
+                            .reconfigure(&kw_encode::Settings {
+                                width,
+                                height,
+                                fps,
+                                bitrate_bps,
+                                max_keyframe_spacing: 60,
+                            })
+                            .map_err(|error| format!("display-encoder-reconfigure:{error}"))?;
+                    }
+                    encoder = prepared;
                     duplicator = Some(fresh);
                     last_frame = None;
                     Ok(actual)
@@ -160,7 +200,7 @@ pub fn run(
             Err(kw_platform::Error::SessionLost(_)) => {
                 eprintln!("capture: session lost, rebuilding duplicator");
                 let _ = duplicator.take();
-                match kw_platform::capture::Duplicator::new(output_index) {
+                match open_output(output_index, output_name.as_deref()) {
                     Ok(fresh) => {
                         duplicator = Some(fresh);
                         last_frame = None;

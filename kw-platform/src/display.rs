@@ -8,16 +8,35 @@ pub struct Size {
 }
 
 pub fn resize(output_index: u32, requested: Size) -> Result<Size, String> {
+    resize_selected(output_index, None, requested)
+}
+
+pub fn selected_name(output_index: u32, name: Option<&str>) -> Result<String, String> {
+    platform::selected_name(output_index, name)
+}
+
+pub fn resize_selected(
+    output_index: u32,
+    name: Option<&str>,
+    requested: Size,
+) -> Result<Size, String> {
     if !(320..=8192).contains(&requested.width) || !(200..=8192).contains(&requested.height) {
         return Err("display-invalid-size".into());
     }
-    platform::resize(output_index, requested)
+    platform::resize(output_index, name, requested)
 }
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use super::Size;
-    pub fn resize(_output_index: u32, _requested: Size) -> Result<Size, String> {
+    pub fn selected_name(_output_index: u32, _name: Option<&str>) -> Result<String, String> {
+        Err("display-backend-unavailable".into())
+    }
+    pub fn resize(
+        _output_index: u32,
+        _name: Option<&str>,
+        _requested: Size,
+    ) -> Result<Size, String> {
         Err("display-backend-unavailable".into())
     }
 }
@@ -33,25 +52,31 @@ mod platform {
         DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
     };
 
-    pub fn resize(output_index: u32, requested: Size) -> Result<Size, String> {
-        // Match Duplicator's selection: the requested output on the first
-        // adapter exposing it. Never fall back to an unrelated monitor.
+    pub fn selected_name(
+        output_index: u32,
+        requested_name: Option<&str>,
+    ) -> Result<String, String> {
         let factory: IDXGIFactory1 =
             unsafe { CreateDXGIFactory1() }.map_err(|_| "display-enumeration-failed")?;
-        let mut name = None;
-        for index in 0..32 {
-            let adapter = match unsafe { factory.EnumAdapters1(index) } {
-                Ok(adapter) => adapter,
-                Err(_) => break,
-            };
-            if let Ok(output) = unsafe { adapter.EnumOutputs(output_index) } {
-                let mut desc = Default::default();
-                unsafe { output.GetDesc(&mut desc) }.map_err(|_| "display-description-failed")?;
-                name = Some(desc.DeviceName);
-                break;
-            }
-        }
-        let name = name.ok_or("display-output-unavailable")?;
+        let (_, output) = super::choose_output(&factory, output_index, requested_name)
+            .map_err(|error| format!("display-output-unavailable:{error}"))?;
+        let mut desc = Default::default();
+        unsafe { output.GetDesc(&mut desc) }.map_err(|_| "display-description-failed")?;
+        let length = desc
+            .DeviceName
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(desc.DeviceName.len());
+        Ok(String::from_utf16_lossy(&desc.DeviceName[..length]))
+    }
+
+    pub fn resize(
+        output_index: u32,
+        requested_name: Option<&str>,
+        requested: Size,
+    ) -> Result<Size, String> {
+        let name = selected_name(output_index, requested_name)?;
+        let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         let device = PCWSTR(name.as_ptr());
         let mut mode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
@@ -83,4 +108,51 @@ mod platform {
             height: mode.dmPelsHeight,
         })
     }
+}
+
+/// Shared selection for capture and modes. Explicit names search every adapter;
+/// legacy index selection retains the first adapter exposing that index.
+#[cfg(target_os = "windows")]
+pub(crate) fn choose_output(
+    factory: &windows::Win32::Graphics::Dxgi::IDXGIFactory1,
+    output_index: u32,
+    name: Option<&str>,
+) -> Result<
+    (
+        windows::Win32::Graphics::Dxgi::IDXGIAdapter1,
+        windows::Win32::Graphics::Dxgi::IDXGIOutput,
+    ),
+    crate::Error,
+> {
+    for adapter_index in 0..32 {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        for index in 0..32 {
+            if name.is_none() && index != output_index {
+                continue;
+            }
+            let output = match unsafe { adapter.EnumOutputs(index) } {
+                Ok(output) => output,
+                Err(_) => break,
+            };
+            let mut desc = Default::default();
+            unsafe { output.GetDesc(&mut desc) }
+                .map_err(|e| crate::Error::Os(e.code().0 as u32))?;
+            if !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let length = desc
+                .DeviceName
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(desc.DeviceName.len());
+            let actual = String::from_utf16_lossy(&desc.DeviceName[..length]);
+            if name.map_or(true, |wanted| wanted.eq_ignore_ascii_case(&actual)) {
+                return Ok((adapter, output));
+            }
+        }
+    }
+    Err(crate::Error::Empty)
 }

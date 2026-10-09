@@ -55,6 +55,10 @@ to a fresh IDR.
   injected and whether a `resizeRequest` can actually change the guest mode;
   a viewer must not send input or expect a real resize before the matching
   flag is true.
+  Optional `capture: {width, height}` gives the true selected desktop size,
+  excluding macroblock padding in the raw H.264 stream. A native viewer crops
+  matching padded frames to that size and updates it only from a successful
+  paired resize result; stale old-mode dimensions must not crop a new-mode IDR.
 - `capabilities`: updated subset of `hello` fields; `capabilityEpoch`
   increases on every change.
 - `attach`: viewer presents a short-lived ticket (see below). Agent and

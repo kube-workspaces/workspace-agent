@@ -10,7 +10,7 @@ use crate::frame::{read_frame, write_control, write_media, Frame, MediaKind};
 use kw_core::{now_secs, Handshake};
 use kw_protocol::{Envelope, InputEvent, Reject, Ticket};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 /// What happened during one served connection (telemetry, no secrets).
@@ -50,6 +50,9 @@ pub struct SessionOutcome {
 /// arbitrarily dropping encoded reference frames. Drop-to-IDR is later work.
 #[derive(Debug, Default)]
 pub struct MediaGate {
+    /// True desktop dimensions, excluding encoder macroblock padding.
+    pub capture_width: AtomicU32,
+    pub capture_height: AtomicU32,
     /// Set on successful attach; the writer thread idles before this.
     pub admitted: AtomicBool,
     /// Set by keyframe_request; the encoder consumes it into one forced IDR.
@@ -322,6 +325,11 @@ fn serve_connection(
         })
     });
     // Speak first: hello with this session's claim ids.
+    let capture = media_gate.as_ref().and_then(|gate| {
+        let width = gate.capture_width.load(Ordering::SeqCst);
+        let height = gate.capture_height.load(Ordering::SeqCst);
+        (width != 0 && height != 0).then(|| serde_json::json!({"width": width, "height": height}))
+    });
     let hello = envelope(
         "hello",
         1,
@@ -332,6 +340,7 @@ fn serve_connection(
             "platform": std::env::consts::OS,
             "role": "controller-only",
             "capabilityEpoch": 1,
+            "capture": capture,
             "clipboardText": clipboard.is_some(),
             "telemetryAvailable": true,
             // Honest capability flags: input reflects whether a backend is

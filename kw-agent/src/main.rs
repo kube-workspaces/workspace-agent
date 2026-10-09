@@ -21,6 +21,9 @@ fn usage(code: i32) -> ! {
         platform::describe()
     );
     eprintln!("usage:");
+    eprintln!(
+        r"  serve --capture-output-name \\.\DISPLAY2 selects one monitor across capture, resize and input"
+    );
     eprintln!("  serve --resize enables guest mode changes with --capture-video in the active console session");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
@@ -117,6 +120,23 @@ fn main() {
             }
         }
         Some("serve") => {
+            let capture_output_index = flag_value(&args, "--capture-output")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let capture_output_name = if args.iter().any(|arg| arg == "--capture-video") {
+                Some(
+                    kw_platform::display::selected_name(
+                        capture_output_index,
+                        flag_value(&args, "--capture-output-name").as_deref(),
+                    )
+                    .unwrap_or_else(|error| {
+                        eprintln!("serve: selected output unavailable: {error}");
+                        std::process::exit(2);
+                    }),
+                )
+            } else {
+                None
+            };
             let workspace_uid = flag_value(&args, "--workspace-uid").unwrap_or_else(|| {
                 eprintln!("serve: --workspace-uid is required");
                 usage(2);
@@ -179,10 +199,12 @@ fn main() {
                     );
                     std::process::exit(2);
                 }
-                let injector = kw_platform::input::Injector::new().unwrap_or_else(|error| {
-                    eprintln!("serve: input backend unavailable: {error}");
-                    std::process::exit(2);
-                });
+                let injector =
+                    kw_platform::input::Injector::for_output(capture_output_name.clone())
+                        .unwrap_or_else(|error| {
+                            eprintln!("serve: input backend unavailable: {error}");
+                            std::process::exit(2);
+                        });
                 struct InjectorInput(std::sync::Mutex<kw_platform::input::Injector>);
                 impl kw_transport::Input for InjectorInput {
                     fn key(&self, keysym: u32, down: bool) -> Result<(), String> {
@@ -314,7 +336,10 @@ fn main() {
                 );
                 // Fail fast on console visibility (not on pixels: the screen
                 // may legitimately be static at startup).
-                if let Err(error) = kw_platform::capture::Duplicator::new(capture_output) {
+                println!("selected output {:?}", capture_output_name);
+                if let Err(error) =
+                    capture::open_output(capture_output, capture_output_name.as_deref())
+                {
                     eprintln!("serve: {error}");
                     std::process::exit(2);
                 }
@@ -358,6 +383,7 @@ fn main() {
                         let thread_gate = Arc::clone(&gate);
                         let thread_stats = Arc::clone(&stats);
                         let thread_settings = synth_settings.clone();
+                        let thread_output_name = capture_output_name.clone();
                         let thread_feed = feed_tx.clone();
                         let thread_anchor = anchor;
                         let source = if capture_video {
@@ -369,6 +395,7 @@ fn main() {
                             if capture_video {
                                 capture::run(
                                     capture_output,
+                                    thread_output_name,
                                     capture_fps,
                                     capture_bitrate_bps,
                                     thread_gate,

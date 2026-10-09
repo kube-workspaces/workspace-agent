@@ -101,9 +101,9 @@ mod platform {
     };
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory1, IDXGIAdapter1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-        IDXGIResource, IDXGISurface, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-        DXGI_MAPPED_RECT, DXGI_MAP_READ, DXGI_OUTDUPL_FRAME_INFO,
+        CreateDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        IDXGISurface, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_MAPPED_RECT,
+        DXGI_MAP_READ, DXGI_OUTDUPL_FRAME_INFO,
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
@@ -168,31 +168,26 @@ mod platform {
         /// returns [`Error::Empty`] — never a fake frame.
         pub fn new(output_index: u32) -> Result<Self, Error> {
             let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            let built = unsafe { Self::build(output_index) };
+            let built = unsafe { Self::build(output_index, None) };
             if built.is_err() {
                 unsafe { CoUninitialize() };
             }
             built
         }
 
-        unsafe fn build(output_index: u32) -> Result<Self, Error> {
+        pub fn new_named(name: &str) -> Result<Self, Error> {
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            let built = unsafe { Self::build(0, Some(name)) };
+            if built.is_err() {
+                unsafe { CoUninitialize() };
+            }
+            built
+        }
+
+        unsafe fn build(output_index: u32, name: Option<&str>) -> Result<Self, Error> {
             let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory1 =
                 CreateDXGIFactory1().map_err(os)?;
-            let mut chosen: Option<(IDXGIAdapter1, IDXGIOutput)> = None;
-            for adapter_index in 0..32u32 {
-                let adapter: IDXGIAdapter1 = match factory.EnumAdapters1(adapter_index) {
-                    Ok(adapter) => adapter,
-                    Err(_) => break,
-                };
-                match adapter.EnumOutputs(output_index) {
-                    Ok(output) => {
-                        chosen = Some((adapter, output));
-                        break;
-                    }
-                    Err(_) => continue,
-                }
-            }
-            let (adapter, output) = chosen.ok_or(Error::Empty)?;
+            let (adapter, output) = crate::display::choose_output(&factory, output_index, name)?;
             let base: windows::Win32::Graphics::Dxgi::IDXGIAdapter = adapter.cast().map_err(os)?;
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
@@ -348,6 +343,10 @@ mod platform {
     #[allow(dead_code)]
     impl Duplicator {
         pub fn new(_output_index: u32) -> Result<Self, Error> {
+            Err(Error::Gated("non-Windows capture backends (P5)"))
+        }
+
+        pub fn new_named(_name: &str) -> Result<Self, Error> {
             Err(Error::Gated("non-Windows capture backends (P5)"))
         }
 

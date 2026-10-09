@@ -37,6 +37,25 @@ not treat fixtures or CI green as guest acceptance.
 | `scripts/verify-release-archives.py` | Release archive contract check |
 | `packaging/windows/` | Unsigned MSI (WiX) build, verify and lifecycle test |
 
+## Windows output selection
+
+Run `kw-agent --hello` in the interactive console session to enumerate actual
+adapters, outputs and supported modes. With `serve --capture-video`, use
+`--capture-output-name '\\.\DISPLAY2'` to explicitly select an output by its
+Windows device name across all adapters. Capture, guest resize and absolute
+pointer coordinates share that selection, including the monitor's origin in
+the virtual desktop. Missing selected outputs fail explicitly.
+
+The legacy `--capture-output N` selects that output index on the first adapter
+exposing it. GPU vendor, onboard/discrete/vGPU/passthrough presence and KVM CPU
+acceleration are not substitutes for actual output, driver or codec capability.
+An emulated Basic Display adapter may expose a fixed resolution; changing an
+arbitrary viewer size requires a guest display driver exposing the desired mode.
+
+`hello.capture` reports true desktop dimensions, excluding encoder padding.
+Successful resize ACKs similarly report actual dimensions; native viewers crop
+the padded H.264 frame to those dimensions.
+
 ## Checks
 
 ```sh

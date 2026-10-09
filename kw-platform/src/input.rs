@@ -27,18 +27,20 @@ pub struct Key {
 /// Stateful injector: remembers the pressed mouse buttons so a pointer event
 /// can emit only the button transitions. One per served session.
 pub struct Injector {
-    width: i32,
-    height: i32,
+    output_name: Option<String>,
     buttons: u8,
     keys: std::collections::BTreeSet<u32>,
 }
 
 impl Injector {
     pub fn new() -> Result<Self, String> {
-        let (width, height) = platform::screen_metrics()?;
+        Self::for_output(None)
+    }
+
+    pub fn for_output(output_name: Option<String>) -> Result<Self, String> {
+        platform::pointer_space(output_name.as_deref())?;
         Ok(Self {
-            width,
-            height,
+            output_name,
             buttons: 0,
             keys: std::collections::BTreeSet::new(),
         })
@@ -55,8 +57,8 @@ impl Injector {
     }
 
     pub fn pointer(&mut self, x: i32, y: i32, buttons: u8) -> Result<(), String> {
-        (self.width, self.height) = platform::screen_metrics()?;
-        platform::pointer(&mut self.buttons, self.width, self.height, x, y, buttons)
+        let space = platform::pointer_space(self.output_name.as_deref())?;
+        platform::pointer(&mut self.buttons, space, x, y, buttons)
     }
 
     pub fn wheel(&mut self, dx: i32, dy: i32) -> Result<(), String> {
@@ -221,11 +223,41 @@ pub fn normalize(value: i32, extent: i32) -> u16 {
 /// Number of pixels one wheel step moves.
 pub const WHEEL_DELTA: i32 = 120;
 
+/// Map guest-local coordinates through the selected monitor's desktop origin.
+#[derive(Clone, Copy, Debug)]
+pub struct PointerSpace {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+    pub virtual_left: i32,
+    pub virtual_top: i32,
+    pub virtual_width: i32,
+    pub virtual_height: i32,
+}
+
+impl PointerSpace {
+    pub fn absolute(&self, x: i32, y: i32) -> (u16, u16) {
+        let x = self
+            .left
+            .saturating_sub(self.virtual_left)
+            .saturating_add(x.clamp(0, (self.width - 1).max(0)));
+        let y = self
+            .top
+            .saturating_sub(self.virtual_top)
+            .saturating_add(y.clamp(0, (self.height - 1).max(0)));
+        (
+            normalize(x, self.virtual_width),
+            normalize(y, self.virtual_height),
+        )
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use super::{Key, SessionState, WHEEL_DELTA};
+    use super::{Key, PointerSpace, SessionState, WHEEL_DELTA};
 
-    pub fn screen_metrics() -> Result<(i32, i32), String> {
+    pub fn pointer_space(_name: Option<&str>) -> Result<PointerSpace, String> {
         Err("input-backend-unavailable".into())
     }
 
@@ -239,8 +271,7 @@ mod platform {
 
     pub fn pointer(
         _buttons: &mut u8,
-        _width: i32,
-        _height: i32,
+        _space: PointerSpace,
         _x: i32,
         _y: i32,
         _mask: u8,
@@ -264,19 +295,28 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{keysym_to_key, keysym_to_unicode, normalize, SessionState, WHEEL_DELTA};
+    use super::{keysym_to_key, keysym_to_unicode, PointerSpace, SessionState, WHEEL_DELTA};
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
     use windows::Win32::System::RemoteDesktop::{
         ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
     };
     use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
         KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
         MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
         MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
 
     pub fn session_state() -> SessionState {
         let current = current_session();
@@ -294,13 +334,58 @@ mod platform {
         Some(session)
     }
 
-    pub fn screen_metrics() -> Result<(i32, i32), String> {
-        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-        let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-        if width <= 0 || height <= 0 {
+    pub fn pointer_space(name: Option<&str>) -> Result<PointerSpace, String> {
+        struct DpiGuard(DPI_AWARENESS_CONTEXT);
+        impl Drop for DpiGuard {
+            fn drop(&mut self) {
+                unsafe { SetThreadDpiAwarenessContext(self.0) };
+            }
+        }
+        // EnumDisplaySettings/DXGI report physical pixels. Read virtual-desktop
+        // metrics in that same coordinate space even with mixed monitor DPI.
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.0 == 0 {
+            return Err("input-dpi-context-unavailable".into());
+        }
+        let _dpi = DpiGuard(previous);
+        let mut space = PointerSpace {
+            left: 0,
+            top: 0,
+            width: unsafe { GetSystemMetrics(SM_CXSCREEN) },
+            height: unsafe { GetSystemMetrics(SM_CYSCREEN) },
+            virtual_left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            virtual_top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+            virtual_width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+            virtual_height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        };
+        if let Some(name) = name {
+            let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut mode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            if !unsafe {
+                EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode)
+            }
+            .as_bool()
+            {
+                return Err("input-output-unavailable".into());
+            }
+            let position = unsafe { mode.Anonymous1.Anonymous2.dmPosition };
+            space.left = position.x;
+            space.top = position.y;
+            space.width = mode.dmPelsWidth as i32;
+            space.height = mode.dmPelsHeight as i32;
+        }
+        if space.width <= 0
+            || space.height <= 0
+            || space.virtual_width <= 0
+            || space.virtual_height <= 0
+        {
             return Err("input-no-screen-metrics".into());
         }
-        Ok((width, height))
+        Ok(space)
     }
 
     fn send(inputs: &[INPUT]) -> Result<(), String> {
@@ -379,17 +464,17 @@ mod platform {
 
     pub fn pointer(
         buttons: &mut u8,
-        width: i32,
-        height: i32,
+        space: PointerSpace,
         x: i32,
         y: i32,
         mask: u8,
     ) -> Result<(), String> {
+        let (x, y) = space.absolute(x, y);
         let mut inputs = vec![mouse_input(
-            normalize(x, width) as i32,
-            normalize(y, height) as i32,
+            x as i32,
+            y as i32,
             0,
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )];
         // RFB mask: bit 0 left, bit 1 middle, bit 2 right. Emit transitions
         // only, so holding a button does not re-press it every move.
@@ -405,8 +490,13 @@ mod platform {
             let flag = if mask & bit != 0 { press } else { release };
             inputs.push(mouse_input(0, 0, 0, flag));
         }
-        *buttons = mask;
-        send(&inputs)
+        let result = send(&inputs);
+        *buttons = if result.is_ok() {
+            mask
+        } else {
+            *buttons | mask
+        };
+        result
     }
 
     pub fn release(buttons: &mut u8) {
@@ -500,6 +590,31 @@ mod tests {
         assert_eq!(normalize(9999, 1920), 65535);
         assert_eq!(normalize(5, 0), 0);
         assert!(normalize(960, 1920) > 30000 && normalize(960, 1920) < 35000);
+    }
+
+    #[test]
+    fn selected_monitor_coordinates_include_negative_virtual_origins() {
+        let mut space = PointerSpace {
+            left: -800,
+            top: -200,
+            width: 800,
+            height: 600,
+            virtual_left: -800,
+            virtual_top: -200,
+            virtual_width: 2080,
+            virtual_height: 1000,
+        };
+        assert_eq!(space.absolute(0, 0), (0, 0));
+        assert_eq!(space.absolute(-10, -10), (0, 0));
+        // The primary screen starts inside the combined desktop, not at its
+        // normalized origin. Its far edge is the combined desktop's far edge.
+        space.left = 0;
+        space.top = 0;
+        space.width = 1280;
+        space.height = 800;
+        assert_eq!(space.absolute(0, 0), (25217, 13120));
+        assert_eq!(space.absolute(1279, 799), (65535, 65535));
+        assert_eq!(space.absolute(9999, 9999), (65535, 65535));
     }
 
     #[test]

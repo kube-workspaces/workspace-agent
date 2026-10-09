@@ -42,6 +42,75 @@ impl Default for Settings {
     }
 }
 
+/// Select a baseline-profile H.264 level for the frame/rate/bitrate, retaining
+/// level 4.0 for existing small streams. Values are the MF level identifiers.
+pub fn h264_level(settings: &Settings) -> Result<u32, Error> {
+    if settings.width == 0 || settings.height == 0 || settings.fps == 0 {
+        return Err(Error::Configure("zero dimension or rate".into()));
+    }
+    let width = (settings.width as u64).div_ceil(16);
+    let height = (settings.height as u64).div_ceil(16);
+    let frame = width.saturating_mul(height);
+    let rate = frame.saturating_mul(settings.fps as u64);
+    let levels: [(u32, u64, u64, u64); 6] = [
+        (40, 8192, 245_760, 20_000_000),
+        (41, 8192, 245_760, 50_000_000),
+        (42, 8704, 522_240, 50_000_000),
+        (50, 22_080, 589_824, 135_000_000),
+        (51, 36_864, 983_040, 240_000_000),
+        (52, 36_864, 2_073_600, 240_000_000),
+    ];
+    for (level, max_frame, max_rate, max_bitrate) in levels {
+        if frame <= max_frame
+            && rate <= max_rate
+            && settings.bitrate_bps as u64 <= max_bitrate
+            && width.saturating_mul(width) <= max_frame * 8
+            && height.saturating_mul(height) <= max_frame * 8
+        {
+            return Ok(level);
+        }
+    }
+    Err(Error::Configure(
+        "frame/rate/bitrate exceeds supported H.264 levels".into(),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn h264_levels_cover_large_frames_and_bound_extreme_rates() {
+    for (width, height, fps, level) in [
+        (320, 240, 30, 40),
+        (1920, 1088, 30, 40),
+        (1920, 1088, 60, 42),
+        (2224, 1360, 30, 50),
+        (3840, 2160, 30, 51),
+        (3840, 2160, 60, 52),
+    ] {
+        assert_eq!(
+            h264_level(&Settings {
+                width,
+                height,
+                fps,
+                ..Settings::default()
+            }),
+            Ok(level)
+        );
+    }
+    for (width, height, fps) in [
+        (8192, 8192, 30),
+        (1920, 1088, u32::MAX),
+        (u32::MAX, u32::MAX, u32::MAX),
+    ] {
+        assert!(h264_level(&Settings {
+            width,
+            height,
+            fps,
+            ..Settings::default()
+        })
+        .is_err());
+    }
+}
+
 /// One encoded chunk with its NAL-unit inventory.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Chunk {
@@ -190,10 +259,10 @@ impl StreamEncoder {
 mod inner {
     use super::*;
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncH264VLevel4, eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT, IMFTransform,
-        MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown,
-        MFStartup, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-        MFSTARTUP_NOSOCKET, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+        eAVEncH264VProfile_Base, CLSID_MSH264EncoderMFT, IMFTransform, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
+        MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
         MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT,
         MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
         MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
@@ -477,7 +546,7 @@ mod inner {
         )?;
         hr(
             line!(),
-            output.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4.0 as u32),
+            output.SetUINT32(&MF_MT_MPEG2_LEVEL, h264_level(settings)?),
         )?;
         hr(
             line!(),
