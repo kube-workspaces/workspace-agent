@@ -39,7 +39,7 @@ pub fn run(options: &Options) -> Result<u64, String> {
     loop {
         beats += 1;
         let status = serde_json::json!({
-            "agentVersion": env!("CARGO_PKG_VERSION"),
+            "agentVersion": kw_protocol::AGENT_VERSION,
             "workspaceUid": identity.workspace_uid,
             "workspaceGeneration": identity.workspace_generation,
             "enrolledAt": identity.enrolled_at,
