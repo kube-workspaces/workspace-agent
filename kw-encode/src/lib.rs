@@ -263,11 +263,11 @@ mod inner {
         MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFShutdown, MFStartup,
         MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
         MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT,
-        MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE,
-        MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
-        MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-        MF_VERSION,
+        MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MF_E_BUFFERTOOSMALL,
+        MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
+        MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+        MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE,
+        MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
@@ -305,6 +305,9 @@ mod inner {
     /// fresh instance opens every GOP segment with SPS/PPS/IDR.
     struct Mft {
         encoder: IMFTransform,
+        /// Minimum output sample size from `GetOutputStreamInfo`, so large
+        /// frames (4K IDRs) never hit a fixed small drain buffer.
+        output_bytes: u32,
     }
 
     /// CoInitializeEx owner: Uninitialize on drop. One per Stream.
@@ -395,7 +398,8 @@ mod inner {
                 hr(line!(), sample.SetSampleTime(timestamp_100ns))?;
                 hr(line!(), sample.SetSampleDuration(self.step_100ns))?;
                 hr(line!(), encoder.ProcessInput(0, &sample, 0))?;
-                drain(encoder, &mut chunks)?;
+                let output_bytes = self.current.as_ref().expect("live transform").output_bytes;
+                drain(encoder, output_bytes, &mut chunks)?;
                 Ok(chunks)
             }
         }
@@ -420,7 +424,7 @@ mod inner {
         unsafe fn replace(&mut self, settings: &Settings) -> Result<Vec<Chunk>, Error> {
             let mut trailing = Vec::new();
             if let Some(old) = self.current.take() {
-                drain(&old.encoder, &mut trailing)?;
+                drain(&old.encoder, old.output_bytes, &mut trailing)?;
                 hr(
                     line!(),
                     old.encoder
@@ -449,7 +453,7 @@ mod inner {
                         .encoder
                         .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0),
                 )?;
-                drain(&current.encoder, &mut chunks)?;
+                drain(&current.encoder, current.output_bytes, &mut chunks)?;
             }
             self.finished = true;
             // Guards drop here: MFShutdown, then CoUninitialize, in order.
@@ -470,7 +474,7 @@ mod inner {
                 ),
             )?;
             configure_types(&encoder, settings)?;
-            hr(line!(), encoder.GetOutputStreamInfo(0))?;
+            let info = hr(line!(), encoder.GetOutputStreamInfo(0))?;
             hr(
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0),
@@ -479,7 +483,17 @@ mod inner {
                 line!(),
                 encoder.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0),
             )?;
-            Ok(Self { encoder })
+            // The MFT reports its per-sample output need; fall back to a
+            // frame-proportional floor when it reports none.
+            let floor = settings
+                .width
+                .saturating_mul(settings.height)
+                .saturating_mul(3)
+                / 2;
+            Ok(Self {
+                encoder,
+                output_bytes: info.cbSize.max(floor).max(1024 * 1024),
+            })
         }
     }
 
@@ -580,21 +594,43 @@ mod inner {
         Ok(())
     }
 
-    unsafe fn drain(encoder: &IMFTransform, chunks: &mut Vec<Chunk>) -> Result<(), Error> {
+    unsafe fn drain(
+        encoder: &IMFTransform,
+        output_bytes: u32,
+        chunks: &mut Vec<Chunk>,
+    ) -> Result<(), Error> {
         loop {
             let mut buffer = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
                 ..Default::default()
             };
-            let backing = hr(line!(), MFCreateMemoryBuffer(4 * 1024 * 1024))?;
+            let backing = hr(line!(), MFCreateMemoryBuffer(output_bytes))?;
             let sample = hr(line!(), MFCreateSample())?;
             hr(line!(), sample.AddBuffer(&backing))?;
             buffer.pSample = std::mem::ManuallyDrop::new(Some(sample));
             let mut status = 0u32;
-            let result = encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status);
+            let mut result =
+                encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status);
+            // A large IDR can exceed even the stream-info size on some
+            // builds: retry once with a quadrupled buffer before failing the
+            // session's video. Bounded, never unbounded growth.
+            if result.as_ref().err().map(|e| e.code()) == Some(MF_E_BUFFERTOOSMALL)
+                && output_bytes <= 16 * 1024 * 1024
+            {
+                drop(std::mem::ManuallyDrop::take(&mut buffer.pSample));
+                drop(std::mem::ManuallyDrop::take(&mut buffer.pEvents));
+                let backing = hr(
+                    line!(),
+                    MFCreateMemoryBuffer(output_bytes.saturating_mul(4)),
+                )?;
+                let sample = hr(line!(), MFCreateSample())?;
+                hr(line!(), sample.AddBuffer(&backing))?;
+                buffer.pSample = std::mem::ManuallyDrop::new(Some(sample));
+                result = encoder.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status);
+            }
             // The bindings deliberately use ManuallyDrop for these COM
             // fields. Reclaim ownership BEFORE handling any HRESULT: even
-            // NEED_MORE_INPUT must release the caller's 4 MiB sample buffer.
+            // NEED_MORE_INPUT must release the caller's sample buffer.
             let produced = std::mem::ManuallyDrop::take(&mut buffer.pSample);
             drop(std::mem::ManuallyDrop::take(&mut buffer.pEvents));
             match result {

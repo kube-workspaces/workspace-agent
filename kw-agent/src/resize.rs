@@ -26,7 +26,12 @@ impl kw_transport::Resize for Bridge {
                 reply,
                 deadline: Instant::now() + Duration::from_secs(8),
             })
-            .map_err(|_| "display-resize-busy")?;
+            .map_err(|error| match error {
+                // The capture thread owns the receiver: a disconnect means
+                // video already ended, not a momentary queue-full.
+                mpsc::TrySendError::Full(_) => "display-resize-busy",
+                mpsc::TrySendError::Disconnected(_) => "display-capture-unavailable",
+            })?;
         result
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "display-resize-timeout".to_owned())?
