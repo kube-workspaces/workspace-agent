@@ -268,6 +268,27 @@ fn main() {
             } else {
                 server
             };
+            // Selected output's OS mode list for hello.displayModes, deduped
+            // (the raw enumeration repeats a size per refresh rate and bit
+            // depth) and sorted. Read-only; the list is static per boot.
+            // Only with capture: without a selected output there is nothing
+            // a viewer could validly request.
+            let display_modes = if capture_video {
+                let mut modes = kw_platform::display::modes(
+                    capture_output_index,
+                    capture_output_name.as_deref(),
+                );
+                modes.sort_by_key(|mode| (mode.width, mode.height));
+                modes.dedup_by_key(|mode| (mode.width, mode.height));
+                println!("selected output modes: {}", modes.len());
+                modes
+                    .into_iter()
+                    .map(|mode| (mode.width, mode.height))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let server = server.with_display_modes(display_modes);
             if synthetic && capture_video {
                 eprintln!("serve: --synthetic-video and --capture-video are exclusive");
                 usage(2);

@@ -134,6 +134,9 @@ pub struct Server {
     clipboard: Option<Arc<dyn Clipboard>>,
     input: Option<Arc<dyn Input>>,
     resize: Option<Arc<dyn Resize>>,
+    /// Selected output's OS mode list, as (width, height) pairs. Advertised
+    /// in hello so viewers request modes the guest actually offers.
+    display_modes: Vec<(u32, u32)>,
 }
 
 impl Server {
@@ -151,6 +154,7 @@ impl Server {
             clipboard: None,
             input: None,
             resize: None,
+            display_modes: Vec::new(),
         })
     }
 
@@ -176,6 +180,14 @@ impl Server {
         self
     }
 
+    /// Advertise the selected output's OS mode list (`hello.displayModes`).
+    /// Empty (e.g. no capture output) omits usable modes; viewers then fall
+    /// back to their built-in ladder.
+    pub fn with_display_modes(mut self, modes: Vec<(u32, u32)>) -> Self {
+        self.display_modes = modes;
+        self
+    }
+
     /// Serve exactly one connection, then return its outcome. The host loop
     /// decides whether to accept another (single-controller discipline means
     /// concurrent sessions are never multiplexed here).
@@ -187,6 +199,7 @@ impl Server {
             &self.workspace_uid,
             &self.workspace_generation,
             &self.agent_version,
+            &self.display_modes,
             None,
             self.clipboard.as_deref(),
             self.input.as_deref(),
@@ -211,6 +224,7 @@ impl Server {
             &self.workspace_uid,
             &self.workspace_generation,
             &self.agent_version,
+            &self.display_modes,
             Some((gate, feed, stats)),
             self.clipboard.as_deref(),
             self.input.as_deref(),
@@ -257,6 +271,7 @@ fn serve_connection(
     workspace_uid: &str,
     workspace_generation: &str,
     agent_version: &str,
+    display_modes: &[(u32, u32)],
     media: Option<(Arc<MediaGate>, mpsc::Receiver<MediaPacket>, Arc<MediaStats>)>,
     clipboard: Option<&dyn Clipboard>,
     input: Option<&dyn Input>,
@@ -330,6 +345,12 @@ fn serve_connection(
         let height = gate.capture_height.load(Ordering::SeqCst);
         (width != 0 && height != 0).then(|| serde_json::json!({"width": width, "height": height}))
     });
+    // Selected output's OS mode list, width/height only (matches the
+    // protocol vector shape). Viewers prefer these over guessing.
+    let display_modes: Vec<serde_json::Value> = display_modes
+        .iter()
+        .map(|(width, height)| serde_json::json!({"width": width, "height": height}))
+        .collect();
     let hello = envelope(
         "hello",
         1,
@@ -341,6 +362,7 @@ fn serve_connection(
             "role": "controller-only",
             "capabilityEpoch": 1,
             "capture": capture,
+            "displayModes": display_modes,
             "clipboardText": clipboard.is_some(),
             "telemetryAvailable": true,
             // Honest capability flags: input reflects whether a backend is
@@ -1077,6 +1099,46 @@ mod tests {
             &mut client,
         );
         assert_eq!(handle.join().unwrap().resize_acks, 3);
+    }
+
+    #[test]
+    fn hello_advertises_selected_output_modes() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_display_modes(vec![(1280, 800), (1920, 1080)]);
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(
+            hello.payload["displayModes"],
+            serde_json::json!([{"width": 1280, "height": 800}, {"width": 1920, "height": 1080}])
+        );
+        let session = hello.session_id;
+        send(
+            &control(&session, "bye", 2, serde_json::json!({})),
+            &mut client,
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn hello_without_modes_advertises_empty_list() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(|| run_server_once(server));
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(
+            hello.payload["displayModes"],
+            serde_json::json!(Vec::<serde_json::Value>::new())
+        );
+        let session = hello.session_id;
+        send(
+            &control(&session, "bye", 2, serde_json::json!({})),
+            &mut client,
+        );
+        handle.join().unwrap();
     }
 
     #[derive(Default)]

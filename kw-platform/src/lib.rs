@@ -99,6 +99,14 @@ pub fn inventory() -> Result<Inventory, Error> {
     inner::inventory()
 }
 
+/// OS mode list for one display device (e.g. `\\.\DISPLAY2`). Read-only;
+/// empty where the backend is gated. The live hello carries the selected
+/// output's list so viewers request modes the guest actually offers
+/// instead of guessing.
+pub fn output_modes(device_name: &str) -> Vec<DisplayMode> {
+    inner::output_modes(device_name)
+}
+
 #[cfg(target_os = "windows")]
 mod inner {
     use super::*;
@@ -173,6 +181,10 @@ mod inner {
         // Single unsafe region: every call below is a read-only COM query
         // against inbox OS objects. No writes, no raw-pointer escape.
         unsafe { adapters_inner(factory) }
+    }
+
+    pub fn output_modes(device_name: &str) -> Vec<DisplayMode> {
+        display_modes(device_name)
     }
 
     unsafe fn adapters_inner(factory: &IDXGIFactory1) -> Vec<AdapterInfo> {
@@ -372,6 +384,10 @@ mod inner {
         // Linux adapters (X11/PipeWire/PulseAudio) are P5 work, after Windows
         // delivery. Report the gate instead of returning host guesses.
         Err(Error::Gated("linux capture/audio/display adapters (P5)"))
+    }
+
+    pub fn output_modes(_device_name: &str) -> Vec<DisplayMode> {
+        Vec::new()
     }
 }
 

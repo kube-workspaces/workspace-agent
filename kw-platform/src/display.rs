@@ -15,6 +15,13 @@ pub fn selected_name(output_index: u32, name: Option<&str>) -> Result<String, St
     platform::selected_name(output_index, name)
 }
 
+/// OS mode list for the selected output. Read-only; empty where the
+/// backend is gated. Callers dedupe/sort; the raw enumeration repeats a
+/// size per refresh rate and bit depth.
+pub fn modes(output_index: u32, name: Option<&str>) -> Vec<crate::DisplayMode> {
+    platform::modes(output_index, name)
+}
+
 pub fn resize_selected(
     output_index: u32,
     name: Option<&str>,
@@ -31,6 +38,9 @@ mod platform {
     use super::Size;
     pub fn selected_name(_output_index: u32, _name: Option<&str>) -> Result<String, String> {
         Err("display-backend-unavailable".into())
+    }
+    pub fn modes(_output_index: u32, _name: Option<&str>) -> Vec<crate::DisplayMode> {
+        Vec::new()
     }
     pub fn resize(
         _output_index: u32,
@@ -68,6 +78,13 @@ mod platform {
             .position(|c| *c == 0)
             .unwrap_or(desc.DeviceName.len());
         Ok(String::from_utf16_lossy(&desc.DeviceName[..length]))
+    }
+
+    pub fn modes(output_index: u32, requested_name: Option<&str>) -> Vec<crate::DisplayMode> {
+        match selected_name(output_index, requested_name) {
+            Ok(name) => crate::output_modes(&name),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn resize(

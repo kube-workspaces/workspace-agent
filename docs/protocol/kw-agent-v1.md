@@ -59,6 +59,9 @@ to a fresh IDR.
   excluding macroblock padding in the raw H.264 stream. A native viewer crops
   matching padded frames to that size and updates it only from a successful
   paired resize result; stale old-mode dimensions must not crop a new-mode IDR.
+  `displayModes` is the selected output's OS mode list as `{width, height}`
+  pairs (deduped, sorted; empty without capture). Viewers prefer it over
+  guessing when requesting a mode.
 - `capabilities`: updated subset of `hello` fields; `capabilityEpoch`
   increases on every change.
 - `attach`: viewer presents a short-lived ticket (see below). Agent and
