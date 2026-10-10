@@ -12,6 +12,7 @@ mod capture;
 mod daemon;
 mod platform;
 mod resize;
+mod status;
 mod synthetic;
 
 fn usage(code: i32) -> ! {
@@ -27,6 +28,7 @@ fn usage(code: i32) -> ! {
     eprintln!("  serve --resize enables guest mode changes with --capture-video in the active console session");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
+    eprintln!("  kw-agent status [--data-dir DIR] [--max-beat-age-secs N]");
     eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
@@ -115,6 +117,65 @@ fn main() {
                 Ok(beats) => println!("daemon exited after {beats} beats"),
                 Err(error) => {
                     eprintln!("daemon: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("status") => {
+            // Read-only Layer 4 indicator: never writes, never enrolls,
+            // never prints key material (status.json holds none).
+            let data_dir = flag_value(&args, "--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon::default_data_dir);
+            let max_beat_age_secs: u64 = match flag_value(&args, "--max-beat-age-secs") {
+                None => status::DEFAULT_MAX_BEAT_AGE_SECS,
+                Some(value) => match value.parse() {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        eprintln!("status: --max-beat-age-secs must be a number of seconds");
+                        usage(2);
+                    }
+                },
+            };
+            match status::read_status(&data_dir) {
+                Ok(heartbeat) => {
+                    let summary = status::summarize(
+                        &heartbeat,
+                        kw_protocol::AGENT_VERSION,
+                        kw_core::now_secs(),
+                        max_beat_age_secs,
+                    );
+                    println!(
+                        "{{\
+                         \"agentVersion\":\"{version}\",\
+                         \"workspaceUid\":\"{uid}\",\
+                         \"workspaceGeneration\":\"{generation}\",\
+                         \"enrolledAt\":{enrolled},\
+                         \"beat\":{beat},\
+                         \"beatAt\":{beat_at},\
+                         \"beatAgeSecs\":{age},\
+                         \"fresh\":{fresh},\
+                         \"versionMatch\":{version_match}}}",
+                        version = heartbeat.agent_version,
+                        uid = heartbeat.workspace_uid,
+                        generation = heartbeat.workspace_generation,
+                        enrolled = heartbeat.enrolled_at,
+                        beat = heartbeat.beat,
+                        beat_at = heartbeat.beat_at,
+                        age = summary.beat_age_secs,
+                        fresh = summary.fresh,
+                        version_match = summary.version_match,
+                    );
+                    if !summary.fresh {
+                        eprintln!(
+                            "status: stale beat (age {}s exceeds {}s)",
+                            summary.beat_age_secs, max_beat_age_secs
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("status: {error}");
                     std::process::exit(1);
                 }
             }
