@@ -236,6 +236,72 @@ pub struct PointerSpace {
     pub virtual_height: i32,
 }
 
+/// One attached monitor in physical pixels: the coordinate space `SendInput`
+/// maps its absolute range onto. Physical, never DPI-virtualized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct MonitorRect {
+    device: String,
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    primary: bool,
+}
+
+/// Build the pointer space from physical per-monitor geometry. The virtual
+/// extent is the union of attached monitors, so mixed-DPI layouts (where a
+/// DPI-virtualized reader would report e.g. 3200x1068 for a physical
+/// 5120x2136 desktop) map exactly. `selected` is the capture head in the
+/// same physical space; without a selection the primary head owns input.
+/// Pure so every OS's CI covers the math; only the enumeration below is
+/// Windows-specific.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_space(
+    monitors: &[MonitorRect],
+    selected: Option<(i32, i32, i32, i32)>,
+) -> Result<PointerSpace, String> {
+    if monitors.is_empty() {
+        return Err("input-no-screen-metrics".into());
+    }
+    let vleft = monitors.iter().map(|m| m.left).min().unwrap_or(0);
+    let vtop = monitors.iter().map(|m| m.top).min().unwrap_or(0);
+    let vright = monitors
+        .iter()
+        .map(|m| m.left.saturating_add(m.width))
+        .max()
+        .unwrap_or(0);
+    let vbottom = monitors
+        .iter()
+        .map(|m| m.top.saturating_add(m.height))
+        .max()
+        .unwrap_or(0);
+    let (left, top, width, height) = match selected {
+        Some(rect) => rect,
+        None => {
+            let primary = monitors
+                .iter()
+                .find(|m| m.primary)
+                .or(monitors.first())
+                .expect("monitors non-empty");
+            (primary.left, primary.top, primary.width, primary.height)
+        }
+    };
+    if width <= 0 || height <= 0 || vright <= vleft || vbottom <= vtop {
+        return Err("input-no-screen-metrics".into());
+    }
+    Ok(PointerSpace {
+        left,
+        top,
+        width,
+        height,
+        virtual_left: vleft,
+        virtual_top: vtop,
+        virtual_width: vright - vleft,
+        virtual_height: vbottom - vtop,
+    })
+}
+
 impl PointerSpace {
     pub fn absolute(&self, x: i32, y: i32) -> (u16, u16) {
         let x = self
@@ -295,9 +361,14 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{keysym_to_key, keysym_to_unicode, PointerSpace, SessionState, WHEEL_DELTA};
-    use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
+    use super::{
+        build_space, keysym_to_key, keysym_to_unicode, MonitorRect, PointerSpace, SessionState,
+        WHEEL_DELTA,
+    };
+    use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
     use windows::Win32::System::RemoteDesktop::{
         ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
     };
@@ -313,10 +384,7 @@ mod platform {
         MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
         MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
     pub fn session_state() -> SessionState {
         let current = current_session();
@@ -341,51 +409,85 @@ mod platform {
                 unsafe { SetThreadDpiAwarenessContext(self.0) };
             }
         }
-        // EnumDisplaySettings/DXGI report physical pixels. Read virtual-desktop
-        // metrics in that same coordinate space even with mixed monitor DPI.
+        // Geometry below comes from per-monitor enumeration in physical
+        // pixels, which no DPI context can virtualize; the guard stays as
+        // defense in depth for any metric read added later.
         let previous =
             unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         if previous.0 == 0 {
             return Err("input-dpi-context-unavailable".into());
         }
         let _dpi = DpiGuard(previous);
-        let mut space = PointerSpace {
-            left: 0,
-            top: 0,
-            width: unsafe { GetSystemMetrics(SM_CXSCREEN) },
-            height: unsafe { GetSystemMetrics(SM_CYSCREEN) },
-            virtual_left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
-            virtual_top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
-            virtual_width: unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) },
-            virtual_height: unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+        let monitors = enumerate_monitors()?;
+        let selected = match name {
+            None => None,
+            Some(want) => match monitors
+                .iter()
+                .find(|m| m.device.eq_ignore_ascii_case(want))
+            {
+                Some(m) => Some((m.left, m.top, m.width, m.height)),
+                None => return Err("input-output-unavailable".into()),
+            },
         };
-        if let Some(name) = name {
-            let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut mode = DEVMODEW {
-                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        build_space(&monitors, selected)
+    }
+
+    /// Enumerate attached monitors in physical pixels via `EnumDisplayMonitors`.
+    /// `GetSystemMetrics` virtual-screen metrics are DPI-context sensitive and
+    /// must not feed pointer math (live 2026-10-13: they reported 3200x1068
+    /// for a physical 5120x2136 desktop, squeezing every click top-left).
+    fn enumerate_monitors() -> Result<Vec<MonitorRect>, String> {
+        unsafe extern "system" fn push_monitor(
+            monitor: HMONITOR,
+            _hdc: HDC,
+            _clip: *mut RECT,
+            data: LPARAM,
+        ) -> BOOL {
+            let out = &mut *(data.0 as *mut Vec<MonitorRect>);
+            let mut info = MONITORINFOEXW {
+                monitorInfo: MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
-            if !unsafe {
-                EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut mode)
-            }
+            if GetMonitorInfoW(
+                monitor,
+                &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+            )
             .as_bool()
             {
-                return Err("input-output-unavailable".into());
+                let rect = info.monitorInfo.rcMonitor;
+                let end = info
+                    .szDevice
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(info.szDevice.len());
+                out.push(MonitorRect {
+                    device: String::from_utf16_lossy(&info.szDevice[..end]),
+                    left: rect.left,
+                    top: rect.top,
+                    width: rect.right - rect.left,
+                    height: rect.bottom - rect.top,
+                    primary: (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
+                });
             }
-            let position = unsafe { mode.Anonymous1.Anonymous2.dmPosition };
-            space.left = position.x;
-            space.top = position.y;
-            space.width = mode.dmPelsWidth as i32;
-            space.height = mode.dmPelsHeight as i32;
+            TRUE
         }
-        if space.width <= 0
-            || space.height <= 0
-            || space.virtual_width <= 0
-            || space.virtual_height <= 0
-        {
+
+        let mut monitors: Vec<MonitorRect> = Vec::new();
+        let ok = unsafe {
+            EnumDisplayMonitors(
+                HDC::default(),
+                None,
+                Some(push_monitor),
+                LPARAM(&mut monitors as *mut Vec<MonitorRect> as isize),
+            )
+        };
+        if !ok.as_bool() || monitors.is_empty() {
             return Err("input-no-screen-metrics".into());
         }
-        Ok(space)
+        Ok(monitors)
     }
 
     fn send(inputs: &[INPUT]) -> Result<(), String> {
@@ -635,5 +737,68 @@ mod tests {
         }
         .can_inject());
         assert!(!SessionState::default().can_inject());
+    }
+
+    fn live_monitors() -> Vec<MonitorRect> {
+        // Live layout 2026-10-13: QEMU DISPLAY1 1280x800@0,0 plus the IDD
+        // DISPLAY2 at physical 3840x2136@1280,0 (200% logical 1920x1068).
+        vec![
+            MonitorRect {
+                device: "\\\\.\\DISPLAY1".into(),
+                left: 0,
+                top: 0,
+                width: 1280,
+                height: 800,
+                primary: true,
+            },
+            MonitorRect {
+                device: "\\\\.\\DISPLAY2".into(),
+                left: 1280,
+                top: 0,
+                width: 3840,
+                height: 2136,
+                primary: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn mixed_dpi_union_uses_physical_extent() {
+        // A DPI-virtualized reader reports 3200x1068 here; SendInput maps the
+        // physical 5120x2136. The union must be physical, or every click
+        // squeezes top-left (live 0.62/0.50 compression).
+        let space = build_space(&live_monitors(), Some((0, 0, 1280, 800))).unwrap();
+        assert_eq!(space.virtual_width, 5120);
+        assert_eq!(space.virtual_height, 2136);
+        assert_eq!((space.virtual_left, space.virtual_top), (0, 0));
+    }
+
+    #[test]
+    fn mixed_dpi_corners_round_trip() {
+        let space = build_space(&live_monitors(), Some((0, 0, 1280, 800))).unwrap();
+        let back = |n: u16, extent: i32| n as i32 * extent / 65535;
+        assert_eq!(space.absolute(0, 0), (0, 0));
+        let (bx, by) = space.absolute(1279, 799);
+        assert_eq!((back(bx, 5120), back(by, 2136)), (1279, 799));
+        let (mx, my) = space.absolute(640, 400);
+        assert_eq!((back(mx, 5120), back(my, 2136)), (640, 400));
+    }
+
+    #[test]
+    fn unnamed_selection_defaults_to_primary() {
+        let monitors = live_monitors();
+        let space = build_space(&monitors, None).unwrap();
+        let primary = monitors.into_iter().find(|m| m.primary).unwrap();
+        assert_eq!(
+            (space.left, space.top, space.width, space.height),
+            (primary.left, primary.top, primary.width, primary.height)
+        );
+        assert_eq!((space.virtual_width, space.virtual_height), (5120, 2136));
+    }
+
+    #[test]
+    fn empty_monitor_list_is_an_error() {
+        assert!(build_space(&[], None).is_err());
+        assert!(build_space(&[], Some((0, 0, 1280, 800))).is_err());
     }
 }
