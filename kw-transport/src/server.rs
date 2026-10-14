@@ -519,14 +519,25 @@ fn serve_control(
         "attach" => {
             let ticket: Result<Ticket, _> =
                 serde_json::from_value(message.payload["ticket"].clone());
+            // Diagnose guest-side refusals without leaking secrets: name the
+            // failing check as booleans plus the ticket expiry skew against
+            // this clock (negative skew = already expired here).
+            let now_ns = now_secs().saturating_mul(1_000_000_000);
+            if let Ok(ref stamped) = ticket {
+                let skew_secs = (stamped.expires_at_ns as i128 - now_ns as i128) / 1_000_000_000;
+                eprintln!(
+                    "attach check: uid_match={} generation_match={} session_match={} audience_match={} control_epoch={} expiry_skew_secs={}",
+                    stamped.workspace_uid == workspace_uid,
+                    stamped.workspace_generation == workspace_generation,
+                    stamped.session_id == handshake.session_id(),
+                    stamped.audience == "workspace-agent",
+                    stamped.control_epoch,
+                    skew_secs,
+                );
+            }
             let decision = match ticket {
                 Ok(ticket) if ticket.workspace_generation == workspace_generation => {
-                    match handshake.attach(
-                        message,
-                        &ticket,
-                        workspace_uid,
-                        now_secs().saturating_mul(1_000_000_000),
-                    ) {
+                    match handshake.attach(message, &ticket, workspace_uid, now_ns) {
                         Ok(_) => serde_json::json!({"admitted": true}),
                         Err(Reject::Ticket) => {
                             serde_json::json!({"admitted": false, "reason": "ticket-rejected"})
@@ -549,6 +560,11 @@ fn serve_control(
             *sequence += 1;
             if write_envelope(writer, &reply).is_err() {
                 return false;
+            }
+            if let Some(reason) = reply.payload.get("reason") {
+                eprintln!("attach refused: reason={reason}");
+            } else {
+                eprintln!("attach admitted");
             }
             let admitted = handshake.admitted();
             if admitted {
