@@ -64,9 +64,9 @@ $action = New-ScheduledTaskAction -Execute $exe -Argument $args
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
 $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
-  -RestartInterval (New-TimeSpan -Minutes 1) `
-  -AllowStartIfOnBatteries -StartWhenAvailable
+  $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -AllowStartIfOnBatteries -StartWhenAvailable -Hidden
 Register-ScheduledTask -TaskName 'kw-agent-serve' -Action $action `
   -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Write-Output "logon task 'kw-agent-serve' registered for $User"
@@ -75,10 +75,14 @@ function Set-ServeRunKey {
   # HKCU Run fallback for $User: Explorer starts serve in-session at logon
   # without Task Scheduler. Resolves the user's profile hive (loaded when
   # logged on, else mounted from NTUSER.DAT) and writes the Run value there.
-  # Non-fatal by design: the logon task above stays the primary mechanism.
+  # The launcher hides every window: powershell.exe itself starts hidden and
+  # Start-Process hides the console agent (a visible console on every boot
+  # is not shippable). Non-fatal by design: the logon task above stays the
+  # primary mechanism.
   param([string]$Exe, [string]$ServeArgs, [string]$UserSid)
   $runName = 'kw-agent-serve'
-  $runValue = "`"$Exe`" $ServeArgs"
+  $launch = "Start-Process '$Exe' -ArgumentList '$ServeArgs' -WindowStyle Hidden"
+  $runValue = "powershell.exe -WindowStyle Hidden -Command '$($launch -replace `"'`", `"''`")'"
   $mounted = $false
   try {
     $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$UserSid'" -ErrorAction Stop |
