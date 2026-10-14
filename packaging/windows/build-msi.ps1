@@ -9,8 +9,8 @@
   payload fragment, and runs `wix build` (WiX v4/v5) against the skeleton in
   this directory.
 
-  The MSI is UNSIGNED and FILES-ONLY: install hygiene (Add/Remove entry,
-  upgrade/uninstall), not enrollment. SmartScreen warns the same as the zip.
+  The MSI is UNSIGNED and per-machine: files plus native SCM service lifecycle,
+  not enrollment. SmartScreen warns the same as the zip.
 
 .PARAMETER Version
   Release tag, e.g. v0.1.0. Sanitized to an MSI ProductVersion (X.Y.Z);
@@ -40,7 +40,8 @@ param(
   [Parameter(Mandatory = $true)][ValidateSet("amd64", "arm64")][string]$Arch,
   [Parameter(Mandatory = $true)][string]$StagingDir,
   [Parameter(Mandatory = $true)][string]$OutFile,
-  [string]$WxsDir = $PSScriptRoot
+  [string]$WxsDir = $PSScriptRoot,
+  [ValidatePattern('^[0-9a-fA-F]{32}$')][string]$TestInstance
 )
 
 Set-StrictMode -Version Latest
@@ -93,10 +94,10 @@ if (-not (Test-Path $exe -PathType Leaf)) {
 # README.md/LICENSE stay out of the MSI (the archive and the image recipe own
 # them); anything else staged is a contract change, so warn before including.
 $payload = @("kw-agent.exe")
-foreach ($opt in @("install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1")) {
+foreach ($opt in @("install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1", "Migrate-LegacyStartup.ps1")) {
   if (Test-Path (Join-Path $staging $opt) -PathType Leaf) { $payload += $opt }
 }
-$known = @("kw-agent.exe", "install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1", "README.md", "LICENSE")
+$known = @("kw-agent.exe", "install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1", "Migrate-LegacyStartup.ps1", "README.md", "LICENSE")
 foreach ($item in Get-ChildItem $staging -File) {
   if ($known -notcontains $item.Name) {
     Write-Warning "Staging holds unexpected file '$($item.Name)'; including it in the MSI."
@@ -105,6 +106,20 @@ foreach ($item in Get-ChildItem $staging -File) {
 }
 
 $productVersion = Get-MsiProductVersion $Version
+$serviceName = 'KubeWorkspacesAgent'
+$productName = 'Kube Workspaces Agent'
+$upgradeCode = 'f72bb43e-dba8-4dbb-a963-b201e6c0d885'
+$folder = 'workspace-agent'
+$serviceArguments = 'service'
+if ($TestInstance) {
+  if (([guid]::ParseExact($TestInstance,'N')).ToString() -eq $upgradeCode) { throw 'TestInstance must not reuse the production UpgradeCode' }
+  $serviceName = "KwAgentMsiTest-$TestInstance"
+  $folder = "kw-agent-test-$TestInstance"
+  $productName = "Kube Workspaces Agent Test $TestInstance"
+  $upgradeCode = ([guid]::ParseExact($TestInstance, 'N')).ToString()
+  $testData = Join-Path $env:ProgramData $folder
+  $serviceArguments = "service --service-name $serviceName --data-dir `"$testData`""
+}
 Write-Host "ProductVersion: $productVersion (from $Version)"
 
 $wixArch = @{ amd64 = "x64"; arm64 = "arm64" }[$Arch]
@@ -137,6 +152,12 @@ foreach ($file in $payload) {
   $src = [System.Security.SecurityElement]::Escape((Join-Path $staging $file))
   $lines += "      <Component Id=`"$compId`" Directory=`"INSTALLDIR`" Bitness=`"always64`" Guid=`"*`">"
   $lines += "        <File Id=`"$fileId`" Source=`"$src`" KeyPath=`"yes`" />"
+  if ($file -eq 'kw-agent.exe') {
+    $escapedArguments = [Security.SecurityElement]::Escape($serviceArguments)
+    $lines += "        <ServiceInstall Id=`"AgentService`" Name=`"$serviceName`" DisplayName=`"$productName`" Description=`"Machine agent and console desktop worker supervisor`" Type=`"ownProcess`" Start=`"auto`" Account=`"LocalSystem`" ErrorControl=`"normal`" Arguments=`"$escapedArguments`" Vital=`"yes`">"
+    $lines += '        </ServiceInstall>'
+    $lines += "        <ServiceControl Id=`"AgentServiceControl`" Name=`"$serviceName`" Start=`"install`" Stop=`"both`" Remove=`"uninstall`" Wait=`"yes`" />"
+  }
   $lines += '      </Component>'
 }
 $lines += @(
@@ -172,6 +193,10 @@ try {
     -ext WixToolset.UI.wixext/5.0.2 `
     -arch $wixArch `
     -d ProductVersion=$productVersion `
+    -d AgentProductName="$productName" `
+    -d AgentUpgradeCode="$upgradeCode" `
+    -d AgentInstallFolder="$folder" `
+    -d AgentServiceName="$serviceName" `
     -d IconPath="$iconPath" `
     -d ArtworkDir="$((Resolve-Path $WxsDir).Path)" `
     -o $OutFile
@@ -181,7 +206,9 @@ try {
   }
 
   # Verify the authored database read-only; never mutate it after validation.
-  & (Join-Path $WxsDir "verify-msi.ps1") -Path $OutFile -Arch $Arch -Version $productVersion -StagingDir $staging
+  $verifyArgs = @{Path=$OutFile;Arch=$Arch;Version=$productVersion;StagingDir=$staging}
+  if ($TestInstance) { $verifyArgs.TestInstance = $TestInstance }
+  & (Join-Path $WxsDir "verify-msi.ps1") @verifyArgs
   Write-Host "Built $OutFile"
 }
 finally {

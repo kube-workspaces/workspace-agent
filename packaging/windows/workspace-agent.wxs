@@ -1,15 +1,16 @@
 <!-- Kube Workspaces agent unsigned Windows MSI (WiX v4/v5, `wix build`).
 //
-// What this is: a per-machine files-only installer for install hygiene
-// (Add/Remove entry, clean upgrade/uninstall). It is explicitly NOT a trust
+// What this is: a per-machine native-service installer (Add/Remove entry,
+// SCM lifecycle, clean upgrade/uninstall). It is explicitly NOT a trust
 // fix: the MSI is built unsigned and SmartScreen warns the same as the zip.
 // Signed MSI stays budget-blocked (tracking/future/code-signing-and-notarisation.md).
 //
 // Scope note (load-bearing): the agent runs machine-wide, so this package is
 // perMachine and installs to Program Files\workspace-agent — the same
 // directory install.ps1 uses. It deliberately does NOT enroll the workspace,
-// write an enrollment token or register the startup task: enrollment material
-// is per-guest (image recipe / first-boot media), never a release artifact.
+// write an enrollment token: enrollment material is per-guest (image recipe /
+// first-boot media), never a release artifact. An unconfigured service waits
+// for enrollment; ServiceInstall/ServiceControl are authored with AgentExe.
 //
 // Layout contract:
 //   - kw-agent.exe plus the enrollment scripts install in INSTALLDIR.
@@ -30,13 +31,13 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="Kube Workspaces Agent"
+  <Package Name="$(var.AgentProductName)"
            Language="1033"
            Version="$(var.ProductVersion)"
            Manufacturer="Kube Workspaces"
-           UpgradeCode="f72bb43e-dba8-4dbb-a963-b201e6c0d885"
+           UpgradeCode="$(var.AgentUpgradeCode)"
            Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Kube Workspaces Agent is already installed." />
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of Kube Workspaces Agent is already installed." />
     <Media Id="1" Cabinet="workspace-agent.cab" EmbedCab="yes" />
 
     <!-- IconPath arrives via -d IconPath= (absolute); kept out of the file so
@@ -54,12 +55,21 @@
     <Property Id="INSTALLDIR" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLDIR" Name="workspace-agent" />
+      <Directory Id="INSTALLDIR" Name="$(var.AgentInstallFolder)" />
     </StandardDirectory>
 
     <Feature Id="ProductFeature" Title="Kube Workspaces Agent" Level="1">
       <ComponentGroupRef Id="PayloadFiles" />
     </Feature>
+
+    <!-- Native SCM recovery configuration runs before service startup, never
+         inside ServiceMain. Windows Installer owns transaction/lifecycle. -->
+    <CustomAction Id="ConfigureAgentService" FileRef="AgentExe"
+                  ExeCommand="service-configure --service-name $(var.AgentServiceName)"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="ConfigureAgentService" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
 
     <!-- Standard welcome/EULA/progress/exit dialogs (WixToolset.UI.wixext).
          The platform-neutral set is referenced via ui:WixUI, which pulls in

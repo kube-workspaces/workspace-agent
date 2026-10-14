@@ -16,7 +16,8 @@ $global:KwServeTestRegistrations = @()
 function New-ScheduledTaskAction { param($Execute, $Argument); [pscustomobject]@{Execute=$Execute;Arguments=$Argument} }
 function New-ScheduledTaskTrigger { param([switch]$AtLogOn, $User); [pscustomobject]@{Delay='';User=$User} }
 function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel); [pscustomobject]@{UserId=$UserId} }
-function New-ScheduledTaskSettingsSet { param($RestartCount, $RestartInterval, [switch]$AllowStartIfOnBatteries, [switch]$StartWhenAvailable, [switch]$Hidden); [pscustomobject]@{Hidden=$Hidden.IsPresent} }
+function New-ScheduledTaskSettingsSet { param($RestartCount, $RestartInterval, [switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, $ExecutionTimeLimit, [switch]$StartWhenAvailable, [switch]$Hidden); [pscustomobject]@{Hidden=$Hidden.IsPresent} }
+function Get-Service { param($Name, $ErrorAction); return $null }
 function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force); $global:KwServeTestRegistrations += $Action }
 function Get-CimInstance { param($ClassName, $Filter, $ErrorAction); return $null }
 function Get-AccessSnapshot($Path) {

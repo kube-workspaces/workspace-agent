@@ -1,127 +1,135 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Install kw-agent v0.1 on Windows: files, machine-protected data dir,
-  one-use enrollment token, SYSTEM scheduled task at startup.
+  Enroll/configure the native Kube Workspaces Agent Windows service.
 .DESCRIPTION
-  Proof installer for disposable guests. Not an MSI, not signed, no driver
-  handling. The task runs `kw-agent daemon` as SYSTEM at startup; the agent
-  itself performs no capture, networking, input or display changes in v0.1.
-  Capture needs serve in the interactive console session (Session 0
-  isolation), so install also registers the per-logon `kw-agent-serve` task
-  via Register-ServeTask.ps1 unless -NoServeTask is given.
-.PARAMETER WorkspaceUid
-  Workspace UID the enrollment token is bound to (generation-bound below).
-.PARAMETER WorkspaceGeneration
-  Workspace generation the enrollment token is bound to.
-.PARAMETER TokenHours
-  Enrollment token validity in hours (default 2). Keep short: the token is
-  consumed on first boot and never reused.
-.PARAMETER DataDir
-  Defaults to $env:ProgramData\workspace-agent.
-.PARAMETER BinDir
-  Defaults to $env:ProgramFiles\workspace-agent. kw-agent.exe must sit next
-  to this script or be given via -InstallerPath.
-.PARAMETER ServeUser
-  Interactive account the serve task runs as (default workspace). Must exist
-  at install time; otherwise the serve task is skipped with a warning and
-  can be registered later by re-running install or Register-ServeTask.ps1.
-.PARAMETER ExtraServeArgs
-  Extra serve flags for the logon task (default full premium set).
-.PARAMETER NoServeTask
-  Skip the interactive logon serve task (control plane only).
+  MSI owns SCM registration; this script also supports installation from the
+  archive. Enrollment is per guest and never embedded in the MSI. Retires the
+  legacy SYSTEM/logon tasks and Run fallback before starting native supervision.
+  Reinstall preserves identity and refuses a mismatched binding before changes.
 #>
 param(
-    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')][string]$WorkspaceUid,
-    [Parameter(Mandatory=$true)][ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) -and $_ -eq $_.Trim() -and $_ -notmatch '[\x00-\x1f\x7f]' })][string]$WorkspaceGeneration,
-    [int]$TokenHours = 2,
-    [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
-    [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent'),
-    [string]$ServeUser = 'workspace',
-    [string]$ExtraServeArgs = '--capture-video --capture-audio --clipboard --input --resize',
-    [switch]$NoServeTask
+  [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')][string]$WorkspaceUid,
+  [Parameter(Mandatory=$true)][ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) -and $_ -eq $_.Trim() -and $_ -notmatch '[\x00-\x1f\x7f]' })][string]$WorkspaceGeneration,
+  [ValidateRange(1,24)][int]$TokenHours = 2,
+  [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
+  [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent'),
+  [string]$ServeUser = 'workspace',
+  [string]$ExtraServeArgs = '--capture-video --capture-audio --clipboard --input --resize',
+  [string[]]$ServeArgs,
+  [Alias('NoServeTask')][switch]$NoDesktopWorker,
+  [ValidatePattern('^[A-Za-z0-9-]{1,64}$')][string]$ServiceName = 'KubeWorkspacesAgent'
 )
 $ErrorActionPreference = 'Stop'
-
-$exe = Join-Path $PSScriptRoot 'kw-agent.exe'
-if (-not (Test-Path -LiteralPath $exe)) { throw "kw-agent.exe not found next to install.ps1" }
-if ($WorkspaceGeneration.Contains('"') -or $DataDir.Contains('"')) { throw 'Generation and DataDir cannot contain double quotes' }
+$name = $ServiceName
+if ($name -ne 'KubeWorkspacesAgent' -and (-not $PSBoundParameters.ContainsKey('DataDir') -or -not $PSBoundParameters.ContainsKey('BinDir'))) {
+  throw 'An isolated service instance requires explicit DataDir and BinDir'
+}
+$source = Join-Path $PSScriptRoot 'kw-agent.exe'
+if (-not (Test-Path -LiteralPath $source)) { throw 'kw-agent.exe must be next to install.ps1' }
+$migration = Join-Path $PSScriptRoot 'Migrate-LegacyStartup.ps1'
+if (-not (Test-Path -LiteralPath $migration)) { throw 'Migrate-LegacyStartup.ps1 must be staged next to install.ps1' }
+$payload = @('kw-agent.exe','install.ps1','uninstall.ps1','Migrate-LegacyStartup.ps1','Register-ServeTask.ps1','Start-Serve.ps1')
+foreach ($file in $payload) { if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $file))) { throw "Installer payload missing: $file" } }
+$DataDir = [IO.Path]::GetFullPath($DataDir)
+$BinDir = [IO.Path]::GetFullPath($BinDir)
+if ($DataDir.Contains('"') -or $BinDir.Contains('"')) { throw 'Paths cannot contain double quotes' }
 if (Test-Path -LiteralPath (Join-Path $DataDir 'identity.json')) {
-    # Never silently reconfigure an enrolled machine for a mistyped binding.
-    & $exe identity-check --data-dir $DataDir --workspace-uid $WorkspaceUid --workspace-generation $WorkspaceGeneration | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Enrolled identity mismatch; installation was not changed' }
+  & $source identity-check --data-dir $DataDir --workspace-uid $WorkspaceUid --workspace-generation $WorkspaceGeneration | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Enrolled identity mismatch; installation was not changed' }
 }
+# Validate typed worker arguments before stopping or changing an installation.
+# -ServeArgs supports quoted values as actual argv; legacy ExtraServeArgs is
+# whitespace-separated switches/numbers/device names, not a shell command.
+if (-not $PSBoundParameters.ContainsKey('ServeArgs')) {
+  # Explicit char[] avoids .NET Core's additional string-separator overload
+  # treating the whole default flag list as one argument in PowerShell 7.
+  $ServeArgs = @($ExtraServeArgs.Split([char[]]@(' ', "`t"), [StringSplitOptions]::RemoveEmptyEntries))
+}
+$config = @{ workerEnabled = -not $NoDesktopWorker.IsPresent; port = 44787; workerArgs = @($ServeArgs) }
+$checkDir = Join-Path $env:TEMP ([guid]::NewGuid().ToString())
+try {
+  New-Item -ItemType Directory $checkDir | Out-Null
+  [IO.File]::WriteAllText((Join-Path $checkDir 'service.json'), ($config | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+  & $source service-config-check --data-dir $checkDir | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Invalid desktop worker configuration; installation was not changed' }
+} finally { if (Test-Path $checkDir) { Remove-Item $checkDir -Recurse -Force } }
 
-# Idempotent reinstall: stop a running previous version first (the task holds
-# the binary open while the daemon runs).
-if (Get-ScheduledTask -TaskName 'workspace-agent' -ErrorAction SilentlyContinue) {
-    Stop-ScheduledTask -TaskName 'workspace-agent' -ErrorAction SilentlyContinue
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-ScheduledTask -TaskName 'workspace-agent').State -ne 'Ready' -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 2
-    }
+$service = Get-Service -Name $name -ErrorAction SilentlyContinue
+if ($service) {
+  Stop-Service $name
+  $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+  $service.Dispose()
 }
-New-Item -ItemType Directory -Force -Path $BinDir, $DataDir | Out-Null
-$destination = Join-Path $BinDir 'kw-agent.exe'
-if ([IO.Path]::GetFullPath($exe) -ne [IO.Path]::GetFullPath($destination)) {
-    Copy-Item -LiteralPath $exe -Destination $destination -Force
+if ($name -eq 'KubeWorkspacesAgent') {
+  & $migration -BinDir $BinDir
 }
+$exe = Join-Path $BinDir 'kw-agent.exe'
 
-# Machine-protected data dir: SYSTEM + Administrators only, no inheritance.
-$acl = Get-Acl -LiteralPath $DataDir
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
-foreach ($account in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
-    [void]$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+New-Item -ItemType Directory -Path $BinDir, $DataDir -Force | Out-Null
+function Set-InstallDirectoryAcl($Path, [bool]$UsersRead) {
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+  foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $principal = New-Object Security.Principal.SecurityIdentifier($sid)
+    [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($principal, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  }
+  if ($UsersRead) {
+    $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($users, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  }
+  # Cmdlet works on both Windows PowerShell 5.1 and PowerShell 7; do not rely
+  # on .NET Framework-only DirectoryInfo.SetAccessControl instance methods.
+  Set-Acl -LiteralPath $Path -AclObject $acl
 }
-Set-Acl -LiteralPath $DataDir -AclObject $acl
-
-# One-use enrollment token, consumed on first daemon start. Written BOM-less:
-# PowerShell 5.1 `Set-Content -Encoding UTF8` emits a BOM (the agent tolerates
-# one, but do not rely on it).
-$bytes = New-Object byte[] 32
-[void][Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-$token = [ordered]@{
-    token = ([BitConverter]::ToString($bytes)).Replace('-', '').ToLower()
-    workspaceUid = $WorkspaceUid
-    workspaceGeneration = $WorkspaceGeneration
-    expiresAt = [int64](Get-Date -UFormat %s) + $TokenHours * 3600
+Set-InstallDirectoryAcl $DataDir $false
+Set-InstallDirectoryAcl $BinDir $true
+foreach ($file in $payload) {
+  $src = Join-Path $PSScriptRoot $file
+  $dest = Join-Path $BinDir $file
+  if ([IO.Path]::GetFullPath($src) -ne [IO.Path]::GetFullPath($dest)) { Copy-Item -LiteralPath $src -Destination $dest -Force }
+  # Custom archive paths must be machine-owned too. A LocalSystem service
+  # must never execute user-writable binaries or elevation helper scripts.
+  $acl = New-Object Security.AccessControl.FileSecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+  foreach ($sid in @('S-1-5-18','S-1-5-32-544','S-1-5-32-545')) {
+    $principal = New-Object Security.Principal.SecurityIdentifier($sid)
+    $rights = if ($sid -eq 'S-1-5-32-545') { 'ReadAndExecute' } else { 'FullControl' }
+    [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($principal,$rights,'Allow')))
+  }
+  Set-Acl -LiteralPath $dest -AclObject $acl
 }
-[System.IO.File]::WriteAllText(
-    (Join-Path $DataDir 'enrollment-token.json'),
-    ($token | ConvertTo-Json),
-    (New-Object System.Text.UTF8Encoding $false))
-
-$action = New-ScheduledTaskAction -Execute (Join-Path $BinDir 'kw-agent.exe') `
-    -Argument "daemon --workspace-uid `"$WorkspaceUid`" --workspace-generation `"$WorkspaceGeneration`" --data-dir `"$DataDir`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName 'workspace-agent' -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName 'workspace-agent'
-Start-Sleep -Seconds 5
-$state = (Get-ScheduledTask -TaskName 'workspace-agent').State
-$status = if (Test-Path (Join-Path $DataDir 'status.json')) { Get-Content (Join-Path $DataDir 'status.json') -Raw } else { '(no status yet)' }
-Write-Output "task state: $state"
-Write-Output "status: $status"
-
-# Interactive serve task: capture/video/audio/input need the logged-on
-# console session, which the SYSTEM task above cannot see (Session 0
-# isolation). Non-fatal when the account does not exist yet (image
-# provisioning order): warn and let a later re-run register it.
-if (-not $NoServeTask) {
-    $serveScript = Join-Path $PSScriptRoot 'Register-ServeTask.ps1'
-    if (-not (Test-Path -LiteralPath $serveScript)) {
-        Write-Warning "Register-ServeTask.ps1 not staged next to install.ps1; skipping interactive serve task"
-    } else {
-        try {
-            & $serveScript -WorkspaceUid $WorkspaceUid -WorkspaceGeneration $WorkspaceGeneration `
-                -User $ServeUser -BinDir $BinDir -DataDir $DataDir -ExtraServeArgs $ExtraServeArgs
-        } catch {
-            Write-Warning "interactive serve task not registered: $($_.Exception.Message)"
-            Write-Warning "re-run install.ps1 (or Register-ServeTask.ps1) once '$ServeUser' exists"
-        }
-    }
+[IO.File]::WriteAllText((Join-Path $DataDir 'service.json'), ($config | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+if (-not (Test-Path (Join-Path $DataDir 'identity.json'))) {
+  $bytes = New-Object byte[] 32
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+  $token = @{token=([BitConverter]::ToString($bytes)).Replace('-','').ToLower(); workspaceUid=$WorkspaceUid; workspaceGeneration=$WorkspaceGeneration; expiresAt=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()+$TokenHours*3600}
+  [IO.File]::WriteAllText((Join-Path $DataDir 'enrollment-token.json'), ($token | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
 }
+$binaryPath = "`"$exe`" service"
+if ($name -eq 'KubeWorkspacesAgent') {
+  # Use the service's 64-bit registry view even from a 32-bit provisioning shell.
+  $machine = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+  try {
+    $key = $machine.CreateSubKey('SOFTWARE\KubeWorkspaces\Agent')
+    try { $key.SetValue('DataDir',$DataDir,[Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }
+  } finally { $machine.Dispose() }
+} else { $binaryPath += " --service-name $name --data-dir `"$DataDir`"" }
+if (-not $service) {
+  $displayName = 'Kube Workspaces Agent'
+  if ($name -ne 'KubeWorkspacesAgent') { $displayName += " ($name)" }
+  New-Service -Name $name -DisplayName $displayName -BinaryPathName $binaryPath -StartupType Automatic -Description 'Kube Workspaces machine agent and interactive desktop worker supervisor' | Out-Null
+} else {
+  $cim = Get-CimInstance Win32_Service | Where-Object Name -eq $name
+  $changed = Invoke-CimMethod -InputObject $cim -MethodName Change -Arguments @{PathName=$binaryPath;StartMode='Automatic';StartName='LocalSystem'}
+  if ($changed.ReturnValue -ne 0) { throw "Cannot update SCM registration: WMI error $($changed.ReturnValue)" }
+}
+& $exe service-configure --service-name $name
+if ($LASTEXITCODE -ne 0) { throw 'Cannot configure native SCM recovery' }
+Start-Service $name
+$started = Get-Service $name
+try { $started.WaitForStatus('Running', [TimeSpan]::FromSeconds(30)) } finally { $started.Dispose() }
+Write-Output 'Native Windows service running; enrollment and console-worker readiness are reported in service-status.json'

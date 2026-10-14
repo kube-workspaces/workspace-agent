@@ -170,8 +170,8 @@ jobs:
   # Unsigned Windows MSI (install hygiene only — NOT a trust fix). Built from
   # the assembled archive on a Windows runner (WiX needs Windows). Runs on
   # every push so a broken .wxs breaks the build, not the release; only tag
-  # pushes publish (see the release job). The MSI places files only: agent
-  # enrollment and the scheduled task stay with install.ps1 (image recipe),
+  # pushes publish (see the release job). MSI owns native service lifecycle;
+  # per-guest enrollment stays with install.ps1 (image recipe),
   # never with a release artifact. When Authenticode is funded, a sign step
   # slots in here before upload.
   msi:
@@ -249,7 +249,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: msi-test-logs
-          path: ${{ runner.temp }}/msi-lifecycle/*.log
+          path: ${{ runner.temp }}/msi-lifecycle-*/*.log
           if-no-files-found: ignore
 
       - name: Upload MSI
@@ -292,7 +292,7 @@ jobs:
           {
             echo '### workspace-agent distribution'
             echo 'Three archives plus the unsigned Windows MSI, covered by SHA256SUMS.'
-            echo 'The MSI places files only; enrollment and the startup task stay with install.ps1.'
+            echo 'The MSI installs the native Windows service; per-guest enrollment stays with install.ps1.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SHA256SUMS
@@ -394,17 +394,34 @@ jobs:
             echo
             echo "**Windows** — the zip carries \`install.ps1\` (admin) which copies the"
             echo "binary to \`%ProgramFiles%\\workspace-agent\`, writes a one-use enrollment"
-            echo "token for the target workspace and registers the SYSTEM startup task"
-            echo "plus the interactive logon serve task (capture needs the console session):"
+            echo "token for the target workspace and configures the native Windows service."
+            echo "The service supervises a hidden worker in the logged-in console session:"
             echo
             echo '```powershell'
             echo ".\\install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>"
             echo '```'
             echo
-            echo "The \`.msi\` is an **unsigned files-only installer** (Add/Remove entry,"
-            echo "install/upgrade/uninstall to \`Program Files\\workspace-agent\`); enrollment"
-            echo "and both scheduled tasks still come from \`install.ps1\` or the workspace image"
+            echo "The \`.msi\` is an **unsigned native-service installer** (Add/Remove entry,"
+            echo "SCM service install/upgrade/uninstall under \`Program Files\\workspace-agent\`); enrollment"
+            echo "still comes from \`install.ps1\` or the workspace image"
             echo "recipe. Silent install: \`msiexec /i workspace-agent-$VERSION-windows-amd64.msi /qn\`."
+            echo
+            echo "### Upgrading a legacy Windows installation"
+            echo
+            echo "Download and extract the Windows zip first. In elevated PowerShell,"
+            echo "run the extracted install script using the existing enrolled identity:"
+            echo
+            echo '```powershell'
+            echo '$identity = Get-Content "$env:ProgramData\workspace-agent\identity.json" -Raw | ConvertFrom-Json'
+            echo '.\install.ps1 -WorkspaceUid $identity.workspaceUid -WorkspaceGeneration $identity.workspaceGeneration'
+            echo 'Get-Service KubeWorkspacesAgent'
+            echo '```'
+            echo
+            echo "This retires the old SYSTEM/logon tasks and Run fallback, preserves"
+            echo "enrollment, and starts the native service with its hidden user-session"
+            echo "worker. Then install the MSI to put future upgrades/uninstalls under"
+            echo "Windows Installer control. Use the original BinDir/DataDir for custom"
+            echo "installations; do not reset or delete identity.json."
             echo
             echo "> **These binaries are not code-signed.** Windows SmartScreen will warn:"
             echo "> choose \"More info\" → \"Run anyway\". Signing and notarisation are not yet"

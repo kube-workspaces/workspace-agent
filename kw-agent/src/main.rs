@@ -13,8 +13,13 @@ mod capture;
 mod daemon;
 mod platform;
 mod resize;
+#[cfg(windows)]
+mod service;
+mod service_config;
 mod status;
 mod synthetic;
+#[cfg(windows)]
+mod windows_runtime;
 
 fn usage(code: i32) -> ! {
     eprintln!(
@@ -30,6 +35,8 @@ fn usage(code: i32) -> ! {
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
     eprintln!("  kw-agent status [--data-dir DIR] [--max-beat-age-secs N]");
+    eprintln!("  kw-agent service (Windows SCM only; automatic machine service)");
+    eprintln!("  kw-agent service-config-check [--data-dir DIR]");
     eprintln!("  kw-agent identity-check [--data-dir DIR] [--workspace-uid UID] [--workspace-generation GEN] (administrator; prints no private key)");
     eprintln!("  kw-agent serve [--data-dir DIR] [--workspace-uid UID --workspace-generation GEN] [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
@@ -48,7 +55,57 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(windows)]
+    let _background_logs = if args.iter().any(|arg| arg == "--background") {
+        let label = flag_value(&args, "--log-label").unwrap_or_else(|| "worker".into());
+        if label.is_empty()
+            || label.len() > 100
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            eprintln!("invalid log label");
+            std::process::exit(2);
+        }
+        Some(
+            windows_runtime::background_logs(&label).unwrap_or_else(|error| {
+                eprintln!("worker logging: {error}");
+                std::process::exit(1);
+            }),
+        )
+    } else {
+        None
+    };
     match args.first().map(String::as_str) {
+        Some("service-config-check") => {
+            let dir = flag_value(&args, "--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon::default_data_dir);
+            match service_config::Config::read(&dir) {
+                Ok(config) => println!(
+                    "{}",
+                    serde_json::to_string(&config).expect("service config")
+                ),
+                Err(error) => {
+                    eprintln!("service configuration: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(windows)]
+        Some("service-configure") => {
+            if let Err(error) = service::configure() {
+                eprintln!("SCM configuration: {error}");
+                std::process::exit(1);
+            }
+        }
+        #[cfg(windows)]
+        Some("service") => {
+            if let Err(error) = service::dispatch() {
+                eprintln!("service: {error}");
+                std::process::exit(1);
+            }
+        }
         Some("--version") => {
             println!("kw-agent {}", kw_protocol::AGENT_VERSION);
         }
@@ -217,6 +274,14 @@ fn main() {
             }
         }
         Some("serve") => {
+            let shutdown = std::sync::Arc::new(kw_transport::Shutdown::default());
+            #[cfg(windows)]
+            if let Some(event) = flag_value(&args, "--stop-event") {
+                windows_runtime::watch_stop(&event, shutdown.clone()).unwrap_or_else(|error| {
+                    eprintln!("worker stop channel: {error}");
+                    std::process::exit(1);
+                });
+            }
             let data_dir = flag_value(&args, "--data-dir")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(daemon::default_data_dir);
@@ -268,6 +333,12 @@ fn main() {
                 eprintln!("serve: bind failed: {error}");
                 std::process::exit(1);
             });
+            let server = server
+                .with_shutdown(shutdown.clone())
+                .unwrap_or_else(|error| {
+                    eprintln!("serve: shutdown setup: {error}");
+                    std::process::exit(1);
+                });
             let server = if args.iter().any(|arg| arg == "--clipboard") {
                 if !cfg!(target_os = "windows") {
                     eprintln!("serve: clipboard backend unavailable on this platform");
@@ -474,6 +545,9 @@ fn main() {
             // listener inherits no timeout and serve_one blocks, so max-idle
             // is enforced between sessions only. Documented, not silent.
             loop {
+                if shutdown.requested() {
+                    break;
+                }
                 if max_sessions != 0 && served >= max_sessions {
                     break;
                 }
@@ -580,6 +654,9 @@ fn main() {
                 };
                 for thread in media_threads {
                     let _ = thread.join();
+                }
+                if shutdown.requested() {
+                    break;
                 }
                 match result {
                     Ok(outcome) => {

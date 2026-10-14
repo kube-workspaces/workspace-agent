@@ -6,10 +6,19 @@ param(
   [Parameter(Mandatory = $true)][string]$Path,
   [Parameter(Mandatory = $true)][ValidateSet("amd64", "arm64")][string]$Arch,
   [Parameter(Mandatory = $true)][string]$Version,
-  [Parameter(Mandatory = $true)][string]$StagingDir
+  [Parameter(Mandatory = $true)][string]$StagingDir,
+  [ValidatePattern('^[0-9a-fA-F]{32}$')][string]$TestInstance
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$expectedUpgrade = '{F72BB43E-DBA8-4DBB-A963-B201E6C0D885}'
+$expectedService = 'KubeWorkspacesAgent'
+$expectedArguments = 'service'
+if ($TestInstance) {
+  $expectedUpgrade = '{' + ([guid]::ParseExact($TestInstance,'N')).ToString().ToUpper() + '}'
+  $expectedService = "KwAgentMsiTest-$TestInstance"
+  $expectedArguments = "service --service-name $expectedService --data-dir `"$(Join-Path $env:ProgramData "kw-agent-test-$TestInstance")`""
+}
 function Invoke-Com($Object, [string]$Name, [object[]]$Arguments) {
   $Object.GetType().InvokeMember($Name, "InvokeMethod", $null, $Object, $Arguments)
 }
@@ -38,14 +47,14 @@ try {
   $db = Invoke-Com $installer "OpenDatabase" @((Resolve-Path $Path).Path, 0)
   $properties = @{}
   Read-Rows 'SELECT `Property`, `Value` FROM `Property`' 2 | ForEach-Object { $properties[$_[0]] = $_[1] }
-  # Files-only per-machine package: the agent runs machine-wide, so the
+  # Native-service per-machine package: the agent runs machine-wide, so the
   # package must default to ALLUSERS=1 (dual-scope would let a silent
   # per-user install shadow Program Files and break upgrade detection).
   if ($properties.ALLUSERS -ne '1') {
     throw "Agent MSI must default to per-machine (ALLUSERS=1), got '$($properties.ALLUSERS)'."
   }
   if ($properties.ProductVersion -ne $Version) { throw "Incorrect ProductVersion: $($properties.ProductVersion)" }
-  if ($properties.UpgradeCode -ne "{F72BB43E-DBA8-4DBB-A963-B201E6C0D885}") { throw "UpgradeCode changed." }
+  if ($properties.UpgradeCode -ne $expectedUpgrade) { throw "UpgradeCode changed." }
   if ($properties.ContainsKey('ARPINSTALLLOCATION')) { throw "ARPINSTALLLOCATION must not be a Property-table row: such values reach the uninstall key literally." }
   # Add/Remove Programs branding: the agent MSI carries the shared Kube
   # Workspaces icon (assets/icon.ico) in the Icon table via ARPPRODUCTICON.
@@ -66,6 +75,11 @@ try {
   if (-not $seq.ContainsKey('SetARPINSTALLLOCATION') -or -not $seq.ContainsKey('CostFinalize') -or $seq['SetARPINSTALLLOCATION'] -le $seq['CostFinalize']) {
     throw "SetARPINSTALLLOCATION must run after CostFinalize so the registry holds the resolved directory."
   }
+  $recovery = @($actions | Where-Object { $_[0] -eq 'ConfigureAgentService' })
+  if ($recovery.Count -ne 1 -or $recovery[0][1] -ne '3090' -or $recovery[0][2] -ne 'AgentExe' -or $recovery[0][3] -ne "service-configure --service-name $expectedService") {
+    throw 'MSI must configure fixed SCM recovery through its elevated native installer operation'
+  }
+  if ($seq.ConfigureAgentService -le $seq.InstallServices -or $seq.ConfigureAgentService -ge $seq.StartServices) { throw 'SCM recovery must be configured after registration and before service startup' }
   $summary = Get-Com $db "SummaryInformation" @(0)
   $template = Get-Com $summary "Property" @(7)
   $expected = @{ amd64 = "x64"; arm64 = "Arm64" }[$Arch]
@@ -84,11 +98,20 @@ try {
   if ($agentFile.Count -ne 1 -or $agentFile[0][1] -notlike '*kw-agent.exe') {
     throw "Agent exe must be authored with File Id 'AgentExe'."
   }
+  $services = @(Read-Rows 'SELECT `Name`, `ServiceType`, `StartType`, `StartName`, `Arguments` FROM `ServiceInstall`' 5)
+  if ($services.Count -ne 1 -or $services[0][0] -ne $expectedService -or $services[0][1] -ne '16' -or $services[0][2] -ne '2' -or $services[0][4] -ne $expectedArguments) {
+    throw 'MSI must install one automatic native own-process agent service'
+  }
+  if ($services[0][3] -and $services[0][3] -ne 'LocalSystem') { throw 'Agent service must use LocalSystem for WTS user-token launch' }
+  $controls = @(Read-Rows 'SELECT `Name`, `Event`, `Wait` FROM `ServiceControl`' 3)
+  if ($controls.Count -ne 1 -or $controls[0][0] -ne $expectedService -or ([int]$controls[0][1] -band 163) -ne 163 -or $controls[0][2] -ne '1') {
+    throw 'MSI must start, stop and remove the agent service through standard service controls'
+  }
   $staged = @(Get-ChildItem $StagingDir -File | Where-Object { $_.Extension -in @('.exe', '.ps1') } | ForEach-Object { $_.Name })
   if (Compare-Object $staged $names) { throw "MSI payload differs from the staged archive (exe + enrollment scripts)." }
   $dialogs = @(Read-Rows 'SELECT `Dialog` FROM `Dialog`' 1 | ForEach-Object { $_[0] })
   # WixUI_Minimal: welcome, progress, exit — nothing more (no license or
-  # scope dialogs for a files-only agent package).
+  # scope dialogs for a machine-service package).
   foreach ($required in @('WelcomeDlg', 'ProgressDlg', 'ExitDialog')) {
     if ($dialogs -notcontains $required) { throw "Missing installer dialog: $required" }
   }

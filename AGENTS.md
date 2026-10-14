@@ -35,7 +35,7 @@ table checks, run by both `build-msi.ps1` and CI).
 - Releases: tag `v*` after the tracked feature milestone lands (first
   tag: `v0.1.0`); the build workflow publishes three archives
   (`linux-amd64`, `linux-arm64`, `windows-amd64`) plus the unsigned
-  files-only MSI and `SHA256SUMS`. MSI `UpgradeCode`
+  native-service MSI and `SHA256SUMS`. MSI `UpgradeCode`
   `f72bb43e-dba8-4dbb-a963-b201e6c0d885` is stable forever. No chart
   bumps or ArgoCD targetRevision changes from tags here — that stays
   separately coordinated (see tracking).

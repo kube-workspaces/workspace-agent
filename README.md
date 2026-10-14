@@ -39,45 +39,91 @@ not treat fixtures or CI green as guest acceptance.
 
 ## Windows desktop startup and identity
 
-`install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>` enrolls
-the daemon. Workspace UIDs must use canonical UUID syntax; generation is an
-opaque, non-empty identifier. Reinstalling or registering startup with values
-that differ from enrollment fails before changing startup configuration.
+Windows uses a native automatic **Kube Workspaces Agent** service
+(`KubeWorkspacesAgent` in SCM). It runs as LocalSystem in Session 0, owns
+enrollment/heartbeat and supervises one user-token worker in the logged-in
+**console** session. Desktop capture, audio, clipboard, input and display
+changes run in that worker, never in Session 0. There is no console window,
+tray requirement, PowerShell supervisor or user startup registration on the
+native path. RDP/multiuser and secure-desktop control are not implied.
 
-The daemon publishes only `workspaceUid` and `workspaceGeneration` to
-`%PROGRAMDATA%\workspace-agent\public\binding.json`. The desktop user has
-read-only access to that directory; the private key in `identity.json` and
-enrollment tokens remain restricted to SYSTEM and Administrators.
-
-Both the interactive logon task and Explorer Run fallback launch the same
-hidden `Start-Serve.ps1`, which runs `serve --data-dir <directory>` and reads
-the enrolled binding. They do not store separate copies of the UID or
-generation. Re-register an already enrolled guest from elevated PowerShell:
+The MSI installs/starts the service and owns stop/remove on upgrade/uninstall.
+An unconfigured installation reports `awaiting-enrollment` and starts no worker.
+Run the per-guest provisioning step from elevated PowerShell:
 
 ```powershell
 cd 'C:\Program Files\workspace-agent'
-.\Register-ServeTask.ps1
+.\install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>
+Get-Service KubeWorkspacesAgent
 ```
 
-Use `-DataDir` for a custom enrollment directory. Start the upgraded daemon
-first so it publishes `public\binding.json`. Optional `-WorkspaceUid` and
-`-WorkspaceGeneration` arguments assert enrollment matches; they cannot
-override it. Standalone, unenrolled protocol diagnostics can still pass both
-binding flags directly to `serve`.
+The same script supports archive installations. It copies all management helpers
+and enforces administrator-owned executables with read/execute-only access for
+regular users, including custom installation paths. Workspace UIDs must use
+canonical UUID syntax; generation is opaque and non-empty. Reinstallation
+refuses enrollment mismatches before changing configuration. The private key
+survives ordinary service restarts and MSI upgrades/uninstalls.
 
-Troubleshooting (no private key is printed):
+Only `workspaceUid` and `workspaceGeneration` are published to
+`%PROGRAMDATA%\workspace-agent\public\binding.json`, read-only to local users.
+The private `identity.json`, enrollment tokens and machine configuration remain
+restricted to SYSTEM and Administrators. Startup never stores a second identity.
+
+The service starts the fixed executable using the console user's token and
+environment with `CREATE_NO_WINDOW`, using the linked limited token when Windows
+provides a UAC split token. The worker never runs as a built-in service account.
+A job object, assigned atomically at process creation, bounds worker lifetime.
+A SYSTEM-owned, ACL-restricted local stop event allows graceful socket/media/input
+teardown before bounded forced cleanup. Worker crashes restart with exponential
+backoff (up to 60 seconds). MSI/archive installation configures SCM crash/error
+recovery with 5/15/60-second service restart delays using a fixed native installer
+operation, outside service startup.
+Startup discovers an already logged-in console, and session notifications plus
+reconciliation handle session replacement and logoff.
+Locked/disconnected consoles are ineligible; unlocking the selected console
+starts a fresh worker. Secure-desktop capture is not attempted.
+
+`service.json` contains `workerEnabled`, `port` and a validated `workerArgs`
+array. It cannot override identity or launch arbitrary commands. Use
+`install.ps1 -ServeArgs <string-array>` for arguments containing spaces;
+`-ExtraServeArgs` remains a whitespace-separated compatibility option.
+`-NoDesktopWorker` (alias `-NoServeTask`) installs only the machine service.
+A custom `-DataDir` is persisted in
+`HKLM\SOFTWARE\KubeWorkspaces\Agent\DataDir`, independently of MSI ImagePath.
+
+**Migrating an older scheduled-task installation:** extract the new archive
+and run its `install.ps1` against the existing BinDir/DataDir before applying
+the service MSI. It checks identity first, retires legacy tasks/Run startup,
+and stops only legacy agent modes at the exact installed executable path.
+Do not reset or delete enrollment. `Register-ServeTask.ps1`/`Start-Serve.ps1`
+remain for legacy diagnostics; registration refuses to create competing startup
+when the native service exists. Legacy logon tasks disable execution time and
+battery-stop limits. Unenrolled diagnostics can still pass both binding flags
+directly to `serve`.
+
+Use Windows Installer to remove an MSI installation. Archive installs use
+`uninstall.ps1`, which also retains enrollment by default; `-PurgeIdentity`
+explicitly removes it when preparing a genuinely fresh enrollment.
+
+Troubleshooting (no private key is printed; specify `--data-dir` for custom paths):
 
 ```powershell
-# Elevated: validate enrollment, its public projection and optional expected values.
 .\kw-agent.exe identity-check
-.\kw-agent.exe identity-check --workspace-uid <expected-uid> --workspace-generation <expected-generation>
-# Interactive desktop user's logs (current and previous launch).
-Get-Content "$env:LOCALAPPDATA\workspace-agent\serve*.log*"
+.\kw-agent.exe service-config-check
+Get-Content "$env:ProgramData\workspace-agent\service-status.json"
+Get-Content "$env:ProgramData\workspace-agent\logs\service*.log"
+# In the interactive desktop user's session:
+Get-Content "$env:LOCALAPPDATA\workspace-agent\worker-KubeWorkspacesAgent*.log"
 ```
 
-The launcher retains one previous set of logs. Attach refusals explicitly
-identify `workspace-uid-mismatch` and `workspace-generation-mismatch`; a daemon
-heartbeat alone does not establish desktop-serving readiness.
+Native logs append and rotate at the next launch after exceeding 10 MiB.
+Early setup failures are also recorded in `service-start-error.log` when the
+data directory is writable; SCM reports an application-specific failure code.
+`worker-process-running` means liveness; `mediaReady: null` explicitly does not
+claim capture/streaming readiness. Transport telemetry remains the evidence for
+streaming. Attach refusals identify `workspace-uid-mismatch` and
+`workspace-generation-mismatch`; a heartbeat alone does not establish desktop
+readiness.
 
 ## Windows output selection
 

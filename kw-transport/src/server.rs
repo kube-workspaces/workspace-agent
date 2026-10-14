@@ -85,6 +85,70 @@ pub struct MediaStats {
 /// through one mutex so reference frames are never interleaved corrupt.
 type SharedWriter = Arc<Mutex<TcpStream>>;
 
+/// Local lifecycle cancellation, never exposed as a remote protocol action.
+/// Closing the active socket lets normal teardown release held input/media.
+#[derive(Default)]
+pub struct Shutdown {
+    stopped: AtomicBool,
+    active: Mutex<Option<TcpStream>>,
+}
+
+impl Shutdown {
+    pub fn request(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Ok(active) = self.active.lock() {
+            if let Some(stream) = active.as_ref() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+    pub fn requested(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+}
+
+/// Poll cancellation inside Read, retaining read_exact's partial frame state.
+/// Winsock shutdown on a duplicated socket does not reliably wake a recv on
+/// another thread. Short OS timeouts must not discard partially read frames.
+struct ControlledReader {
+    stream: TcpStream,
+    shutdown: Option<Arc<Shutdown>>,
+    admission_deadline: Option<std::time::Instant>,
+}
+impl std::io::Read for ControlledReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.shutdown.as_ref().is_some_and(|stop| stop.requested()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "local shutdown",
+                ));
+            }
+            if self
+                .admission_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "admission timeout",
+                ));
+            }
+            match std::io::Read::read(&mut self.stream, buffer) {
+                Err(error)
+                    if self.shutdown.is_some()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    continue
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 /// Console-session clipboard backend supplied by the guest executable.
 pub trait Clipboard: Send + Sync {
     fn read_text(&self) -> Result<Option<String>, String>;
@@ -137,6 +201,7 @@ pub struct Server {
     /// Selected output's OS mode list, as (width, height) pairs. Advertised
     /// in hello so viewers request modes the guest actually offers.
     display_modes: Vec<(u32, u32)>,
+    shutdown: Option<Arc<Shutdown>>,
 }
 
 impl Server {
@@ -155,11 +220,51 @@ impl Server {
             input: None,
             resize: None,
             display_modes: Vec::new(),
+            shutdown: None,
         })
     }
 
     pub fn local_address(&self) -> std::io::Result<std::net::SocketAddr> {
         self.listener.local_addr()
+    }
+
+    pub fn with_shutdown(mut self, shutdown: Arc<Shutdown>) -> std::io::Result<Self> {
+        self.listener.set_nonblocking(true)?;
+        self.shutdown = Some(shutdown);
+        Ok(self)
+    }
+
+    fn accept(&self) -> Result<(TcpStream, std::net::SocketAddr), String> {
+        loop {
+            if self.shutdown.as_ref().is_some_and(|stop| stop.requested()) {
+                return Err("local-shutdown".into());
+            }
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+                    if let Some(stop) = &self.shutdown {
+                        let mut active = stop.active.lock().map_err(|e| e.to_string())?;
+                        if stop.requested() {
+                            return Err("local-shutdown".into());
+                        }
+                        *active = Some(stream.try_clone().map_err(|e| e.to_string())?);
+                    }
+                    return Ok((stream, peer));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(error) => return Err(format!("accept: {error}")),
+            }
+        }
+    }
+
+    fn finish_connection(&self) {
+        if let Some(stop) = &self.shutdown {
+            if let Ok(mut active) = stop.active.lock() {
+                *active = None;
+            }
+        }
     }
 
     pub fn with_clipboard(mut self, clipboard: Arc<dyn Clipboard>) -> Self {
@@ -192,8 +297,8 @@ impl Server {
     /// decides whether to accept another (single-controller discipline means
     /// concurrent sessions are never multiplexed here).
     pub fn serve_one(&self) -> Result<SessionOutcome, String> {
-        let (stream, peer) = self.listener.accept().map_err(|e| format!("accept: {e}"))?;
-        Ok(serve_connection(
+        let (stream, peer) = self.accept()?;
+        let outcome = serve_connection(
             stream,
             peer.to_string(),
             &self.workspace_uid,
@@ -204,7 +309,10 @@ impl Server {
             self.clipboard.as_deref(),
             self.input.as_deref(),
             self.resize.as_deref(),
-        ))
+            self.shutdown.clone(),
+        );
+        self.finish_connection();
+        Ok(outcome)
     }
 
     /// Serve one connection with a media feed: after admission, packets from
@@ -217,8 +325,14 @@ impl Server {
         feed: mpsc::Receiver<MediaPacket>,
         stats: Arc<MediaStats>,
     ) -> Result<SessionOutcome, String> {
-        let (stream, peer) = self.listener.accept().map_err(|e| format!("accept: {e}"))?;
-        Ok(serve_connection(
+        let (stream, peer) = match self.accept() {
+            Ok(connection) => connection,
+            Err(error) => {
+                gate.ended.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let outcome = serve_connection(
             stream,
             peer.to_string(),
             &self.workspace_uid,
@@ -229,7 +343,10 @@ impl Server {
             self.clipboard.as_deref(),
             self.input.as_deref(),
             self.resize.as_deref(),
-        ))
+            self.shutdown.clone(),
+        );
+        self.finish_connection();
+        Ok(outcome)
     }
 }
 
@@ -276,17 +393,25 @@ fn serve_connection(
     clipboard: Option<&dyn Clipboard>,
     input: Option<&dyn Input>,
     resize: Option<&dyn Resize>,
+    shutdown: Option<Arc<Shutdown>>,
 ) -> SessionOutcome {
     let mut outcome = SessionOutcome::default();
     // The session claim is minted here and advertised in our hello; clients
     // echo it back. Anything else is a foreign claim.
     let session_id = format!("sess-{}", now_secs());
     let mut handshake = Handshake::new(session_id.clone(), 0);
-    let mut reader = stream.try_clone().expect("clone reader");
+    let reader_stream = stream.try_clone().expect("clone reader");
+    let _ = reader_stream.set_read_timeout(Some(if shutdown.is_some() {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_secs(30)
+    }));
+    let mut reader = ControlledReader {
+        stream: reader_stream,
+        shutdown,
+        admission_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+    };
     let writer: SharedWriter = Arc::new(Mutex::new(stream));
-    reader
-        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .ok();
     if let Ok(guard) = writer.lock() {
         let _ = guard.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     }
@@ -428,7 +553,10 @@ fn serve_connection(
                 if message.message_type == "attach" && handshake.admitted() {
                     // Bound anonymous handshakes, not a valid readonly media
                     // viewer that has no reason to send input every 30 seconds.
-                    let _ = reader.set_read_timeout(None);
+                    reader.admission_deadline = None;
+                    if reader.shutdown.is_none() {
+                        let _ = reader.stream.set_read_timeout(None);
+                    }
                 }
             }
         }
@@ -750,6 +878,99 @@ mod tests {
 
     fn run_server_once(server: Server) -> SessionOutcome {
         server.serve_one().expect("serve")
+    }
+
+    #[test]
+    fn cancellation_polling_preserves_partial_control_frames() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_shutdown(Arc::new(Shutdown::default()))
+            .unwrap();
+        let port = server.local_address().unwrap().port();
+        let thread = std::thread::spawn(move || server.serve_one().unwrap());
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        let body = serde_json::to_vec(&control(
+            &hello.session_id,
+            "attach",
+            2,
+            serde_json::json!({"ticket":test_ticket(&hello.session_id)}),
+        ))
+        .unwrap();
+        let mut wire = vec![0u8];
+        wire.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&body);
+        client.write_all(&wire[..2]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        client.write_all(&wire[2..]).unwrap();
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        send(
+            &control(&hello.session_id, "bye", 3, serde_json::json!({})),
+            &mut client,
+        );
+        assert_eq!(thread.join().unwrap().ended, "peer-bye");
+    }
+
+    #[test]
+    fn local_shutdown_cancels_idle_accept_and_releases_active_connection() {
+        let stop = Arc::new(Shutdown::default());
+        let idle = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_shutdown(stop.clone())
+            .unwrap();
+        stop.request();
+        assert_eq!(idle.serve_one().unwrap_err(), "local-shutdown");
+
+        let stop = Arc::new(Shutdown::default());
+        let input = Arc::new(RecordingInput::default());
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_input(input.clone())
+            .with_shutdown(stop.clone())
+            .unwrap();
+        let port = server.local_address().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tx.send(server.serve_one()).unwrap();
+        });
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        send(
+            &control(
+                &hello.session_id,
+                "attach",
+                2,
+                serde_json::json!({"ticket":test_ticket(&hello.session_id)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        send(
+            &control(
+                &hello.session_id,
+                "input",
+                3,
+                serde_json::json!({"kind":"key","keysym":65,"down":true}),
+            ),
+            &mut client,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while input.events.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(input.events.lock().unwrap().len(), 1);
+        stop.request();
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        assert!(matches!(read_frame(&mut client), Ok(None) | Err(_)));
+        thread.join().unwrap();
+        assert_eq!(
+            input.reset.load(Ordering::SeqCst),
+            1,
+            "local stop must release held input"
+        );
     }
 
     #[test]

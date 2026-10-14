@@ -55,6 +55,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if (Get-Service -Name KubeWorkspacesAgent -ErrorAction SilentlyContinue) {
+  throw 'Native agent service is installed; configure it with install.ps1 instead of enabling legacy logon startup'
+}
+
 if ([string]::IsNullOrWhiteSpace($UserSid)) {
   $UserSid = (Get-LocalUser $User).SID.Value
 }
@@ -113,7 +117,7 @@ $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Limited
   $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
-    -AllowStartIfOnBatteries -StartWhenAvailable -Hidden
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Hidden
 Register-ScheduledTask -TaskName 'kw-agent-serve' -Action $action `
   -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Write-Output "logon task 'kw-agent-serve' registered for $User"

@@ -18,5 +18,5 @@ pub use client::ClientOutcome;
 pub use frame::{MediaKind, MAX_CONTROL_BYTES, MAX_MEDIA_BYTES};
 pub use server::{
     Clipboard, Input, MediaGate, MediaPacket, MediaStats, Resize, Server, ServerEvent,
-    SessionOutcome,
+    SessionOutcome, Shutdown,
 };
