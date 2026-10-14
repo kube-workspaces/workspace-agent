@@ -19,6 +19,23 @@ function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel); [ps
 function New-ScheduledTaskSettingsSet { param($RestartCount, $RestartInterval, [switch]$AllowStartIfOnBatteries, [switch]$StartWhenAvailable, [switch]$Hidden); [pscustomobject]@{Hidden=$Hidden.IsPresent} }
 function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force); $global:KwServeTestRegistrations += $Action }
 function Get-CimInstance { param($ClassName, $Filter, $ErrorAction); return $null }
+function Get-AccessSnapshot($Path) {
+  $acl = Get-Acl -LiteralPath $Path
+  # Windows can add the auto-inherited (AI) descriptor flag when a parent's
+  # DACL is updated, without changing a single ACE. Compare access semantics,
+  # ownership and inheritance protection, not that bookkeeping flag.
+  $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+    ForEach-Object {
+      '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights,
+        $_.AccessControlType, $_.IsInherited, $_.InheritanceFlags, $_.PropagationFlags
+    } | Sort-Object)
+  [ordered]@{
+    Owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    Group = $acl.GetGroup([Security.Principal.SecurityIdentifier]).Value
+    Protected = $acl.AreAccessRulesProtected
+    Rules = $rules
+  } | ConvertTo-Json -Compress
+}
 function Assert-Fails($Overrides, $Expected) {
   $before = $global:KwServeTestRegistrations.Count
   $failed = $false
@@ -33,12 +50,21 @@ function Assert-Fails($Overrides, $Expected) {
 }
 try {
   New-Item -ItemType Directory -Path $bin, $data -Force | Out-Null
+  # Match install.ps1 rather than inheriting the runner's TEMP permissions.
+  $acl = New-Object Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($accountSid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $account = New-Object Security.Principal.SecurityIdentifier($accountSid)
+    [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+      $account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+  }
+  (Get-Item -LiteralPath $data).SetAccessControl($acl)
   Copy-Item -LiteralPath $AgentPath -Destination (Join-Path $bin 'kw-agent.exe')
   $identity = @{agentKeyHex='private-test-key';workspaceUid=$uid;workspaceGeneration=$generation;enrolledAt=1}
   [IO.File]::WriteAllText((Join-Path $data 'identity.json'), ($identity | ConvertTo-Json))
   New-Item -ItemType Directory -Path (Join-Path $data 'public') | Out-Null
   [IO.File]::WriteAllText((Join-Path $data 'public\binding.json'), (@{workspaceUid=$uid;workspaceGeneration=$generation} | ConvertTo-Json))
-  $privateAcl = (Get-Acl (Join-Path $data 'identity.json')).Sddl
+  $privateAcl = Get-AccessSnapshot (Join-Path $data 'identity.json')
   Assert-Fails @{WorkspaceUid=($uid+'0')} 'validat|pattern'
   Assert-Fails @{WorkspaceUid='00000000-0000-4000-8000-000000000002'} 'UID mismatch|validation failed'
   Assert-Fails @{WorkspaceGeneration='mistyped'} 'generation mismatch|validation failed'
@@ -48,7 +74,8 @@ try {
   $action = $global:KwServeTestRegistrations[0]
   if ($action.Arguments -notmatch 'Start-Serve.ps1' -or $action.Arguments -notmatch '-WindowStyle Hidden') { throw 'Hidden launcher missing' }
   if ($action.Arguments -match 'workspace-uid|workspace-generation') { throw 'Registration duplicated identity values' }
-  if ((Get-Acl (Join-Path $data 'identity.json')).Sddl -ne $privateAcl) { throw 'Private identity ACL changed' }
+  $afterAcl = Get-AccessSnapshot (Join-Path $data 'identity.json')
+  if ($afterAcl -ne $privateAcl) { throw "Private identity access changed: before=$privateAcl after=$afterAcl" }
   $publicAcl = Get-Acl (Join-Path $data 'public')
   $userRule = @($publicAcl.Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $sid })
   if ($userRule.Count -ne 1 -or $userRule[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) { throw 'Desktop binding must be read-only' }
