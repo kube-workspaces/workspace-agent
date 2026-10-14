@@ -47,6 +47,11 @@ try {
   if ($properties.ProductVersion -ne $Version) { throw "Incorrect ProductVersion: $($properties.ProductVersion)" }
   if ($properties.UpgradeCode -ne "{F72BB43E-DBA8-4DBB-A963-B201E6C0D885}") { throw "UpgradeCode changed." }
   if ($properties.ContainsKey('ARPINSTALLLOCATION')) { throw "ARPINSTALLLOCATION must not be a Property-table row: such values reach the uninstall key literally." }
+  # Add/Remove Programs branding: the agent MSI carries the shared Kube
+  # Workspaces icon (assets/icon.ico) in the Icon table via ARPPRODUCTICON.
+  $icons = @(Read-Rows 'SELECT `Name` FROM `Icon`' 1 | ForEach-Object { $_[0] })
+  if ($icons -notcontains 'AppIcon.ico') { throw "MSI Icon table must contain the branded AppIcon.ico." }
+  if ($properties.ARPPRODUCTICON -ne 'AppIcon.ico') { throw "ARPPRODUCTICON must reference AppIcon.ico." }
   $actions = @(Read-Rows 'SELECT `Action`, `Type`, `Source`, `Target` FROM `CustomAction`' 4)
   $setLoc = @($actions | Where-Object { $_[0] -eq 'SetARPINSTALLLOCATION' })
   if ($setLoc.Count -ne 1 -or $setLoc[0][1] -ne '51' -or $setLoc[0][2] -ne 'ARPINSTALLLOCATION' -or $setLoc[0][3] -ne '[INSTALLDIR]') {

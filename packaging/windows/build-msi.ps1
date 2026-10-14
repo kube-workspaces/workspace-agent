@@ -113,6 +113,12 @@ if (-not (Test-Path $skeleton -PathType Leaf)) {
   Write-Error "WiX skeleton missing: $skeleton"
   exit 1
 }
+$icon = Join-Path $WxsDir "..\..\assets\icon.ico"
+if (-not (Test-Path $icon -PathType Leaf)) {
+  Write-Error "Icon missing: $icon"
+  exit 1
+}
+$iconPath = (Resolve-Path $icon).Path
 
 # Generated fragment: one 64-bit component per payload file. The agent's File
 # Id is the fixed contract AgentExe (verify-msi.ps1 checks it).
@@ -166,6 +172,7 @@ try {
     -ext WixToolset.UI.wixext/5.0.2 `
     -arch $wixArch `
     -d ProductVersion=$productVersion `
+    -d IconPath="$iconPath" `
     -o $OutFile
   if ($LASTEXITCODE -ne 0) {
     Write-Error "wix build failed (exit $LASTEXITCODE)."

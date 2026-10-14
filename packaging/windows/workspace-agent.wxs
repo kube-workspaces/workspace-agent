@@ -13,6 +13,9 @@
 //
 // Layout contract:
 //   - kw-agent.exe plus the enrollment scripts install in INSTALLDIR.
+//   - assets/icon.ico (same artwork as desktop-client) brands Add/Remove
+//     Programs via ARPPRODUCTICON; it is compiled into the MSI Icon table,
+//     not installed as a payload file.
 //   - No Start Menu shortcut: this is a background guest agent, not a GUI app.
 //   - Uninstall never touches %ProgramData%\workspace-agent (agent identity
 //     and status live there and must survive upgrade/uninstall).
@@ -36,6 +39,11 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of Kube Workspaces Agent is already installed." />
     <Media Id="1" Cabinet="workspace-agent.cab" EmbedCab="yes" />
 
+    <!-- IconPath arrives via -d IconPath= (absolute); kept out of the file so
+         the build works from any working directory. Brands Add/Remove
+         Programs (same artwork as desktop-client assets/icon.ico). -->
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
     <!-- Recorded install location: Add/Remove Programs shows it. MUST be a
          SetProperty after CostFinalize, never a Property-table row: ARP
          values from the Property table reach the uninstall key literally,
@@ -56,9 +64,9 @@
     <!-- Standard welcome/EULA/progress/exit dialogs (WixToolset.UI.wixext).
          The platform-neutral set is referenced via ui:WixUI, which pulls in
          the matching per-architecture custom actions; a direct UIRef to the
-         WixUI_ id fails WIX0094 in v4/v5. No custom artwork or icon: an
-         unsigned console utility does not need a banner budget, and no
-         assets/ directory is bundled on purpose. -->
+         WixUI_ id fails WIX0094 in v4/v5. No custom banner artwork: an
+         unsigned console utility does not need a banner budget. The Add/Remove
+         Programs icon above is the only branding. -->
     <ui:WixUI Id="WixUI_Minimal" />
   </Package>
 </Wix>
