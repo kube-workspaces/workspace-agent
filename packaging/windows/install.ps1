@@ -7,6 +7,9 @@
   Proof installer for disposable guests. Not an MSI, not signed, no driver
   handling. The task runs `kw-agent daemon` as SYSTEM at startup; the agent
   itself performs no capture, networking, input or display changes in v0.1.
+  Capture needs serve in the interactive console session (Session 0
+  isolation), so install also registers the per-logon `kw-agent-serve` task
+  via Register-ServeTask.ps1 unless -NoServeTask is given.
 .PARAMETER WorkspaceUid
   Workspace UID the enrollment token is bound to (generation-bound below).
 .PARAMETER WorkspaceGeneration
@@ -19,13 +22,24 @@
 .PARAMETER BinDir
   Defaults to $env:ProgramFiles\workspace-agent. kw-agent.exe must sit next
   to this script or be given via -InstallerPath.
+.PARAMETER ServeUser
+  Interactive account the serve task runs as (default workspace). Must exist
+  at install time; otherwise the serve task is skipped with a warning and
+  can be registered later by re-running install or Register-ServeTask.ps1.
+.PARAMETER ExtraServeArgs
+  Extra serve flags for the logon task (default full premium set).
+.PARAMETER NoServeTask
+  Skip the interactive logon serve task (control plane only).
 #>
 param(
     [Parameter(Mandatory=$true)][string]$WorkspaceUid,
     [Parameter(Mandatory=$true)][string]$WorkspaceGeneration,
     [int]$TokenHours = 2,
     [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
-    [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent')
+    [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent'),
+    [string]$ServeUser = 'workspace',
+    [string]$ExtraServeArgs = '--capture-video --capture-audio --clipboard --input --resize',
+    [switch]$NoServeTask
 )
 $ErrorActionPreference = 'Stop'
 
@@ -83,3 +97,22 @@ $state = (Get-ScheduledTask -TaskName 'workspace-agent').State
 $status = if (Test-Path (Join-Path $DataDir 'status.json')) { Get-Content (Join-Path $DataDir 'status.json') -Raw } else { '(no status yet)' }
 Write-Output "task state: $state"
 Write-Output "status: $status"
+
+# Interactive serve task: capture/video/audio/input need the logged-on
+# console session, which the SYSTEM task above cannot see (Session 0
+# isolation). Non-fatal when the account does not exist yet (image
+# provisioning order): warn and let a later re-run register it.
+if (-not $NoServeTask) {
+    $serveScript = Join-Path $PSScriptRoot 'Register-ServeTask.ps1'
+    if (-not (Test-Path -LiteralPath $serveScript)) {
+        Write-Warning "Register-ServeTask.ps1 not staged next to install.ps1; skipping interactive serve task"
+    } else {
+        try {
+            & $serveScript -WorkspaceUid $WorkspaceUid -WorkspaceGeneration $WorkspaceGeneration `
+                -User $ServeUser -BinDir $BinDir -ExtraServeArgs $ExtraServeArgs
+        } catch {
+            Write-Warning "interactive serve task not registered: $($_.Exception.Message)"
+            Write-Warning "re-run install.ps1 (or Register-ServeTask.ps1) once '$ServeUser' exists"
+        }
+    }
+}

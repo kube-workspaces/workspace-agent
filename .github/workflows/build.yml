@@ -394,7 +394,8 @@ jobs:
             echo
             echo "**Windows** — the zip carries \`install.ps1\` (admin) which copies the"
             echo "binary to \`%ProgramFiles%\\workspace-agent\`, writes a one-use enrollment"
-            echo "token for the target workspace and registers the startup task:"
+            echo "token for the target workspace and registers the SYSTEM startup task"
+            echo "plus the interactive logon serve task (capture needs the console session):"
             echo
             echo '```powershell'
             echo ".\\install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>"
@@ -402,7 +403,7 @@ jobs:
             echo
             echo "The \`.msi\` is an **unsigned files-only installer** (Add/Remove entry,"
             echo "install/upgrade/uninstall to \`Program Files\\workspace-agent\`); enrollment"
-            echo "and the startup task still come from \`install.ps1\` or the workspace image"
+            echo "and both scheduled tasks still come from \`install.ps1\` or the workspace image"
             echo "recipe. Silent install: \`msiexec /i workspace-agent-$VERSION-windows-amd64.msi /qn\`."
             echo
             echo "> **These binaries are not code-signed.** Windows SmartScreen will warn:"

@@ -1,11 +1,12 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Uninstall kw-agent v0.1: stop/remove the task, delete binaries and data.
+  Uninstall kw-agent v0.1: stop/remove the tasks, delete binaries and data.
 .DESCRIPTION
   Removes identity.json too — use only on disposable guests or when a fresh
   enrollment is intended. Product Reset semantics are owned by the platform,
-  not this script.
+  not this script. Removes both the SYSTEM daemon task and the interactive
+  logon serve task (see install.ps1).
 #>
 param(
     [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
@@ -14,6 +15,8 @@ param(
 $ErrorActionPreference = 'SilentlyContinue'
 Stop-ScheduledTask -TaskName 'workspace-agent'
 Unregister-ScheduledTask -TaskName 'workspace-agent' -Confirm:$false
+Stop-ScheduledTask -TaskName 'kw-agent-serve'
+Unregister-ScheduledTask -TaskName 'kw-agent-serve' -Confirm:$false
 Remove-Item -LiteralPath $BinDir -Recurse -Force
 Remove-Item -LiteralPath $DataDir -Recurse -Force
 Write-Output 'workspace-agent removed'
