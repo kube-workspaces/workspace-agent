@@ -173,6 +173,7 @@ try {
     -arch $wixArch `
     -d ProductVersion=$productVersion `
     -d IconPath="$iconPath" `
+    -d ArtworkDir="$((Resolve-Path $WxsDir).Path)" `
     -o $OutFile
   if ($LASTEXITCODE -ne 0) {
     Write-Error "wix build failed (exit $LASTEXITCODE)."
