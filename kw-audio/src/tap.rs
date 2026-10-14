@@ -134,9 +134,10 @@ mod platform {
     use super::super::{Error, MixFormat};
     use windows::Win32::Foundation::{BOOL, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
-        eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-        MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX,
+        eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioEndpointVolume,
+        IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        WAVEFORMATEX,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
@@ -156,6 +157,10 @@ mod platform {
         event: windows::Win32::Foundation::HANDLE,
         format: MixFormat,
         frame_bytes: usize,
+        /// Endpoint volume control for master-volume following (see
+        /// [`crate::volume`]). Absent on drivers that do not expose it;
+        /// capture then behaves as before (unity gain).
+        endpoint_volume: Option<IAudioEndpointVolume>,
     }
 
     impl LoopbackTap {
@@ -179,6 +184,8 @@ mod platform {
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|_| Error::NoEndpoint)?;
             let client: IAudioClient = endpoint.Activate(CLSCTX_ALL, None).map_err(os)?;
+            let endpoint_volume: Option<IAudioEndpointVolume> =
+                endpoint.Activate(CLSCTX_ALL, None).ok();
             let mix = client.GetMixFormat().map_err(os)?;
             let format = mix_format_of(&*mix)?;
             let frame_bytes = format.channels as usize * (format.bits as usize / 8).max(1);
@@ -204,7 +211,24 @@ mod platform {
                 event,
                 format,
                 frame_bytes,
+                endpoint_volume,
             })
+        }
+
+        /// Guest endpoint master volume as (0..1 scalar, muted), polled from
+        /// the endpoint on every call. Falls back to unity/unmuted when the
+        /// driver exposes no volume control. Polled rather than notified:
+        /// two cheap COM reads per pump batch beat implementing a COM event
+        /// sink, and volume moves land within one batch.
+        pub fn master_volume(&self) -> (f32, bool) {
+            match &self.endpoint_volume {
+                None => (1.0, false),
+                Some(volume) => unsafe {
+                    let scalar = volume.GetMasterVolumeLevelScalar().unwrap_or(1.0);
+                    let muted = volume.GetMute().map(|mute| mute.as_bool()).unwrap_or(false);
+                    (scalar, muted)
+                },
+            }
         }
 
         pub fn mix_format(&self) -> MixFormat {
@@ -362,6 +386,11 @@ mod platform {
 
         pub fn read(&self, _timeout_ms: u32) -> Result<Option<(MixFormat, Vec<u8>, u32)>, Error> {
             Err(Error::Gated("non-Windows audio capture backends"))
+        }
+
+        /// Off Windows there is no endpoint to follow: unity gain, unmuted.
+        pub fn master_volume(&self) -> (f32, bool) {
+            (1.0, false)
         }
     }
 }

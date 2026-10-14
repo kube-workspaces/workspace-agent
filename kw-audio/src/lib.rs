@@ -9,6 +9,7 @@
 pub mod opus;
 pub mod resample;
 pub mod tap;
+pub mod volume;
 
 pub use tap::MixFormat;
 

@@ -5,6 +5,13 @@
 //! packets — the clock never stalls on a quiet console. Device loss
 //! reopens the tap boundedly; anything else ends audio for the session
 //! while video/control continue (degraded, never silent).
+//!
+//! Guest master-volume following: per-application mixer volumes are
+//! engine-applied and therefore always present in the loopback, but the
+//! endpoint master volume/mute may be delegated to the audio hardware
+//! (observed on virtual HDA), upstream of the software tap. The pump
+//! scales captured samples by the polled endpoint volume (mute forces
+//! silence), so remote listeners hear what the guest mixer promises.
 
 use kw_transport::{MediaGate, MediaPacket};
 use std::sync::atomic::Ordering;
@@ -122,7 +129,13 @@ pub fn run(
                 Ok(pcm) => pcm,
                 Err(error) => return PumpEnd::Fatal(format!("mix decode failed: {error}")),
             };
-            let stereo = kw_audio::tap::to_stereo(&pcm, format.channels);
+            let mut stereo = kw_audio::tap::to_stereo(&pcm, format.channels);
+            // Guest master-volume following: the loopback tap sits upstream
+            // of hardware-applied endpoint volume on some devices, so the
+            // master slider/mute would otherwise have no effect remotely.
+            // Per-application volumes are engine-applied and already present.
+            let (scalar, muted) = tap.master_volume();
+            kw_audio::volume::apply_master_volume(&mut stereo, scalar, muted);
             accumulator.push(&resampler.push_stereo(&stereo));
             while let Some(frame) = accumulator.pop_frame() {
                 let packet = match opus.encode_frame(&frame) {
