@@ -69,7 +69,9 @@ to a fresh IDR.
   control epoch, audience and expiry before admitting input.
 - `attachResult`: `{admitted, reason?}`, sent in reply to `attach` in the
   same session claim; a rejected attach carries a bounded machine-readable
-  reason and admits no input.
+  reason and admits no input. Workspace binding failures use
+  `workspace-uid-mismatch` or `workspace-generation-mismatch`; reasons name
+  the failed field without including identities, credentials or ticket data.
 - `input`: viewer→guest input, sent only by the admitted controller and only
   when `hello.inputAvailable` is true. Carries a `kind` tag:
   `{"kind":"key","keysym":N,"down":bool}` (X11 keysym, named/legacy values

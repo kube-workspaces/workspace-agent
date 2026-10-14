@@ -65,7 +65,7 @@ package: ## Stage and archive release targets from bin/<target>/
 		chmod +x "$$stage/$$(basename "$$src")"; \
 		cp README.md LICENSE "$$stage/"; \
 		if [ "$$os" = windows ]; then \
-			cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 packaging/windows/Register-ServeTask.ps1 "$$stage/"; \
+			cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 packaging/windows/Register-ServeTask.ps1 packaging/windows/Start-Serve.ps1 "$$stage/"; \
 		fi; \
 		if [ "$$os" = windows ]; then \
 			(cd $(DIST_DIR) && zip -qr "$(PACKAGE_NAME)-$(VERSION)-$$os-$$arch.zip" "$(PACKAGE_NAME)-$$os-$$arch"); \

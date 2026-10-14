@@ -10,21 +10,24 @@
   stored, and a 30 s delay plus restart-on-failure covers display drivers
   that are not ready in the first seconds after logon.
 
-  Survives stop/start and reboot (UID+generation are stable). Re-run with new
-  values after a workspace Reset, which rotates the binding.
+  Loads UID+generation from the daemon's public enrolled binding at startup.
+  Optional binding parameters are assertions, never independent task state.
 
   As a fallback the script also writes an HKCU Run value for the same user:
   Explorer launches it in-session at every logon with no scheduler
   involvement, which survives hardened-image Task Scheduler launch denials
-  (observed 0x80070005). If both fire, the loser exits on bind failure
-  (serve exits 1), so a double start is safe. Uninstall removes the Run
+  (observed 0x80070005). A shared per-session launcher mutex prevents double
+  starts and competing log writers. Uninstall removes the Run
   value (see uninstall.ps1).
 
 .PARAMETER WorkspaceUid
-  Workspace UID the serve session binds to.
+  Optional expected workspace UID. Must match the enrolled identity.
 
 .PARAMETER WorkspaceGeneration
-  Workspace generation the serve session binds to.
+  Optional expected generation. Must match the enrolled identity.
+
+.PARAMETER DataDir
+  Enrollment directory shared with the daemon (default ProgramData\workspace-agent).
 
 .PARAMETER User
   Interactive account name (default workspace).
@@ -36,16 +39,16 @@
   Extra serve flags (default full premium set).
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File Register-ServeTask.ps1 `
-    -WorkspaceUid <uid> -WorkspaceGeneration <gen>
+  powershell -ExecutionPolicy Bypass -File Register-ServeTask.ps1
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)][string]$WorkspaceUid,
-  [Parameter(Mandatory = $true)][string]$WorkspaceGeneration,
+  [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')][string]$WorkspaceUid,
+  [ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) -and $_ -eq $_.Trim() -and $_ -notmatch '[\x00-\x1f\x7f]' })][string]$WorkspaceGeneration,
   [string]$User = 'workspace',
   [string]$UserSid = '',
   [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent'),
+  [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
   [string]$ExtraServeArgs = '--capture-video --capture-audio --clipboard --input --resize'
 )
 
@@ -59,8 +62,52 @@ $exe = Join-Path $BinDir 'kw-agent.exe'
 if (-not (Test-Path $exe -PathType Leaf)) {
   throw "Agent binary missing: $exe (install the MSI first)"
 }
-$args = "serve --workspace-uid `"$WorkspaceUid`" --workspace-generation `"$WorkspaceGeneration`" --bind 0.0.0.0 --port 44787 $ExtraServeArgs"
-$action = New-ScheduledTaskAction -Execute $exe -Argument $args
+# Validate before touching either startup mechanism or its permissions.
+$checkArgs = @('identity-check', '--data-dir', $DataDir)
+if ($WorkspaceUid) { $checkArgs += @('--workspace-uid', $WorkspaceUid) }
+if ($WorkspaceGeneration) { $checkArgs += @('--workspace-generation', $WorkspaceGeneration) }
+$bindingJson = & $exe @checkArgs
+if ($LASTEXITCODE -ne 0) { throw 'Enrolled identity validation failed; startup registration was not changed' }
+$binding = ($bindingJson -join "`n") | ConvertFrom-Json
+if (-not (Test-Path -LiteralPath (Join-Path $DataDir 'public\binding.json'))) {
+  throw 'public/binding.json missing; start the enrolled daemon before registering desktop startup'
+}
+if ($ExtraServeArgs -match '(?i)--(?:workspace-uid|workspace-generation|data-dir)(?:\s|=|$)') {
+  throw 'ExtraServeArgs cannot override the enrolled identity or data directory'
+}
+if ($DataDir.Contains('"')) { throw 'DataDir cannot contain double quotes' }
+$launcher = Join-Path $BinDir 'Start-Serve.ps1'
+$sourceLauncher = Join-Path $PSScriptRoot 'Start-Serve.ps1'
+if (-not (Test-Path -LiteralPath $sourceLauncher)) { throw "Launcher missing: $sourceLauncher" }
+if ([IO.Path]::GetFullPath($sourceLauncher) -ne [IO.Path]::GetFullPath($launcher)) {
+  Copy-Item -LiteralPath $sourceLauncher -Destination $launcher -Force
+}
+
+# The user may traverse the protected data directory but cannot list/read its
+# private files. Only the public subdirectory grants inherited read access.
+$acl = Get-Acl -LiteralPath $DataDir
+$sid = New-Object Security.Principal.SecurityIdentifier($UserSid)
+[void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+  $sid, 'Traverse', 'None', 'None', 'Allow')))
+Set-Acl -LiteralPath $DataDir -AclObject $acl
+$publicDir = Join-Path $DataDir 'public'
+$acl = Get-Acl -LiteralPath $publicDir
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
+foreach ($accountSid in @('S-1-5-18', 'S-1-5-32-544')) {
+  $account = New-Object Security.Principal.SecurityIdentifier($accountSid)
+  [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+    $account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+}
+[void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+  $sid, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+Set-Acl -LiteralPath $publicDir -AclObject $acl
+[IO.File]::WriteAllText((Join-Path $publicDir 'serve-options.json'),
+  (@{ extraServeArgs = $ExtraServeArgs } | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+
+$powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$launchArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`" -DataDir `"$DataDir`""
+$action = New-ScheduledTaskAction -Execute $powershell -Argument $launchArgs
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $User
 $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive -RunLevel Limited
@@ -70,6 +117,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $UserSid -LogonType Interactive 
 Register-ScheduledTask -TaskName 'kw-agent-serve' -Action $action `
   -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Write-Output "logon task 'kw-agent-serve' registered for $User"
+Write-Output "desktop binding uses enrolled identity ($($binding.workspaceUid)); logs: %LOCALAPPDATA%\workspace-agent\serve*.log"
 
 function Set-ServeRunKey {
   # HKCU Run fallback for $User: Explorer starts serve in-session at logon
@@ -81,10 +129,10 @@ function Set-ServeRunKey {
   # primary mechanism.
   param([string]$Exe, [string]$ServeArgs, [string]$UserSid)
   $runName = 'kw-agent-serve'
-  $launch = "Start-Process '$Exe' -ArgumentList '$ServeArgs' -WindowStyle Hidden"
-  $runValue = "powershell.exe -WindowStyle Hidden -Command '$($launch -replace `"'`", `"''`")'"
+  $runValue = "`"$Exe`" $ServeArgs"
   $mounted = $false
   try {
+    if ($runValue.Length -gt 260) { throw 'Run command exceeds the Windows 260-character limit; use shorter BinDir/DataDir paths' }
     $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$UserSid'" -ErrorAction Stop |
       Where-Object { $_.LocalPath -and (Test-Path (Join-Path $_.LocalPath 'NTUSER.DAT') -PathType Leaf) } |
       Select-Object -First 1
@@ -109,4 +157,4 @@ function Set-ServeRunKey {
   }
 }
 
-Set-ServeRunKey -Exe $exe -ServeArgs $args -UserSid $UserSid
+Set-ServeRunKey -Exe $powershell -ServeArgs $launchArgs -UserSid $UserSid

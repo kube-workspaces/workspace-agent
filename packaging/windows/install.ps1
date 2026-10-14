@@ -32,8 +32,8 @@
   Skip the interactive logon serve task (control plane only).
 #>
 param(
-    [Parameter(Mandatory=$true)][string]$WorkspaceUid,
-    [Parameter(Mandatory=$true)][string]$WorkspaceGeneration,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')][string]$WorkspaceUid,
+    [Parameter(Mandatory=$true)][ValidateScript({ -not [string]::IsNullOrWhiteSpace($_) -and $_ -eq $_.Trim() -and $_ -notmatch '[\x00-\x1f\x7f]' })][string]$WorkspaceGeneration,
     [int]$TokenHours = 2,
     [string]$DataDir = (Join-Path $env:ProgramData 'workspace-agent'),
     [string]$BinDir = (Join-Path $env:ProgramFiles 'workspace-agent'),
@@ -45,6 +45,12 @@ $ErrorActionPreference = 'Stop'
 
 $exe = Join-Path $PSScriptRoot 'kw-agent.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw "kw-agent.exe not found next to install.ps1" }
+if ($WorkspaceGeneration.Contains('"') -or $DataDir.Contains('"')) { throw 'Generation and DataDir cannot contain double quotes' }
+if (Test-Path -LiteralPath (Join-Path $DataDir 'identity.json')) {
+    # Never silently reconfigure an enrolled machine for a mistyped binding.
+    & $exe identity-check --data-dir $DataDir --workspace-uid $WorkspaceUid --workspace-generation $WorkspaceGeneration | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Enrolled identity mismatch; installation was not changed' }
+}
 
 # Idempotent reinstall: stop a running previous version first (the task holds
 # the binary open while the daemon runs).
@@ -56,7 +62,10 @@ if (Get-ScheduledTask -TaskName 'workspace-agent' -ErrorAction SilentlyContinue)
     }
 }
 New-Item -ItemType Directory -Force -Path $BinDir, $DataDir | Out-Null
-Copy-Item -LiteralPath $exe -Destination (Join-Path $BinDir 'kw-agent.exe') -Force
+$destination = Join-Path $BinDir 'kw-agent.exe'
+if ([IO.Path]::GetFullPath($exe) -ne [IO.Path]::GetFullPath($destination)) {
+    Copy-Item -LiteralPath $exe -Destination $destination -Force
+}
 
 # Machine-protected data dir: SYSTEM + Administrators only, no inheritance.
 $acl = Get-Acl -LiteralPath $DataDir
@@ -109,7 +118,7 @@ if (-not $NoServeTask) {
     } else {
         try {
             & $serveScript -WorkspaceUid $WorkspaceUid -WorkspaceGeneration $WorkspaceGeneration `
-                -User $ServeUser -BinDir $BinDir -ExtraServeArgs $ExtraServeArgs
+                -User $ServeUser -BinDir $BinDir -DataDir $DataDir -ExtraServeArgs $ExtraServeArgs
         } catch {
             Write-Warning "interactive serve task not registered: $($_.Exception.Message)"
             Write-Warning "re-run install.ps1 (or Register-ServeTask.ps1) once '$ServeUser' exists"

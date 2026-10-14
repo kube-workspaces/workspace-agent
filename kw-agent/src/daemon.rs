@@ -22,6 +22,11 @@ pub struct Options {
 
 /// Run until killed (or `beats` reached). Returns the beat count.
 pub fn run(options: &Options) -> Result<u64, String> {
+    crate::binding::Binding {
+        workspace_uid: options.workspace_uid.clone(),
+        workspace_generation: options.workspace_generation.clone(),
+    }
+    .validate()?;
     let identity = enroll(
         &options.data_dir,
         &options.workspace_uid,
@@ -29,6 +34,15 @@ pub fn run(options: &Options) -> Result<u64, String> {
         now_secs(),
     )
     .map_err(|e| format!("enrollment failed: {e}"))?;
+    let binding = crate::binding::Binding {
+        workspace_uid: identity.workspace_uid.clone(),
+        workspace_generation: identity.workspace_generation.clone(),
+    };
+    binding.check(
+        Some(&options.workspace_uid),
+        Some(&options.workspace_generation),
+    )?;
+    crate::binding::publish(&options.data_dir, &binding)?;
     println!(
         "kw-agent daemon enrolled workspace={} generation={} key_bytes={}",
         identity.workspace_uid,

@@ -53,6 +53,13 @@ jobs:
           "$bin" --version
           "$bin" --version | grep -F "kw-agent 0.1.0"
 
+      - name: Windows desktop startup regression (PowerShell 5.1)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          ./packaging/windows/test-serve-registration.ps1 -AgentPath ./target/debug/kw-agent.exe
+          ./packaging/windows/test-serve-launcher.ps1
+
       # Windows runners have real inbox APIs: --hello must emit valid JSON,
       # the inbox H.264 MFT must encode synthetic frames, and WASAPI must
       # initialize (silence is an ok outcome).

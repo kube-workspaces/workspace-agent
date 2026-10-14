@@ -536,6 +536,9 @@ fn serve_control(
                 );
             }
             let decision = match ticket {
+                Ok(ref ticket) if ticket.workspace_uid != workspace_uid => {
+                    serde_json::json!({"admitted": false, "reason": "workspace-uid-mismatch"})
+                }
                 Ok(ticket) if ticket.workspace_generation == workspace_generation => {
                     match handshake.attach(message, &ticket, workspace_uid, now_ns) {
                         Ok(_) => serde_json::json!({"admitted": true}),
@@ -547,7 +550,9 @@ fn serve_control(
                         }
                     }
                 }
-                Ok(_) => serde_json::json!({"admitted": false, "reason": "wrong-generation"}),
+                Ok(_) => {
+                    serde_json::json!({"admitted": false, "reason": "workspace-generation-mismatch"})
+                }
                 Err(_) => serde_json::json!({"admitted": false, "reason": "malformed-ticket"}),
             };
             let reply = envelope(
@@ -798,6 +803,35 @@ mod tests {
         assert_eq!(outcome.resize_acks, 1);
         assert_eq!(outcome.keyframes_forwarded, 1);
         assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[test]
+    fn binding_mismatches_name_the_failed_field() {
+        for (field, reason) in [
+            ("workspaceUid", "workspace-uid-mismatch"),
+            ("workspaceGeneration", "workspace-generation-mismatch"),
+        ] {
+            let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+            let port = server.local_address().unwrap().port();
+            let handle = std::thread::spawn(|| run_server_once(server));
+            let mut client = connect(port);
+            let hello = read_envelope(&mut client);
+            let mut bad = test_ticket(&hello.session_id);
+            bad[field] = serde_json::json!("transcription-error");
+            send(
+                &control(
+                    &hello.session_id,
+                    "attach",
+                    2,
+                    serde_json::json!({"ticket": bad}),
+                ),
+                &mut client,
+            );
+            let result = read_envelope(&mut client);
+            assert_eq!(result.payload["admitted"], false);
+            assert_eq!(result.payload["reason"], reason);
+            assert_eq!(handle.join().unwrap().ended, "refused");
+        }
     }
 
     #[test]

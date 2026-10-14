@@ -93,10 +93,10 @@ if (-not (Test-Path $exe -PathType Leaf)) {
 # README.md/LICENSE stay out of the MSI (the archive and the image recipe own
 # them); anything else staged is a contract change, so warn before including.
 $payload = @("kw-agent.exe")
-foreach ($opt in @("install.ps1", "uninstall.ps1", "Register-ServeTask.ps1")) {
+foreach ($opt in @("install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1")) {
   if (Test-Path (Join-Path $staging $opt) -PathType Leaf) { $payload += $opt }
 }
-$known = @("kw-agent.exe", "install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "README.md", "LICENSE")
+$known = @("kw-agent.exe", "install.ps1", "uninstall.ps1", "Register-ServeTask.ps1", "Start-Serve.ps1", "README.md", "LICENSE")
 foreach ($item in Get-ChildItem $staging -File) {
   if ($known -notcontains $item.Name) {
     Write-Warning "Staging holds unexpected file '$($item.Name)'; including it in the MSI."

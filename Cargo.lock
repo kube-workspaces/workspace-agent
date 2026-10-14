@@ -35,6 +35,7 @@ dependencies = [
  "kw-platform",
  "kw-protocol",
  "kw-transport",
+ "serde",
  "serde_json",
 ]
 

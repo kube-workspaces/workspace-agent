@@ -37,6 +37,48 @@ not treat fixtures or CI green as guest acceptance.
 | `scripts/verify-release-archives.py` | Release archive contract check |
 | `packaging/windows/` | Unsigned MSI (WiX) build, verify and lifecycle test |
 
+## Windows desktop startup and identity
+
+`install.ps1 -WorkspaceUid <uid> -WorkspaceGeneration <generation>` enrolls
+the daemon. Workspace UIDs must use canonical UUID syntax; generation is an
+opaque, non-empty identifier. Reinstalling or registering startup with values
+that differ from enrollment fails before changing startup configuration.
+
+The daemon publishes only `workspaceUid` and `workspaceGeneration` to
+`%PROGRAMDATA%\workspace-agent\public\binding.json`. The desktop user has
+read-only access to that directory; the private key in `identity.json` and
+enrollment tokens remain restricted to SYSTEM and Administrators.
+
+Both the interactive logon task and Explorer Run fallback launch the same
+hidden `Start-Serve.ps1`, which runs `serve --data-dir <directory>` and reads
+the enrolled binding. They do not store separate copies of the UID or
+generation. Re-register an already enrolled guest from elevated PowerShell:
+
+```powershell
+cd 'C:\Program Files\workspace-agent'
+.\Register-ServeTask.ps1
+```
+
+Use `-DataDir` for a custom enrollment directory. Start the upgraded daemon
+first so it publishes `public\binding.json`. Optional `-WorkspaceUid` and
+`-WorkspaceGeneration` arguments assert enrollment matches; they cannot
+override it. Standalone, unenrolled protocol diagnostics can still pass both
+binding flags directly to `serve`.
+
+Troubleshooting (no private key is printed):
+
+```powershell
+# Elevated: validate enrollment, its public projection and optional expected values.
+.\kw-agent.exe identity-check
+.\kw-agent.exe identity-check --workspace-uid <expected-uid> --workspace-generation <expected-generation>
+# Interactive desktop user's logs (current and previous launch).
+Get-Content "$env:LOCALAPPDATA\workspace-agent\serve*.log*"
+```
+
+The launcher retains one previous set of logs. Attach refusals explicitly
+identify `workspace-uid-mismatch` and `workspace-generation-mismatch`; a daemon
+heartbeat alone does not establish desktop-serving readiness.
+
 ## Windows output selection
 
 Run `kw-agent --hello` in the interactive console session to enumerate actual

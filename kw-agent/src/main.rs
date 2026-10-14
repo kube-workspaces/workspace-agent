@@ -8,6 +8,7 @@
 //! operations.
 
 mod audio;
+mod binding;
 mod capture;
 mod daemon;
 mod platform;
@@ -29,7 +30,8 @@ fn usage(code: i32) -> ! {
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
     eprintln!("  kw-agent status [--data-dir DIR] [--max-beat-age-secs N]");
-    eprintln!("  kw-agent serve --workspace-uid UID --workspace-generation GEN [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
+    eprintln!("  kw-agent identity-check [--data-dir DIR] [--workspace-uid UID] [--workspace-generation GEN] (administrator; prints no private key)");
+    eprintln!("  kw-agent serve [--data-dir DIR] [--workspace-uid UID --workspace-generation GEN] [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
     );
@@ -121,6 +123,40 @@ fn main() {
                 }
             }
         }
+        Some("identity-check") => {
+            let data_dir = flag_value(&args, "--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon::default_data_dir);
+            let result = (|| {
+                let enrolled = binding::enrolled(&data_dir)?;
+                enrolled.check(
+                    flag_value(&args, "--workspace-uid").as_deref(),
+                    flag_value(&args, "--workspace-generation").as_deref(),
+                )?;
+                let public = binding::read(&data_dir)?;
+                if let Some(ref public) = public {
+                    enrolled
+                        .check(
+                            Some(&public.workspace_uid),
+                            Some(&public.workspace_generation),
+                        )
+                        .map_err(|error| format!("public binding: {error}"))?;
+                }
+                serde_json::to_string(&serde_json::json!({
+                    "workspaceUid": enrolled.workspace_uid,
+                    "workspaceGeneration": enrolled.workspace_generation,
+                    "publicBindingPresent": public.is_some(),
+                }))
+                .map_err(|error| error.to_string())
+            })();
+            match result {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("identity-check: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("status") => {
             // Read-only Layer 4 indicator: never writes, never enrolls,
             // never prints key material (status.json holds none).
@@ -181,6 +217,18 @@ fn main() {
             }
         }
         Some("serve") => {
+            let data_dir = flag_value(&args, "--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon::default_data_dir);
+            let binding = binding::resolve(
+                &data_dir,
+                flag_value(&args, "--workspace-uid").as_deref(),
+                flag_value(&args, "--workspace-generation").as_deref(),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("serve: {error}");
+                std::process::exit(2);
+            });
             let capture_output_index = flag_value(&args, "--capture-output")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
@@ -198,15 +246,6 @@ fn main() {
             } else {
                 None
             };
-            let workspace_uid = flag_value(&args, "--workspace-uid").unwrap_or_else(|| {
-                eprintln!("serve: --workspace-uid is required");
-                usage(2);
-            });
-            let workspace_generation =
-                flag_value(&args, "--workspace-generation").unwrap_or_else(|| {
-                    eprintln!("serve: --workspace-generation is required");
-                    usage(2);
-                });
             let port: u16 = flag_value(&args, "--port")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
@@ -222,8 +261,8 @@ fn main() {
             let bind = flag_value(&args, "--bind").unwrap_or_else(|| "127.0.0.1".into());
             let server = kw_transport::Server::bind(
                 (bind.as_str(), port),
-                workspace_uid,
-                workspace_generation,
+                binding.workspace_uid,
+                binding.workspace_generation,
             )
             .unwrap_or_else(|error| {
                 eprintln!("serve: bind failed: {error}");
