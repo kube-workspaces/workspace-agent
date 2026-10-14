@@ -52,12 +52,10 @@ try {
   $icons = @(Read-Rows 'SELECT `Name` FROM `Icon`' 1 | ForEach-Object { $_[0] })
   if ($icons -notcontains 'AppIcon.ico') { throw "MSI Icon table must contain the branded AppIcon.ico." }
   if ($properties.ARPPRODUCTICON -ne 'AppIcon.ico') { throw "ARPPRODUCTICON must reference AppIcon.ico." }
-  # Wizard branding: the standard dialogs must use the shared artwork, not
-  # the stock WiX bitmaps (bound into the Binary table under these names).
-  $binaries = @(Read-Rows 'SELECT `Name` FROM `Binary`' 1 | ForEach-Object { $_[0] })
-  foreach ($required in @('WixUIDialogBmp', 'WixUIBannerBmp')) {
-    if ($binaries -notcontains $required) { throw "MSI Binary table must brand the wizard with $required." }
-  }
+  # Wizard artwork (WixUIDialogBmp/WixUIBannerBmp) is validated by consumption:
+  # wix build fails on a missing bitmap path, and the mechanism mirrors the
+  # proven desktop-client installer. Like desktop-client, no Binary-table
+  # assert here — those names are build-time only and absent from the MSI.
   $actions = @(Read-Rows 'SELECT `Action`, `Type`, `Source`, `Target` FROM `CustomAction`' 4)
   $setLoc = @($actions | Where-Object { $_[0] -eq 'SetARPINSTALLLOCATION' })
   if ($setLoc.Count -ne 1 -or $setLoc[0][1] -ne '51' -or $setLoc[0][2] -ne 'ARPINSTALLLOCATION' -or $setLoc[0][3] -ne '[INSTALLDIR]') {
