@@ -12,6 +12,12 @@ pub struct Request {
 #[derive(Default)]
 pub struct Bridge(pub Mutex<Option<mpsc::SyncSender<Request>>>);
 
+/// One-time grace extension for a slow encoder warmup. When the first
+/// confirmation deadline passes with frames flowing but no keyframe yet,
+/// capture pulses force-IDR once and extends by this long instead of
+/// NACKing immediately. The control-side reply wait covers budget + grace.
+pub const IDR_GRACE_SECS: u64 = 8;
+
 /// Seconds budgeted for a mode change plus encoder rebuild plus delivered
 /// IDR, scaled by frame area. 8s covers 1080p and below (observed ~3s
 /// round trips); 4K software-encoder warmup measured 6.6s and timed out
@@ -53,7 +59,7 @@ impl kw_transport::Resize for Bridge {
                 mpsc::TrySendError::Disconnected(_) => "display-capture-unavailable",
             })?;
         result
-            .recv_timeout(budget + Duration::from_secs(2))
+            .recv_timeout(budget + Duration::from_secs(IDR_GRACE_SECS + 2))
             .map_err(|_| "display-resize-timeout".to_owned())?
     }
 }

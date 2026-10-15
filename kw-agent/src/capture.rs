@@ -171,6 +171,12 @@ pub fn run(
     let mut next_tick = anchor;
     let mut last_frame = None;
     let mut pending_resize: Option<(crate::resize::Request, kw_platform::display::Size)> = None;
+    // One-time grace per pending resize: a slow encoder warmup (large
+    // software modes) can miss the first confirmation deadline with frames
+    // flowing but no keyframe emitted yet. Extend once with a fresh
+    // force-IDR pulse before NACKing; a truly wedged encoder still fails,
+    // just ~IDR_GRACE_SECS later.
+    let mut resize_grace_used = false;
     loop {
         if gate.ended.load(Ordering::SeqCst) {
             break;
@@ -179,6 +185,7 @@ pub fn run(
         // desktop, then build a fresh duplicator + encoder before resuming.
         if duplicator.is_none() {
             if let Some((request, _)) = pending_resize.take() {
+                resize_grace_used = false;
                 let _ = request
                     .reply
                     .send(Err("display-desktop-unavailable".into()));
@@ -211,7 +218,15 @@ pub fn run(
             .as_ref()
             .is_some_and(|(request, _)| Instant::now() >= request.deadline)
         {
-            if let Some((request, _)) = pending_resize.take() {
+            if !resize_grace_used {
+                resize_grace_used = true;
+                if let Some((request, _)) = pending_resize.as_mut() {
+                    request.deadline =
+                        Instant::now() + Duration::from_secs(crate::resize::IDR_GRACE_SECS);
+                }
+                gate.force_idr.store(true, Ordering::SeqCst);
+                eprintln!("capture: resize confirmation slow, extended with fresh IDR pulse");
+            } else if let Some((request, _)) = pending_resize.take() {
                 let _ = request.reply.send(Err("display-idr-timeout".into()));
             }
         }
@@ -286,6 +301,7 @@ pub fn run(
                 match changed {
                     Ok(actual) => {
                         pending_resize = Some((request, actual));
+                        resize_grace_used = false;
                         gate.force_idr.store(true, Ordering::SeqCst);
                     }
                     Err(reason) => {
@@ -315,6 +331,7 @@ pub fn run(
                 encoder = None;
                 last_frame = None;
                 if let Some((request, _)) = pending_resize.take() {
+                    resize_grace_used = false;
                     let _ = request
                         .reply
                         .send(Err("display-desktop-unavailable".into()));
