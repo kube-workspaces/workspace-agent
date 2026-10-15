@@ -14,6 +14,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod display;
 pub mod input;
+pub mod input_desktop;
 
 use serde::{Deserialize, Serialize};
 

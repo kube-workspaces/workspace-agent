@@ -30,6 +30,19 @@ pub fn pad16(value: u32) -> u32 {
     value.next_multiple_of(16)
 }
 
+/// Runtime desktop transitions can temporarily deny duplication. Initial
+/// capture setup still fails fast; an established stream may wait for access.
+pub fn recoverable(error: &super::Error) -> bool {
+    matches!(
+        error,
+        super::Error::SessionLost(_)
+            | super::Error::Empty
+            | super::Error::Os(
+                0x80070005 | 0x887a0026 | 0x887a0028 | 0x887a0022 | 0x887a0005 | 0x887a0007
+            )
+    )
+}
+
 /// BGRA (byte order B,G,R,A per pixel, `stride` bytes per row) → NV12 with
 /// black padding to the mod-16 grid. Integer BT.601; chroma is 2x2-box
 /// averaged. Pure function: unit-tested on every platform.

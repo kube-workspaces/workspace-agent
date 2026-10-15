@@ -53,6 +53,9 @@ pub struct MediaGate {
     /// True desktop dimensions, excluding encoder macroblock padding.
     pub capture_width: AtomicU32,
     pub capture_height: AtomicU32,
+    /// Hardware access paused during a desktop switch; not a transport failure.
+    pub capture_suspended: AtomicBool,
+    pub capture_recoveries: AtomicU64,
     /// Set on successful attach; the writer thread idles before this.
     pub admitted: AtomicBool,
     /// Set by keyframe_request; the encoder consumes it into one forced IDR.
@@ -805,7 +808,9 @@ fn serve_control(
                     "inputEvents": outcome.input_events, "inputDropped": outcome.input_dropped,
                     "resizeAcks": outcome.resize_acks,
                     "inputAvailable": input.is_some(), "resizeAvailable": resize.is_some(),
-                    "session": input.map(|backend| backend.status()),
+                    "session": input.map(|backend| serde_json::json!({ "desktop": backend.status() })),
+                    "captureSuspended": gate.map(|gate| gate.capture_suspended.load(Ordering::SeqCst)),
+                    "captureRecoveries": gate.map(|gate| gate.capture_recoveries.load(Ordering::SeqCst)),
                 }),
             );
             *sequence += 1;

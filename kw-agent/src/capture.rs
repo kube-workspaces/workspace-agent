@@ -18,11 +18,37 @@ pub fn open_output(
     output_index: u32,
     name: Option<&str>,
 ) -> Result<kw_platform::capture::Duplicator, String> {
+    open_output_raw(output_index, name)
+        .map_err(|error| format!("console capture unavailable: {error}"))
+}
+
+fn open_output_raw(
+    output_index: u32,
+    name: Option<&str>,
+) -> Result<kw_platform::capture::Duplicator, kw_platform::Error> {
     match name {
         Some(name) => kw_platform::capture::Duplicator::new_named(name),
         None => kw_platform::capture::Duplicator::new(output_index),
     }
-    .map_err(|error| format!("console capture unavailable: {error}"))
+}
+
+/// Keep the admitted transport alive while Windows owns the secure desktop.
+/// Polling is bounded and cancellable, including repeated access-denied errors.
+fn reopen<T>(
+    ended: &std::sync::atomic::AtomicBool,
+    delay: Duration,
+    mut open: impl FnMut() -> Result<T, kw_platform::Error>,
+) -> Result<Option<T>, kw_platform::Error> {
+    loop {
+        if ended.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        match open() {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if kw_platform::capture::recoverable(&error) => std::thread::sleep(delay),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Capture thread body: open, acquire → encode → feed until the session
@@ -197,29 +223,53 @@ pub fn run(
             // reuse the last real capture at the bounded DXGI timeout cadence.
             Ok(None) if last_frame.is_some() => {}
             Ok(None) => continue,
-            Err(kw_platform::Error::SessionLost(_)) => {
-                eprintln!("capture: session lost, rebuilding duplicator");
+            Err(error) if kw_platform::capture::recoverable(&error) => {
+                eprintln!("capture: desktop temporarily unavailable ({error}); waiting to recover");
+                gate.capture_suspended.store(true, Ordering::SeqCst);
                 let _ = duplicator.take();
-                match open_output(output_index, output_name.as_deref()) {
-                    Ok(fresh) => {
+                last_frame = None;
+                if let Some((request, _)) = pending_resize.take() {
+                    let _ = request
+                        .reply
+                        .send(Err("display-desktop-unavailable".into()));
+                }
+                match reopen(&gate.ended, Duration::from_millis(250), || {
+                    // Reject resize promptly while capture is suspended rather
+                    // than leaving the control thread blocked on a dead owner.
+                    while let Ok(request) = resize.try_recv() {
+                        let _ = request
+                            .reply
+                            .send(Err("display-desktop-unavailable".into()));
+                    }
+                    open_output_raw(output_index, output_name.as_deref())
+                }) {
+                    Ok(Some(fresh)) => {
+                        gate.capture_width.store(fresh.size().0, Ordering::SeqCst);
+                        gate.capture_height.store(fresh.size().1, Ordering::SeqCst);
                         duplicator = Some(fresh);
-                        last_frame = None;
                         let (w, h) = duplicator.as_ref().expect("rebuilt output").padded_size();
-                        if w != encoder.settings().width || h != encoder.settings().height {
-                            if let Err(error) = encoder.reconfigure(&kw_encode::Settings {
-                                width: w,
-                                height: h,
-                                fps,
-                                bitrate_bps,
-                                max_keyframe_spacing: 60,
-                            }) {
-                                eprintln!("capture: reconfigure failed: {error}");
+                        // Recreate even at the same size: old buffered GOP
+                        // references must not survive a desktop access loss.
+                        match kw_encode::StreamEncoder::new(&kw_encode::Settings {
+                            width: w,
+                            height: h,
+                            fps,
+                            bitrate_bps,
+                            max_keyframe_spacing: 60,
+                        }) {
+                            Ok(fresh) => encoder = fresh,
+                            Err(error) => {
+                                eprintln!("capture: recovery encoder failed: {error}");
                                 return;
                             }
                         }
+                        next_tick = Instant::now();
+                        gate.capture_recoveries.fetch_add(1, Ordering::SeqCst);
                         gate.force_idr.store(true, Ordering::SeqCst);
+                        eprintln!("capture: normal desktop access restored");
                         continue;
                     }
+                    Ok(None) => return,
                     Err(error) => {
                         eprintln!("capture: rebuild failed: {error}");
                         return;
@@ -232,6 +282,7 @@ pub fn run(
             }
         }
         let frame = last_frame.as_ref().expect("real capture before encoding");
+        gate.capture_suspended.store(false, Ordering::SeqCst);
         // Pacing: present-driven would burst on activity; cadence keeps the
         // encoder (and viewers) at the negotiated frame rate.
         next_tick += cadence;
@@ -297,5 +348,41 @@ pub fn run(
                 written: None,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    #[test]
+    fn repeated_secure_desktop_denials_do_not_end_capture() {
+        let ended = AtomicBool::new(false);
+        let mut attempts = 0;
+        let restored = reopen(&ended, Duration::ZERO, || {
+            attempts += 1;
+            if attempts < 4 {
+                Err(kw_platform::Error::Os(0x80070005))
+            } else {
+                Ok("fresh-desktop")
+            }
+        })
+        .unwrap();
+        assert_eq!(restored, Some("fresh-desktop"));
+        assert_eq!(attempts, 4);
+    }
+    #[test]
+    fn desktop_wait_is_cancellable_and_fatal_errors_stay_fatal() {
+        let ended = AtomicBool::new(false);
+        let cancelled = reopen::<()>(&ended, Duration::ZERO, || {
+            ended.store(true, Ordering::SeqCst);
+            Err(kw_platform::Error::Os(0x80070005))
+        })
+        .unwrap();
+        assert!(cancelled.is_none());
+        let fatal = reopen::<()>(&AtomicBool::new(false), Duration::ZERO, || {
+            Err(kw_platform::Error::Os(0x80070057))
+        });
+        assert_eq!(fatal.unwrap_err(), kw_platform::Error::Os(0x80070057));
     }
 }

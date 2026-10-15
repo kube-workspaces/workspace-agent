@@ -403,9 +403,11 @@ fn main() {
                     }
                     fn status(&self) -> serde_json::Value {
                         let state = kw_platform::input::session_state();
+                        let desktop = kw_platform::input_desktop::status();
                         serde_json::json!({"processSession": state.current,
                             "activeConsoleSession": state.active_console,
-                            "canInject": state.can_inject()})
+                            "canInject": state.can_inject() && !desktop.requires_console,
+                            "desktop": desktop})
                     }
                 }
                 println!("input injection enabled (session {:?})", state.current);
