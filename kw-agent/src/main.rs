@@ -13,6 +13,10 @@ mod capture;
 mod daemon;
 mod platform;
 mod resize;
+// Retirement targets Windows startup artifacts; on other platforms only the
+// file-cleanup logic is exercised (by tests), so allow unused there.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod retire;
 #[cfg(windows)]
 mod service;
 mod service_config;
@@ -20,6 +24,12 @@ mod status;
 mod synthetic;
 #[cfg(windows)]
 mod windows_runtime;
+
+/// `serve` exit code when the configured port is already bound. The native
+/// service supervisor distinguishes this from a generic crash so a competing
+/// listener (e.g. a legacy per-logon worker) is surfaced, not masked as a
+/// restart storm.
+const EXIT_BIND_IN_USE: i32 = 75;
 
 fn usage(code: i32) -> ! {
     eprintln!(
@@ -37,6 +47,7 @@ fn usage(code: i32) -> ! {
     eprintln!("  kw-agent status [--data-dir DIR] [--max-beat-age-secs N]");
     eprintln!("  kw-agent service (Windows SCM only; automatic machine service)");
     eprintln!("  kw-agent service-config-check [--data-dir DIR]");
+    eprintln!("  kw-agent retire-legacy-startup (Windows; removes pre-service scheduled task, Run value and leftover launcher)");
     eprintln!("  kw-agent identity-check [--data-dir DIR] [--workspace-uid UID] [--workspace-generation GEN] (administrator; prints no private key)");
     eprintln!("  kw-agent serve [--data-dir DIR] [--workspace-uid UID --workspace-generation GEN] [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
@@ -45,6 +56,37 @@ fn usage(code: i32) -> ! {
     eprintln!("  kw-agent encode-test [--width W] [--height H] [--frames N] [--bitrate-bps B]");
     eprintln!("  kw-agent audio-test [--seconds N] [--require-endpoint]");
     std::process::exit(code);
+}
+
+/// Remove pre-native-service startup (scheduled task, HKCU Run value, leftover
+/// launcher) next to this executable. Idempotent; reports each action. Shared
+/// by the MSI `service-configure` operation and the operator subcommand.
+#[cfg(windows)]
+fn retire_legacy_startup() {
+    let bin_dir = match std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        Some(dir) => dir,
+        None => {
+            eprintln!("legacy startup retirement: cannot resolve install directory");
+            std::process::exit(1);
+        }
+    };
+    match retire::legacy_startup(&bin_dir) {
+        Ok(actions) => {
+            if actions.is_empty() {
+                println!("legacy startup: nothing to retire");
+            }
+            for action in actions {
+                println!("legacy startup: {action}");
+            }
+        }
+        Err(error) => {
+            eprintln!("legacy startup retirement: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -98,7 +140,19 @@ fn main() {
                 eprintln!("SCM configuration: {error}");
                 std::process::exit(1);
             }
+            // Retire legacy startup only for the production service: an
+            // isolated test instance (--service-name) must not touch the real
+            // machine's tasks/Run values. The MSI runs this as a deferred
+            // SYSTEM custom action on every install/upgrade, so an MSI-only
+            // update removes orphaned startup that would otherwise compete
+            // with the native worker for the serve port.
+            let name = flag_value(&args, "--service-name").unwrap_or_else(|| service::NAME.into());
+            if name == service::NAME {
+                retire_legacy_startup();
+            }
         }
+        #[cfg(windows)]
+        Some("retire-legacy-startup") => retire_legacy_startup(),
         #[cfg(windows)]
         Some("service") => {
             if let Err(error) = service::dispatch() {
@@ -330,6 +384,10 @@ fn main() {
                 binding.workspace_generation,
             )
             .unwrap_or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AddrInUse {
+                    eprintln!("serve: port {port} already in use: {error}");
+                    std::process::exit(EXIT_BIND_IN_USE);
+                }
                 eprintln!("serve: bind failed: {error}");
                 std::process::exit(1);
             });
@@ -530,12 +588,22 @@ fn main() {
                 );
                 // Fail fast on console visibility (not on pixels: the screen
                 // may legitimately be static at startup).
+                // A temporarily denied desktop (Windows owns the secure
+                // desktop while a UAC prompt is up) is recoverable: the
+                // capture thread serves suspended and recovers. Only a
+                // genuinely unusable desktop fails fast.
                 println!("selected output {:?}", capture_output_name);
-                if let Err(error) =
-                    capture::open_output(capture_output, capture_output_name.as_deref())
-                {
-                    eprintln!("serve: {error}");
-                    std::process::exit(2);
+                match capture::open_output(capture_output, capture_output_name.as_deref()) {
+                    Ok(_) => {}
+                    Err(error) if kw_platform::capture::recoverable(&error) => {
+                        eprintln!(
+                            "serve: console temporarily unavailable ({error}); starting suspended"
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("serve: console capture unavailable: {error}");
+                        std::process::exit(2);
+                    }
                 }
             }
             if capture_audio {

@@ -197,6 +197,9 @@ fn run(
     let mut previous_config = None;
     let mut last_status = String::new();
     let mut last_status_at: Option<Instant> = None;
+    // Last worker failure worth surfacing; cleared only after a worker has run
+    // long enough to have bound and served, never merely because it was spawned.
+    let mut worker_error: Option<&'static str> = None;
     loop {
         if identity.is_none() {
             match crate::daemon::initialize(dir) {
@@ -238,9 +241,24 @@ fn run(
             if child.started.elapsed() >= Duration::from_secs(60) {
                 retry.reset();
             }
-            eprintln!("worker exited; bounded restart scheduled");
+            if child.exit_code() == Some(crate::EXIT_BIND_IN_USE as u32) {
+                eprintln!(
+                    "worker exited: serve port already in use; another process is holding the configured port"
+                );
+                worker_error = Some("port-in-use");
+            } else {
+                eprintln!("worker exited; bounded restart scheduled");
+                worker_error = None;
+            }
             drop(child);
             retry.failed(origin.elapsed().as_secs());
+        } else if worker
+            .as_ref()
+            .is_some_and(|child| child.started.elapsed() >= Duration::from_secs(5))
+        {
+            // Only a worker that has survived long enough to have bound the
+            // port clears the error; a brief spawn is not evidence of health.
+            worker_error = None;
         }
         if worker.is_none() && retry.ready(origin.elapsed().as_secs()) {
             if let (Some(session), Ok(config)) = (target, &config) {
@@ -262,6 +280,8 @@ fn run(
             "awaiting-enrollment"
         } else if config.is_err() {
             "configuration-error"
+        } else if worker_error == Some("port-in-use") && worker.is_none() {
+            "port-in-use"
         } else if worker.is_some() {
             "worker-process-running"
         } else if target.is_some() {
@@ -269,7 +289,7 @@ fn run(
         } else {
             "no-console-worker"
         };
-        let mut snapshot = serde_json::json!({"schemaVersion":1,"serviceState":"running","state":state,"workerEnabled":config.as_ref().ok().map(|c| c.worker_enabled),"workerPid":worker.as_ref().map(|w| w.pid),"consoleSession":target,"mediaReady":null,"configurationError":config.as_ref().err(),"enrollmentError":enrollment_error});
+        let mut snapshot = serde_json::json!({"schemaVersion":1,"serviceState":"running","state":state,"workerEnabled":config.as_ref().ok().map(|c| c.worker_enabled),"workerPid":worker.as_ref().map(|w| w.pid),"consoleSession":target,"mediaReady":null,"workerError":worker_error,"configurationError":config.as_ref().err(),"enrollmentError":enrollment_error});
         // Status is machine-authored. Process liveness is never labeled as media readiness.
         let text = snapshot.to_string();
         if text != last_status

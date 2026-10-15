@@ -61,6 +61,7 @@ jobs:
           ./packaging/windows/test-serve-launcher.ps1
           ./packaging/windows/test-native-service.ps1 -AgentPath ./target/debug/kw-agent.exe
           ./packaging/windows/test-legacy-migration.ps1
+          ./packaging/windows/test-legacy-retirement.ps1 -AgentPath ./target/debug/kw-agent.exe
 
       # Windows runners have real inbox APIs: --hello must emit valid JSON,
       # the inbox H.264 MFT must encode synthetic frames, and WASAPI must

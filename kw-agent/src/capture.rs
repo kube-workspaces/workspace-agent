@@ -11,24 +11,60 @@ use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-/// Open the console output now (fail-fast): a serve that cannot see the
-/// desktop must not sit listening until the first viewer discovers it.
-/// Returns the desktop size for encoder configuration.
+/// Open the console output. Returns the typed platform error so callers can
+/// tell a genuinely unusable desktop (no outputs, non-Windows) apart from one
+/// that is merely *temporarily* unavailable — Windows owns the secure desktop
+/// while a UAC prompt is up — and recover instead of aborting the session.
 pub fn open_output(
-    output_index: u32,
-    name: Option<&str>,
-) -> Result<kw_platform::capture::Duplicator, String> {
-    open_output_raw(output_index, name)
-        .map_err(|error| format!("console capture unavailable: {error}"))
-}
-
-fn open_output_raw(
     output_index: u32,
     name: Option<&str>,
 ) -> Result<kw_platform::capture::Duplicator, kw_platform::Error> {
     match name {
         Some(name) => kw_platform::capture::Duplicator::new_named(name),
         None => kw_platform::capture::Duplicator::new(output_index),
+    }
+}
+
+/// Build a fresh duplicator + encoder for the current desktop, waiting out a
+/// temporary loss (secure desktop) instead of ending the capture thread.
+/// `Ok(None)` means the session ended while waiting.
+fn attempt_establish(
+    output_index: u32,
+    output_name: Option<&str>,
+    fps: u32,
+    bitrate_bps: u32,
+    gate: &MediaGate,
+    resize: &mpsc::Receiver<crate::resize::Request>,
+) -> Result<Option<(kw_platform::capture::Duplicator, kw_encode::StreamEncoder)>, String> {
+    match reopen(&gate.ended, Duration::from_millis(250), || {
+        // Reject resize promptly while capture is suspended rather than
+        // leaving the control thread blocked on a dead owner.
+        while let Ok(request) = resize.try_recv() {
+            let _ = request
+                .reply
+                .send(Err("display-desktop-unavailable".into()));
+        }
+        open_output(output_index, output_name)
+    }) {
+        Ok(Some(fresh)) => {
+            gate.capture_width.store(fresh.size().0, Ordering::SeqCst);
+            gate.capture_height.store(fresh.size().1, Ordering::SeqCst);
+            let (width, height) = fresh.padded_size();
+            // Recreate even at the same size: old buffered GOP references
+            // must not survive a desktop access loss.
+            match kw_encode::StreamEncoder::new(&kw_encode::Settings {
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                max_keyframe_spacing: 60,
+            }) {
+                Ok(encoder) => Ok(Some((fresh, encoder))),
+                Err(error) => Err(format!("capture recovery encoder failed: {error}")),
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(format!("console capture rebuild failed: {error}")),
     }
 }
 
@@ -53,9 +89,10 @@ fn reopen<T>(
 
 /// Capture thread body: open, acquire → encode → feed until the session
 /// ends. The duplicator opens per session (fresh mode read every time);
-/// construction failure reports through `ready` so serve exits loudly
-/// instead of serving a blind session. Timestamps come from the shared
-/// session `anchor` (one clock for audio + video).
+/// a genuinely unusable desktop reports through `ready` so serve exits
+/// loudly instead of serving a blind session, while a temporary denial
+/// (secure desktop) starts suspended and recovers. Timestamps come from the
+/// shared session `anchor` (one clock for audio + video).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     output_index: u32,
@@ -70,37 +107,48 @@ pub fn run(
     resize: mpsc::Receiver<crate::resize::Request>,
 ) {
     let fps = fps.max(1);
-    let mut duplicator = Some(match open_output(output_index, output_name.as_deref()) {
-        Ok(duplicator) => duplicator,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
+    // Open now when the desktop is reachable. A *temporary* denial — Windows
+    // owns the secure desktop while a UAC prompt is up — must not end the
+    // session: start with capture suspended, report readiness, and recover in
+    // the loop once access returns. A genuinely unusable desktop (no outputs,
+    // non-Windows) still fails readiness loudly rather than serving blind.
+    let (mut duplicator, mut encoder) = match open_output(output_index, output_name.as_deref()) {
+        Ok(duplicator) => {
+            let settings = kw_encode::Settings {
+                width: duplicator.padded_size().0,
+                height: duplicator.padded_size().1,
+                fps,
+                bitrate_bps,
+                max_keyframe_spacing: 60,
+            };
+            match kw_encode::StreamEncoder::new(&settings) {
+                Ok(encoder) => (Some(duplicator), Some(encoder)),
+                Err(error) => {
+                    let _ = ready.send(Err(format!("capture encoder unavailable: {error}")));
+                    return;
+                }
+            }
         }
-    });
-    gate.capture_width.store(
-        duplicator.as_ref().expect("opened output").size().0,
-        Ordering::SeqCst,
-    );
-    gate.capture_height.store(
-        duplicator.as_ref().expect("opened output").size().1,
-        Ordering::SeqCst,
-    );
-    let mut encoder = match kw_encode::StreamEncoder::new(&kw_encode::Settings {
-        width: duplicator.as_ref().expect("opened output").padded_size().0,
-        height: duplicator.as_ref().expect("opened output").padded_size().1,
-        fps,
-        bitrate_bps,
-        max_keyframe_spacing: 60,
-    }) {
-        Ok(encoder) => {
-            let _ = ready.send(Ok(()));
-            encoder
+        Err(error) if kw_platform::capture::recoverable(&error) => {
+            eprintln!(
+                "capture: console temporarily unavailable at startup ({error}); \
+                     serving suspended until access returns"
+            );
+            gate.capture_suspended.store(true, Ordering::SeqCst);
+            (None, None)
         }
         Err(error) => {
-            let _ = ready.send(Err(format!("capture encoder unavailable: {error}")));
+            let _ = ready.send(Err(format!("console capture unavailable: {error}")));
             return;
         }
     };
+    if let Some(duplicator) = duplicator.as_ref() {
+        gate.capture_width
+            .store(duplicator.size().0, Ordering::SeqCst);
+        gate.capture_height
+            .store(duplicator.size().1, Ordering::SeqCst);
+    }
+    let _ = ready.send(Ok(()));
     // Wait for admission: no anonymous bytes before the ticket gate.
     while !gate.admitted.load(Ordering::SeqCst) {
         if gate.ended.load(Ordering::SeqCst) {
@@ -123,6 +171,38 @@ pub fn run(
     loop {
         if gate.ended.load(Ordering::SeqCst) {
             break;
+        }
+        // Suspended (never established, or access lost): wait out the secure
+        // desktop, then build a fresh duplicator + encoder before resuming.
+        if duplicator.is_none() {
+            if let Some((request, _)) = pending_resize.take() {
+                let _ = request
+                    .reply
+                    .send(Err("display-desktop-unavailable".into()));
+            }
+            match attempt_establish(
+                output_index,
+                output_name.as_deref(),
+                fps,
+                bitrate_bps,
+                &gate,
+                &resize,
+            ) {
+                Ok(Some((fresh, fresh_encoder))) => {
+                    duplicator = Some(fresh);
+                    encoder = Some(fresh_encoder);
+                    last_frame = None;
+                    next_tick = Instant::now();
+                    gate.capture_recoveries.fetch_add(1, Ordering::SeqCst);
+                    gate.force_idr.store(true, Ordering::SeqCst);
+                    eprintln!("capture: normal desktop access restored");
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("capture: {error}");
+                    return;
+                }
+            }
         }
         if pending_resize
             .as_ref()
@@ -174,7 +254,9 @@ pub fn run(
                     let fresh = loop {
                         match open_output(output_index, output_name.as_deref()) {
                             Ok(fresh) => break fresh,
-                            Err(error) if Instant::now() >= request.deadline => return Err(error),
+                            Err(error) if Instant::now() >= request.deadline => {
+                                return Err(error.to_string())
+                            }
                             Err(_) => std::thread::sleep(Duration::from_millis(50)),
                         }
                     };
@@ -193,7 +275,7 @@ pub fn run(
                             })
                             .map_err(|error| format!("display-encoder-reconfigure:{error}"))?;
                     }
-                    encoder = prepared;
+                    encoder = Some(prepared);
                     duplicator = Some(fresh);
                     last_frame = None;
                     Ok(actual)
@@ -227,54 +309,16 @@ pub fn run(
                 eprintln!("capture: desktop temporarily unavailable ({error}); waiting to recover");
                 gate.capture_suspended.store(true, Ordering::SeqCst);
                 let _ = duplicator.take();
+                encoder = None;
                 last_frame = None;
                 if let Some((request, _)) = pending_resize.take() {
                     let _ = request
                         .reply
                         .send(Err("display-desktop-unavailable".into()));
                 }
-                match reopen(&gate.ended, Duration::from_millis(250), || {
-                    // Reject resize promptly while capture is suspended rather
-                    // than leaving the control thread blocked on a dead owner.
-                    while let Ok(request) = resize.try_recv() {
-                        let _ = request
-                            .reply
-                            .send(Err("display-desktop-unavailable".into()));
-                    }
-                    open_output_raw(output_index, output_name.as_deref())
-                }) {
-                    Ok(Some(fresh)) => {
-                        gate.capture_width.store(fresh.size().0, Ordering::SeqCst);
-                        gate.capture_height.store(fresh.size().1, Ordering::SeqCst);
-                        duplicator = Some(fresh);
-                        let (w, h) = duplicator.as_ref().expect("rebuilt output").padded_size();
-                        // Recreate even at the same size: old buffered GOP
-                        // references must not survive a desktop access loss.
-                        match kw_encode::StreamEncoder::new(&kw_encode::Settings {
-                            width: w,
-                            height: h,
-                            fps,
-                            bitrate_bps,
-                            max_keyframe_spacing: 60,
-                        }) {
-                            Ok(fresh) => encoder = fresh,
-                            Err(error) => {
-                                eprintln!("capture: recovery encoder failed: {error}");
-                                return;
-                            }
-                        }
-                        next_tick = Instant::now();
-                        gate.capture_recoveries.fetch_add(1, Ordering::SeqCst);
-                        gate.force_idr.store(true, Ordering::SeqCst);
-                        eprintln!("capture: normal desktop access restored");
-                        continue;
-                    }
-                    Ok(None) => return,
-                    Err(error) => {
-                        eprintln!("capture: rebuild failed: {error}");
-                        return;
-                    }
-                }
+                // The top of the loop re-establishes a fresh duplicator +
+                // encoder once access returns (see attempt_establish).
+                continue;
             }
             Err(error) => {
                 eprintln!("capture: {error}");
@@ -294,6 +338,9 @@ pub fn run(
         }
         let force = index == 0 || gate.force_idr.swap(false, Ordering::SeqCst);
         let timestamp_100ns = u128::min(anchor.elapsed().as_nanos(), i64::MAX as u128) as i64 / 100;
+        let encoder = encoder
+            .as_mut()
+            .expect("encoder with an established output");
         match encoder.push(&frame.nv12, timestamp_100ns, force) {
             Ok(chunks) => {
                 for chunk in chunks {
@@ -337,16 +384,18 @@ pub fn run(
         }
         index += 1;
     }
-    if let Ok(trailing) = encoder.finish() {
-        for chunk in trailing {
-            if chunk.keyframe {
-                stats.keyframes_sent.fetch_add(1, Ordering::SeqCst);
+    if let Some(encoder) = encoder.take() {
+        if let Ok(trailing) = encoder.finish() {
+            for chunk in trailing {
+                if chunk.keyframe {
+                    stats.keyframes_sent.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = feed.send(MediaPacket {
+                    kind: kw_transport::MediaKind::H264,
+                    payload: chunk.bytes,
+                    written: None,
+                });
             }
-            let _ = feed.send(MediaPacket {
-                kind: kw_transport::MediaKind::H264,
-                payload: chunk.bytes,
-                written: None,
-            });
         }
     }
 }

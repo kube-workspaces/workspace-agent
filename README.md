@@ -83,6 +83,40 @@ reconciliation handle session replacement and logoff.
 Locked/disconnected consoles are ineligible; unlocking the selected console
 starts a fresh worker. Secure-desktop capture is not attempted.
 
+### Boot and logon timeline
+
+**At boot (machine, before any user logs on):**
+
+- SCM starts `KubeWorkspacesAgent` (`Start=auto`, LocalSystem, Session 0). This
+  is the only agent-related startup entry; it is a real service, not a scheduled
+  task or Run key.
+- The service loads `service.json` and the enrolled identity, then owns
+  enrollment, heartbeat and the control socket. An unconfigured installation
+  reports `awaiting-enrollment` and stays idle.
+- No desktop worker starts yet: there is no console session to attach to. The
+  service registers session notifications and reconciliation so it can react the
+  moment an eligible console appears.
+
+**At user logon (interactive session init):**
+
+- The service discovers the new console session, obtains that user's token
+  (the linked limited token when a UAC split token exists), and launches the
+  fixed `kw-agent.exe serve` in that session with `CREATE_NO_WINDOW`, assigned
+  atomically to a job object.
+- The worker runs on `winsta0\default` and owns capture, audio, clipboard, input
+  and display changes. It runs as the ordinary interactive user, never as a
+  built-in service account and never in Session 0.
+- **Nothing user-level is installed or executed at logon:** no `Run` value, no
+  scheduled task, no PowerShell launcher, no tray icon and no console window.
+  Because every step is a hidden Session 0 service or a `CREATE_NO_WINDOW`
+  worker, nothing starts or flashes on the desktop.
+- Lock/logoff/disconnect stops the worker; a locked or disconnected console is
+  ineligible until it is unlocked, at which point the service starts a fresh
+  worker.
+
+Legacy scheduled-task installs (pre-native-service) instead registered a per-logon
+task and `HKCU\...\Run` value; those are retired on upgrade — see below.
+
 `service.json` contains `workerEnabled`, `port` and a validated `workerArgs`
 array. It cannot override identity or launch arbitrary commands. Use
 `install.ps1 -ServeArgs <string-array>` for arguments containing spaces;
@@ -100,6 +134,16 @@ remain for legacy diagnostics; registration refuses to create competing startup
 when the native service exists. Legacy logon tasks disable execution time and
 battery-stop limits. Unenrolled diagnostics can still pass both binding flags
 directly to `serve`.
+
+An **MSI-only upgrade self-heals**: the agent runs `service-configure` as a
+deferred SYSTEM custom action on every install/upgrade, and that now also
+retires legacy startup — it unregisters the `kw-agent-serve`/`workspace-agent`
+scheduled tasks, deletes the `kw-agent-serve` HKCU Run value from every loaded
+hive, and removes leftover launchers (e.g. `launch-serve.ps1`) the MSI no
+longer ships. Run it explicitly on an existing guest with
+`kw-agent.exe retire-legacy-startup`. The native path leaves no user-level
+startup: the SYSTEM service (`Start=auto`, online at boot) spawns the console
+worker hidden (`CREATE_NO_WINDOW`), so nothing runs or flashes at logon.
 
 Use Windows Installer to remove an MSI installation. Archive installs use
 `uninstall.ps1`, which also retains enrollment by default; `-PurgeIdentity`
@@ -123,7 +167,10 @@ data directory is writable; SCM reports an application-specific failure code.
 claim capture/streaming readiness. Transport telemetry remains the evidence for
 streaming. Attach refusals identify `workspace-uid-mismatch` and
 `workspace-generation-mismatch`; a heartbeat alone does not establish desktop
-readiness.
+readiness. If the configured port is already bound, the worker exits with a
+distinct code and `service-status.json` reports `state: "port-in-use"` with
+`workerError: "port-in-use"` instead of crash-looping silently; retire any
+legacy listener with `kw-agent.exe retire-legacy-startup`.
 
 ## Windows output selection
 

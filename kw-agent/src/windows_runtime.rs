@@ -414,6 +414,17 @@ impl Worker {
     pub fn exited(&self) -> bool {
         unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 }
     }
+    /// Process exit code once the worker has exited; `None` if it is still
+    /// running or the code is unavailable. Lets the supervisor distinguish a
+    /// port-contention exit from an unexplained crash.
+    pub fn exit_code(&self) -> Option<u32> {
+        unsafe {
+            let mut code = 0u32;
+            GetExitCodeProcess(self.process.0, &mut code)
+                .is_ok()
+                .then_some(code)
+        }
+    }
     pub fn stop(&self) {
         unsafe {
             let _ = SetEvent(self.stop.0);

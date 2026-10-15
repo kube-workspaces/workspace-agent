@@ -42,6 +42,12 @@ if (-not $LoadedHivesOnly) {
   }
 }
 $exe = Join-Path ([IO.Path]::GetFullPath($BinDir)) 'kw-agent.exe'
+# Superseded launcher scripts are not shipped by the current MSI; remove any
+# leftover so only MSI-owned files remain beside the native service binary.
+foreach ($orphan in @('launch-serve.ps1')) {
+  $path = Join-Path ([IO.Path]::GetFullPath($BinDir)) $orphan
+  if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+}
 Get-CimInstance Win32_Process | Where-Object {
   $_.ExecutablePath -eq $exe -and $_.CommandLine -match '\s(daemon|serve)(\s|$)'
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
