@@ -106,6 +106,9 @@ pub fn run(
         let mut accumulator = kw_audio::tap::FrameAccumulator::new();
         let mut sequence = 0u64;
         loop {
+            if gate.control_only.load(Ordering::SeqCst) {
+                return PumpEnd::Done; // Drop the loopback tap and Opus encoder.
+            }
             if gate.ended.load(Ordering::SeqCst) {
                 return PumpEnd::Done;
             }

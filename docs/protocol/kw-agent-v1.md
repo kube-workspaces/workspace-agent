@@ -67,11 +67,24 @@ to a fresh IDR.
 - `attach`: viewer presents a short-lived ticket (see below). Agent and
   proxy verify workspace UID, generation, session/participant, role,
   control epoch, audience and expiry before admitting input.
+  When `hello.controlOnlyAvailable` is true, an attach may additionally request
+  `controlOnly: true`. The same ticket/claim admission still applies, but the
+  admitted connection accepts only telemetry requests and `bye`. Input,
+  clipboard, resize and keyframe requests end this restricted connection without
+  touching the guest. This is used by the native client's desktop watcher while
+  the independent authenticated RFB console owns the viewport.
 - `attachResult`: `{admitted, reason?}`, sent in reply to `attach` in the
   same session claim; a rejected attach carries a bounded machine-readable
   reason and admits no input. Workspace binding failures use
   `workspace-uid-mismatch` or `workspace-generation-mismatch`; reasons name
   the failed field without including identities, credentials or ticket data.
+  A successful control-only attach explicitly acknowledges `controlOnly: true`.
+  No H.264/Opus packets are sent; per-session media producers release their
+  capture/tap/encoder resources on admission. Startup readiness probes still
+  occur before the hello, as for an ordinary attach. A connection that omits
+  `controlOnly` retains the original media behavior. Older guests do not advertise
+  this capability; clients may retain their existing media-discarding watcher
+  until the guest is upgraded.
 - `input`: viewer→guest input, sent only by the admitted controller and only
   when `hello.inputAvailable` is true. Carries a `kind` tag:
   `{"kind":"key","keysym":N,"down":bool}` (X11 keysym, named/legacy values

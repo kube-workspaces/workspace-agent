@@ -156,6 +156,9 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    if gate.control_only.load(Ordering::SeqCst) {
+        return; // Drop duplication/encoder; the admitted watcher needs status only.
+    }
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
     let _awake = match kw_platform::capture::DisplayAwake::new() {
         Ok(guard) => guard,

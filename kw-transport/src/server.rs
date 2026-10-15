@@ -16,6 +16,8 @@ use std::sync::{mpsc, Arc, Mutex};
 /// What happened during one served connection (telemetry, no secrets).
 #[derive(Clone, Debug, Default)]
 pub struct SessionOutcome {
+    /// Admitted telemetry-only attach: no media or guest mutation.
+    pub control_only: bool,
     /// Control frames processed.
     pub control_frames: u64,
     /// Media frames counted (and bounded — see below).
@@ -50,6 +52,8 @@ pub struct SessionOutcome {
 /// arbitrarily dropping encoded reference frames. Drop-to-IDR is later work.
 #[derive(Debug, Default)]
 pub struct MediaGate {
+    /// Negotiated before admitted is set; media producers drop their resources.
+    pub control_only: AtomicBool,
     /// True desktop dimensions, excluding encoder macroblock padding.
     pub capture_width: AtomicU32,
     pub capture_height: AtomicU32,
@@ -433,6 +437,9 @@ fn serve_connection(
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
+                if gate.control_only.load(Ordering::SeqCst) {
+                    break;
+                }
                 let packet = match feed.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(packet) => packet,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -493,6 +500,7 @@ fn serve_connection(
             "displayModes": display_modes,
             "clipboardText": clipboard.is_some(),
             "telemetryAvailable": true,
+            "controlOnlyAvailable": true,
             // Honest capability flags: input reflects whether a backend is
             // wired; real guest resize lands with the display mode manager.
             "inputAvailable": input.is_some(),
@@ -578,8 +586,10 @@ fn serve_connection(
         outcome.audio_frames_sent = stats.audio_frames_sent.load(Ordering::SeqCst);
         outcome.audio_bytes_sent = stats.audio_bytes_sent.load(Ordering::SeqCst);
     }
-    if let Some(input) = input {
-        input.reset();
+    if !outcome.control_only {
+        if let Some(input) = input {
+            input.reset();
+        }
     }
     outcome
 }
@@ -601,6 +611,10 @@ fn serve_control(
     input: Option<&dyn Input>,
     resize: Option<&dyn Resize>,
 ) -> bool {
+    if outcome.control_only && !matches!(message.message_type.as_str(), "telemetry" | "bye") {
+        outcome.ended = "control-only-action".into();
+        return false;
+    }
     match message.message_type.as_str() {
         "clipboardGet" | "clipboardSet" => {
             if handshake.clipboard_request(message).is_err() {
@@ -648,6 +662,11 @@ fn serve_control(
             write_envelope(writer, &reply).is_ok()
         }
         "attach" => {
+            let control_only = match message.payload.get("controlOnly") {
+                None | Some(serde_json::Value::Bool(false)) => false,
+                Some(serde_json::Value::Bool(true)) => true,
+                Some(_) => return false,
+            };
             let ticket: Result<Ticket, _> =
                 serde_json::from_value(message.payload["ticket"].clone());
             // Diagnose guest-side refusals without leaking secrets: name the
@@ -672,6 +691,9 @@ fn serve_control(
                 }
                 Ok(ticket) if ticket.workspace_generation == workspace_generation => {
                     match handshake.attach(message, &ticket, workspace_uid, now_ns) {
+                        Ok(_) if control_only => {
+                            serde_json::json!({"admitted": true, "controlOnly": true})
+                        }
                         Ok(_) => serde_json::json!({"admitted": true}),
                         Err(Reject::Ticket) => {
                             serde_json::json!({"admitted": false, "reason": "ticket-rejected"})
@@ -704,7 +726,9 @@ fn serve_control(
             }
             let admitted = handshake.admitted();
             if admitted {
+                outcome.control_only = control_only;
                 if let Some(gate) = gate {
+                    gate.control_only.store(control_only, Ordering::SeqCst);
                     gate.admitted.store(true, Ordering::SeqCst);
                 }
             }
@@ -807,7 +831,8 @@ fn serve_control(
                 serde_json::json!({
                     "inputEvents": outcome.input_events, "inputDropped": outcome.input_dropped,
                     "resizeAcks": outcome.resize_acks,
-                    "inputAvailable": input.is_some(), "resizeAvailable": resize.is_some(),
+                    "controlOnly": outcome.control_only,
+                    "inputAvailable": input.is_some() && !outcome.control_only, "resizeAvailable": resize.is_some() && !outcome.control_only,
                     "session": input.map(|backend| backend.status()),
                     "captureSuspended": gate.map(|gate| gate.capture_suspended.load(Ordering::SeqCst)),
                     "captureRecoveries": gate.map(|gate| gate.capture_recoveries.load(Ordering::SeqCst)),
@@ -1215,6 +1240,130 @@ mod tests {
         assert_eq!(outcome.audio_frames_sent, 1);
         assert_eq!(outcome.audio_bytes_sent, 24);
         assert_eq!(outcome.ended, "peer-bye");
+    }
+
+    #[test]
+    fn control_only_attach_keeps_telemetry_without_media() {
+        let backend = Arc::new(RecordingInput::default());
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+            .unwrap()
+            .with_input(backend.clone());
+        let port = server.local_address().unwrap().port();
+        let gate = Arc::new(MediaGate::default());
+        let check_gate = gate.clone();
+        let stats = Arc::new(MediaStats::default());
+        let (tx, rx) = mpsc::channel();
+        for kind in [MediaKind::H264, MediaKind::Opus] {
+            tx.send(MediaPacket {
+                kind,
+                payload: vec![7; 64],
+                written: None,
+            })
+            .unwrap();
+        }
+        let handle = std::thread::spawn(move || server.serve_one_media(gate, rx, stats).unwrap());
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["controlOnlyAvailable"], true);
+        let session = hello.session_id;
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket":test_ticket(&session),"controlOnly":true}),
+            ),
+            &mut client,
+        );
+        let result = read_envelope(&mut client);
+        assert_eq!(result.payload["admitted"], true);
+        assert_eq!(result.payload["controlOnly"], true);
+        send(
+            &control(&session, "telemetry", 3, serde_json::json!({})),
+            &mut client,
+        );
+        // Queued media cannot precede telemetry or leak into this connection.
+        let telemetry = read_envelope(&mut client);
+        assert_eq!(telemetry.message_type, "telemetry");
+        assert!(telemetry.payload["session"]["desktop"].is_object());
+        assert_eq!(telemetry.payload["inputAvailable"], false);
+        assert!(check_gate.control_only.load(Ordering::SeqCst));
+        send(
+            &control(&session, "bye", 4, serde_json::json!({})),
+            &mut client,
+        );
+        let outcome = handle.join().unwrap();
+        assert!(outcome.control_only);
+        assert_eq!(outcome.video_bytes_sent + outcome.audio_bytes_sent, 0);
+        assert_eq!(backend.reset.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn control_only_attach_cannot_mutate_guest() {
+        for action in [
+            "input",
+            "resizeRequest",
+            "clipboardGet",
+            "clipboardSet",
+            "keyframeRequest",
+        ] {
+            let backend = Arc::new(RecordingInput::default());
+            let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into())
+                .unwrap()
+                .with_input(backend.clone());
+            let port = server.local_address().unwrap().port();
+            let handle = std::thread::spawn(move || run_server_once(server));
+            let mut client = connect(port);
+            let session = read_envelope(&mut client).session_id;
+            send(
+                &control(
+                    &session,
+                    "attach",
+                    2,
+                    serde_json::json!({"ticket":test_ticket(&session),"controlOnly":true}),
+                ),
+                &mut client,
+            );
+            assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+            send(
+                &control(
+                    &session,
+                    action,
+                    3,
+                    serde_json::json!({"kind":"key","keysym":65,"down":true,"requestId":"x","width":800,"height":600,"text":"test"}),
+                ),
+                &mut client,
+            );
+            let outcome = handle.join().unwrap();
+            assert_eq!(outcome.ended, "control-only-action", "{action}");
+            assert_eq!(
+                outcome.input_events + outcome.resize_acks + outcome.keyframes_forwarded,
+                0
+            );
+            assert_eq!(backend.reset.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn control_only_does_not_bypass_ticket_admission() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let handle = std::thread::spawn(move || run_server_once(server));
+        let mut client = connect(port);
+        let session = read_envelope(&mut client).session_id;
+        let mut ticket = test_ticket(&session);
+        ticket["workspaceUid"] = serde_json::json!("foreign-workspace");
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket":ticket,"controlOnly":true}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], false);
+        assert!(!handle.join().unwrap().control_only);
     }
 
     #[derive(Default)]
