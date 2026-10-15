@@ -808,7 +808,7 @@ fn serve_control(
                     "inputEvents": outcome.input_events, "inputDropped": outcome.input_dropped,
                     "resizeAcks": outcome.resize_acks,
                     "inputAvailable": input.is_some(), "resizeAvailable": resize.is_some(),
-                    "session": input.map(|backend| serde_json::json!({ "desktop": backend.status() })),
+                    "session": input.map(|backend| backend.status()),
                     "captureSuspended": gate.map(|gate| gate.capture_suspended.load(Ordering::SeqCst)),
                     "captureRecoveries": gate.map(|gate| gate.capture_recoveries.load(Ordering::SeqCst)),
                 }),
@@ -1444,6 +1444,23 @@ mod tests {
         fn reset(&self) {
             self.reset.fetch_add(1, Ordering::SeqCst);
         }
+        // Mirrors the guest backend: the input status object carries the
+        // desktop access classification nested under `desktop`. The client
+        // reads `session.desktop.requiresConsole`, so this must not be
+        // double-wrapped by the telemetry reply.
+        fn status(&self) -> serde_json::Value {
+            serde_json::json!({
+                "processSession": 1,
+                "activeConsoleSession": 1,
+                "canInject": false,
+                "desktop": {
+                    "requiresConsole": true,
+                    "reason": "protected-desktop",
+                    "processIntegrity": 8192,
+                    "foregroundIntegrity": serde_json::Value::Null,
+                },
+            })
+        }
     }
 
     #[test]
@@ -1513,6 +1530,16 @@ mod tests {
         assert_eq!(telemetry.message_type, "telemetry");
         assert_eq!(telemetry.payload["inputEvents"], 3);
         assert_eq!(telemetry.payload["inputDropped"], 1);
+        // The desktop classification must sit at session.desktop (not nested a
+        // second time), matching what the client reads for the console handoff.
+        assert_eq!(
+            telemetry.payload["session"]["desktop"]["requiresConsole"],
+            true
+        );
+        assert_eq!(
+            telemetry.payload["session"]["desktop"]["reason"],
+            "protected-desktop"
+        );
         send(
             &control(&session, "bye", 8, serde_json::json!({})),
             &mut client,
