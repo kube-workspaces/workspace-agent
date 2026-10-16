@@ -112,11 +112,44 @@ fn generate_key_hex() -> Result<String, EnrollError> {
     Ok(key.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Persist an identity. Owner-only permissions on creation (Unix; Windows
+/// ACLs are set by the installer on the data dir).
+fn store_identity(data_dir: &Path, identity: &Identity) -> Result<(), EnrollError> {
+    std::fs::create_dir_all(data_dir).map_err(|e| EnrollError::Storage(format!("mkdir: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(identity_path(data_dir))
+            .map_err(|e| EnrollError::Storage(format!("create: {e}")))?;
+        serde_json::to_writer_pretty(&file, identity)
+            .map_err(|e| EnrollError::Storage(format!("write: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let text = serde_json::to_string_pretty(identity)
+            .map_err(|e| EnrollError::Storage(format!("encode: {e}")))?;
+        std::fs::write(identity_path(data_dir), text)
+            .map_err(|e| EnrollError::Storage(format!("write: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Enroll once: validate the staged token, generate the identity key, store
 /// the identity, and delete the token so it cannot be replayed.
 ///
-/// If an identity already exists, it is returned unchanged (ordinary restart
-/// preserves identity) and the token file — if any — is left alone.
+/// If an identity already exists, an unexpired staged token for the SAME
+/// binding is spent and the identity returned unchanged (ordinary restart
+/// preserves identity; a reinstall staging a fresh token must not leave
+/// live tokens at rest). An unexpired staged token for a DIFFERENT binding
+/// means the platform re-provisioned (Reset, new clone lineage): it is
+/// adopted — fresh key, stored identity replaced, token consumed — so the
+/// guest follows the rotation instead of serving a stale binding that
+/// every attach then refuses. Stale (expired/malformed/foreign-expired)
+/// tokens are left for diagnosis and the stored identity is kept.
 pub fn enroll(
     data_dir: &Path,
     workspace_uid: &str,
@@ -124,9 +157,8 @@ pub fn enroll(
     now_secs: u64,
 ) -> Result<Identity, EnrollError> {
     if let Some(identity) = load(data_dir)? {
-        // Restart path: keep the stable identity. A staged token for the
-        // SAME binding is spent (a reinstall staging a fresh token must not
-        // leave live tokens at rest); anything else is left for diagnosis.
+        // Restart path: keep the stable identity unless a valid staged
+        // token carries a different binding (platform rotation).
         if let Ok(text) = std::fs::read_to_string(token_path(data_dir)) {
             let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
             if let Ok(token) = serde_json::from_str::<EnrollmentToken>(body) {
@@ -139,6 +171,34 @@ pub fn enroll(
                 .is_ok()
                 {
                     let _ = std::fs::remove_file(token_path(data_dir));
+                    return Ok(identity);
+                }
+                if !token.token.trim().is_empty()
+                    && token.expires_at > now_secs
+                    && (token.workspace_uid != identity.workspace_uid
+                        || token.workspace_generation != identity.workspace_generation)
+                {
+                    // Rotation: re-enroll under the token's binding. The
+                    // token arrived over the trusted staging channel
+                    // (controller-written); planting identity.json directly
+                    // was already possible, so this grants nothing new —
+                    // attaches still need platform tickets for the binding.
+                    let rotated = Identity {
+                        agent_key_hex: generate_key_hex()?,
+                        workspace_uid: token.workspace_uid.clone(),
+                        workspace_generation: token.workspace_generation.clone(),
+                        enrolled_at: now_secs,
+                    };
+                    // Replace the stale binding (store_identity refuses to
+                    // clobber, so remove first).
+                    let _ = std::fs::remove_file(identity_path(data_dir));
+                    store_identity(data_dir, &rotated)?;
+                    if let Err(error) = std::fs::remove_file(token_path(data_dir)) {
+                        return Err(EnrollError::Storage(format!(
+                            "token consumed but not deleted: {error}"
+                        )));
+                    }
+                    return Ok(rotated);
                 }
             }
         }
@@ -158,28 +218,7 @@ pub fn enroll(
         workspace_generation: token.workspace_generation.clone(),
         enrolled_at: now_secs,
     };
-    std::fs::create_dir_all(data_dir).map_err(|e| EnrollError::Storage(format!("mkdir: {e}")))?;
-    // Owner-only permissions on creation (Unix; Windows ACLs are set by the
-    // installer on the data dir — see packaging/windows/install.ps1).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(identity_path(data_dir))
-            .map_err(|e| EnrollError::Storage(format!("create: {e}")))?;
-        serde_json::to_writer_pretty(&file, &identity)
-            .map_err(|e| EnrollError::Storage(format!("write: {e}")))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let text = serde_json::to_string_pretty(&identity)
-            .map_err(|e| EnrollError::Storage(format!("encode: {e}")))?;
-        std::fs::write(identity_path(data_dir), text)
-            .map_err(|e| EnrollError::Storage(format!("write: {e}")))?;
-    }
+    store_identity(data_dir, &identity)?;
     // Consume the token: a stolen copy must not enroll a second identity.
     // A failed delete after a successful store keeps the valid identity and
     // reports storage trouble without rolling back.
@@ -287,18 +326,50 @@ mod tests {
     }
 
     #[test]
-    fn foreign_token_survives_reuse_for_diagnosis() {
-        let dir = scratch("foreign");
+    fn rotation_adopts_valid_token_for_new_binding() {
+        let dir = scratch("rotate");
         std::fs::write(
             token_path(&dir),
             serde_json::to_string(&token()).expect("token json"),
         )
         .expect("stage token");
         let first = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls");
+        // Platform re-provisioned under a new generation: a valid staged
+        // token for the new binding rotates the identity (Reset path).
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&EnrollmentToken {
+                workspace_uid: "ws-1".into(),
+                workspace_generation: "gen-2".into(),
+                ..token()
+            })
+            .expect("token json"),
+        )
+        .expect("stage token");
+        let second = enroll(&dir, "ws-1", "gen-1", 1500).expect("rotates");
+        assert_ne!(first.agent_key_hex, second.agent_key_hex, "fresh key");
+        assert_eq!(second.workspace_generation, "gen-2");
+        assert!(!token_path(&dir).exists(), "rotation token consumed");
+        // Steady state again afterwards.
+        let third = enroll(&dir, "ws-1", "gen-2", 1600).expect("reuses");
+        assert_eq!(second.agent_key_hex, third.agent_key_hex);
+    }
+
+    #[test]
+    fn expired_foreign_token_survives_reuse_for_diagnosis() {
+        let dir = scratch("stale-foreign");
+        std::fs::write(
+            token_path(&dir),
+            serde_json::to_string(&token()).expect("token json"),
+        )
+        .expect("stage token");
+        let first = enroll(&dir, "ws-1", "gen-1", 1000).expect("enrolls");
+        // Same shape but expired: stale, left alone.
         std::fs::write(
             token_path(&dir),
             serde_json::to_string(&EnrollmentToken {
                 workspace_uid: "other".into(),
+                expires_at: 1400,
                 ..token()
             })
             .expect("token json"),
@@ -306,7 +377,7 @@ mod tests {
         .expect("stage token");
         let second = enroll(&dir, "ws-1", "gen-1", 1500).expect("reuses");
         assert_eq!(first.agent_key_hex, second.agent_key_hex);
-        assert!(token_path(&dir).exists(), "foreign token left alone");
+        assert!(token_path(&dir).exists(), "stale token left alone");
     }
 
     #[test]
