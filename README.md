@@ -181,11 +181,21 @@ Windows device name across all adapters. Capture, guest resize and absolute
 pointer coordinates share that selection, including the monitor's origin in
 the virtual desktop. Missing selected outputs fail explicitly.
 
+With no explicit output name, selection prefers an attached output on a
+**virtual/indirect display driver** (e.g. the pinned MikeTheTech Virtual
+Display Driver reports "Virtual Display Driver"). That monitor exposes the
+host-configurable mode list, so premium streams a resizable display instead of
+the emulated Basic Display VGA, which is a fixed-mode output. This is why a
+managed service with default `workerArgs` no longer locks to the VGA's single
+mode. An explicit `--capture-output-name` (or a non-zero `--capture-output`
+index) still overrides the preference.
+
 The legacy `--capture-output N` selects that output index on the first adapter
 exposing it. GPU vendor, onboard/discrete/vGPU/passthrough presence and KVM CPU
 acceleration are not substitutes for actual output, driver or codec capability.
 An emulated Basic Display adapter may expose a fixed resolution; changing an
-arbitrary viewer size requires a guest display driver exposing the desired mode.
+arbitrary viewer size requires a guest display driver exposing the desired mode
+(virtual-display mode lists are configured by the image, not negotiated live).
 
 `hello.capture` reports true desktop dimensions, excluding encoder padding.
 Successful resize ACKs similarly report actual dimensions; native viewers crop

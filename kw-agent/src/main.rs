@@ -41,6 +41,9 @@ fn usage(code: i32) -> ! {
     eprintln!(
         r"  serve --capture-output-name \\.\DISPLAY2 selects one monitor across capture, resize and input"
     );
+    eprintln!(
+        "  serve --capture-video defaults to a virtual/indirect display output when present (configurable modes)"
+    );
     eprintln!("  serve --resize enables guest mode changes with --capture-video in the active console session");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
