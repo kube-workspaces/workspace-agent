@@ -176,6 +176,151 @@ def recv_control(sock):
     return json.loads(data[5 : 5 + length].decode("utf-8"))
 
 
+def percentile(sorted_vals, pct):
+    """Nearest-rank percentile over an already-sorted list (None when empty).
+    pct is 0-100; rank = ceil(pct/100 * N), 1-based into the list."""
+    if not sorted_vals:
+        return None
+    rank = min(len(sorted_vals), max(1, -(-pct * len(sorted_vals) // 100)))
+    return sorted_vals[int(rank) - 1]
+
+
+def annexb_has_idr(unit):
+    """True when an H.264 Annex-B access unit carries an IDR slice (NAL type 5)."""
+    zeros = 0
+    for i, byte in enumerate(unit):
+        if byte == 0:
+            zeros += 1
+            continue
+        if byte == 1 and zeros >= 2 and i + 1 < len(unit) and unit[i + 1] & 0x1F == 5:
+            return True
+        zeros = 0
+    return False
+
+
+class MeasureStats:
+    """W6 transport/quality counters for one measurement window (no I/O)."""
+
+    NOMINAL_VIDEO_MS = 1000.0 / 30
+    NOMINAL_AUDIO_MS = 20.0
+
+    def __init__(self):
+        self.video_frames = 0
+        self.video_bytes = 0
+        self.video_sizes = []
+        self.video_idrs = 0
+        self.video_gaps = []
+        self.audio_packets = 0
+        self.audio_bytes = 0
+        self.audio_gaps = []
+        self.telemetry_rtts = []
+        self._last_video_at = None
+        self._last_audio_at = None
+
+    def add_video(self, size, idr, at_ms):
+        self.video_frames += 1
+        self.video_bytes += size
+        self.video_sizes.append(size)
+        if idr:
+            self.video_idrs += 1
+        if self._last_video_at is not None:
+            self.video_gaps.append(at_ms - self._last_video_at)
+        self._last_video_at = at_ms
+
+    def add_audio(self, size, at_ms):
+        self.audio_packets += 1
+        self.audio_bytes += size
+        if self._last_audio_at is not None:
+            self.audio_gaps.append(at_ms - self._last_audio_at)
+        self._last_audio_at = at_ms
+
+    def add_telemetry_rtt(self, rtt_ms):
+        self.telemetry_rtts.append(rtt_ms)
+
+    def summary(self, duration_s):
+        out = {"duration_s": round(duration_s, 3)}
+        gaps = sorted(self.video_gaps)
+        sizes = sorted(self.video_sizes)
+        out["video"] = {
+            "frames": self.video_frames,
+            "bytes": self.video_bytes,
+            "fps": round(self.video_frames / duration_s, 2) if duration_s > 0 else 0,
+            "bitrate_bps": round(self.video_bytes * 8 / duration_s) if duration_s > 0 else 0,
+            "idr_frames": self.video_idrs,
+            "frame_bytes_p50": percentile(sizes, 50),
+            "frame_bytes_p95": percentile(sizes, 95),
+            "gap_ms_p50": percentile(gaps, 50),
+            "gap_ms_p95": percentile(gaps, 95),
+        }
+        agaps = sorted(self.audio_gaps)
+        out["audio"] = {
+            "packets": self.audio_packets,
+            "bytes": self.audio_bytes,
+            "pps": round(self.audio_packets / duration_s, 2) if duration_s > 0 else 0,
+            "gap_ms_p50": percentile(agaps, 50),
+            "gap_ms_p95": percentile(agaps, 95),
+        }
+        rtts = sorted(self.telemetry_rtts)
+        out["telemetry"] = {
+            "responses": len(rtts),
+            "rtt_ms_p50": percentile(rtts, 50),
+            "rtt_ms_p95": percentile(rtts, 95),
+        }
+        return out
+
+
+def run_measure(sock, live_session, seq, seconds):
+    """Collect media/cadence evidence for W6: keyframe, then count H.264
+    access units and Opus packets for `seconds` while pinging telemetry
+    ~1/s. Telemetry RTT is send-to-next-response (approximation: the guest
+    answers state pushes, not addressed replies). Returns (MeasureStats,
+    next_seq). Never raises on guest silence; raises ConnectionError only
+    when the bridge itself dies.
+    """
+    stats = MeasureStats()
+    start = time.monotonic()
+    deadline = start + seconds
+    sock.settimeout(0.5)
+    send_control(sock, live_session, "keyframeRequest", seq, {})
+    seq += 1
+    next_telemetry_at = start
+    pending_telemetry_at = None
+    try:
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_telemetry_at:
+                send_control(sock, live_session, "telemetry", seq, {})
+                seq += 1
+                pending_telemetry_at = now
+                next_telemetry_at = now + 1.0
+            try:
+                data = ws_recv(sock)
+            except socket.timeout:
+                continue
+            except ConnectionError:
+                break  # Bridge died mid-measure: keep partial evidence.
+            at_ms = (time.monotonic() - start) * 1000.0
+            if len(data) < 5:
+                continue
+            tag = data[0]
+            (length,) = struct.unpack("!I", data[1:5])
+            body = data[5 : 5 + length]
+            if tag == 0x01:
+                stats.add_video(len(body), annexb_has_idr(body), at_ms)
+            elif tag == 0x02:
+                stats.add_audio(len(body), at_ms)
+            elif tag == 0x00 and pending_telemetry_at is not None:
+                try:
+                    if json.loads(body.decode("utf-8")).get("type") == "telemetry":
+                        stats.add_telemetry_rtt((time.monotonic() - pending_telemetry_at) * 1000.0)
+                        pending_telemetry_at = None
+                except (ValueError, UnicodeDecodeError):
+                    pass
+    finally:
+        sock.settimeout(None)
+    return stats, seq
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--api-base", required=True, help="API origin, e.g. https://api.example.com")
@@ -187,6 +332,9 @@ def main():
     ap.add_argument("--token", default=os.environ.get("KW_TOKEN"), help="platform bearer token (or $KW_TOKEN)")
     ap.add_argument("--busy-test", action="store_true", help="hold the bridge and expect a second connect to fail busy")
     ap.add_argument("--skip-release", action="store_true")
+    ap.add_argument("--measure", type=float, default=0, metavar="SECONDS",
+                    help="after admission, collect media/cadence evidence for SECONDS "
+                         "(W6 reference measurement; needs the display seat)")
     args = ap.parse_args()
     if not args.token:
         print("error: --token or $KW_TOKEN is required", file=sys.stderr)
@@ -252,10 +400,28 @@ def main():
         return finish(summary, failures, sock)
     check("attach-admitted", result.get("payload", {}).get("admitted") is True,
           f"type={result.get('type')} payload={result.get('payload')}")
+    seq = 3
+
+    # 4b. Optional W6 measurement before the resize round-trip disturbs the mode.
+    if args.measure > 0:
+        admitted = result.get("payload", {}).get("admitted") is True
+        if not admitted:
+            check("measure", False, "skipped: attach not admitted")
+        else:
+            try:
+                stats, seq = run_measure(sock, live_session, seq, args.measure)
+                summary["measure"] = stats.summary(args.measure)
+                check("measure", True, f"fps={summary['measure']['video']['fps']} "
+                      f"video_bps={summary['measure']['video']['bitrate_bps']} "
+                      f"audio_pps={summary['measure']['audio']['pps']}")
+            except ConnectionError as exc:
+                check("measure", False, str(exc)[:160])
+                return finish(summary, failures, sock)
 
     # 5. Resize round-trip (pairing is the proof; the mode NACK is expected pre-display-backend).
     rid = "bridge-check-1"
-    send_control(sock, live_session, "resizeRequest", 3, {"requestId": rid})
+    send_control(sock, live_session, "resizeRequest", seq, {"requestId": rid})
+    seq += 1
     try:
         ack = recv_control(sock)
     except ConnectionError as exc:
@@ -265,8 +431,10 @@ def main():
           f"reason={ack.get('payload', {}).get('reason')}")
 
     # 6. Keyframe (no reply by design) + orderly bye + release.
-    send_control(sock, live_session, "keyframeRequest", 4, {})
-    send_control(sock, live_session, "bye", 5, {})
+    send_control(sock, live_session, "keyframeRequest", seq, {})
+    seq += 1
+    send_control(sock, live_session, "bye", seq, {})
+    seq += 1
     sock.close()
     check("bye-sent", True)
     if not args.skip_release:
