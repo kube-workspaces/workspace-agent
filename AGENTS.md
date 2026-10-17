@@ -52,6 +52,21 @@ table checks, run by both `build-msi.ps1` and CI).
 - Never commit secrets, private identities, enrollment tokens, hostnames,
   credentials, or live-environment evidence. Generic examples only.
 - No generic remote command execution in the agent protocol. Named,
-  versioned actions only.
+  versioned actions only. A separate, mutually authenticated **management
+  endpoint** may implement a versioned `management.*` naming scheme for
+  explicitly enumerated operations (command/script run, PTY/ConPTY shell,
+  input/resize, cancel, status) only when all of the following hold:
+  - the connection is mutually authenticated TLS bound to the workspace
+    identity, and the listener is not reachable unauthenticated;
+  - every request carries a short-lived, asymmetrically signed grant bound to
+    actor, workspace UID/generation, operation, target OS identity, audience
+    and expiry, which the guest verifies independently — grants supplied by
+    the API are never trusted without guest-side verification;
+  - all I/O is recorded independently of the desktop worker; and
+  - no unauthenticated diagnostic/fallback path exists, and root/SYSTEM
+    targets additionally require a separately authorized elevated grant.
+
+  This supersedes the blanket prohibition for that endpoint only; there is
+  still no capability-discovery or arbitrary-argv execute endpoint.
 - Fixture changes must keep `tools/validate_fixtures.py` and its tests
   green. Headless fixtures do not close driver/A/V acceptance.
