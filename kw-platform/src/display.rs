@@ -18,18 +18,33 @@ pub struct Size {
 pub(crate) struct OutputCandidate {
     pub name: String,
     pub adapter_description: String,
+    /// The DXGI adapter is flagged `DXGI_ADAPTER_FLAG_SOFTWARE`. The pinned
+    /// MikeTheTech IDD is a root-enumerated software device and reports this
+    /// flag, whereas the emulated basic VGA is a PCI hardware device.
+    pub software: bool,
     pub attached: bool,
     pub output_index: u32,
 }
 
 /// Whether an adapter description identifies a virtual/indirect display driver
-/// (`\\.\DISPLAYn` whose mode list the host controls). The pinned MikeTheTech
-/// Virtual Display Driver reports "Virtual Display Driver"; the emulated basic
-/// VGA reports "Microsoft Basic Display Adapter" and is not matched.
+/// (`\\.\DISPLAYn` whose mode list the host controls). Some builds report a
+/// vendor name ("Virtual Display Driver"); the guest's IDD instead enumerates
+/// as the generic `Microsoft Basic Render Driver`, so [`is_virtual_display`]
+/// also accepts the software-adapter flag below.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn is_virtual_display_adapter(description: &str) -> bool {
     let lowered = description.to_ascii_lowercase();
     lowered.contains("virtual display") || lowered.contains("virtualdisplay")
+}
+
+/// Whether a candidate is a virtual/indirect display: the adapter advertises a
+/// virtual-display name, or DXGI flags the adapter as software. In the premium
+/// Windows guest the fixed-mode basic VGA (PCI `VEN_1234:1111`) is the only
+/// hardware-flagged output, and the configurable IDD is the software-flagged
+/// one, so either signal identifies the display whose modes the host controls.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn is_virtual_display(candidate: &OutputCandidate) -> bool {
+    candidate.software || is_virtual_display_adapter(&candidate.adapter_description)
 }
 
 /// Pick the output to stream from an adapter-major candidate list.
@@ -53,9 +68,10 @@ pub(crate) fn select_output(
         });
     }
     if output_index == 0 {
-        if let Some(index) = candidates.iter().position(|candidate| {
-            candidate.attached && is_virtual_display_adapter(&candidate.adapter_description)
-        }) {
+        if let Some(index) = candidates
+            .iter()
+            .position(|candidate| candidate.attached && is_virtual_display(candidate))
+        {
             return Some(index);
         }
     }
@@ -199,7 +215,7 @@ pub(crate) fn choose_output(
     ),
     crate::Error,
 > {
-    use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1;
+    use windows::Win32::Graphics::Dxgi::{DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE};
     let mut candidates = Vec::new();
     let mut handles = Vec::new();
     for adapter_index in 0..32 {
@@ -212,6 +228,7 @@ pub(crate) fn choose_output(
             Ok(()) => wide_to_string(&adapter_desc.Description),
             Err(_) => String::new(),
         };
+        let software = adapter_desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
         for index in 0..32 {
             let output = match unsafe { adapter.EnumOutputs(index) } {
                 Ok(output) => output,
@@ -223,6 +240,7 @@ pub(crate) fn choose_output(
             candidates.push(OutputCandidate {
                 name: wide_to_string(&desc.DeviceName),
                 adapter_description: adapter_description.clone(),
+                software,
                 attached: desc.AttachedToDesktop.as_bool(),
                 output_index: index,
             });
@@ -249,20 +267,64 @@ mod tests {
         OutputCandidate {
             name: name.into(),
             adapter_description: adapter.into(),
+            software: false,
             attached,
             output_index: index,
         }
     }
 
+    fn software_candidate(
+        name: &str,
+        adapter: &str,
+        attached: bool,
+        index: u32,
+    ) -> OutputCandidate {
+        OutputCandidate {
+            software: true,
+            ..candidate(name, adapter, attached, index)
+        }
+    }
+
     const VGA: &str = "Microsoft Basic Display Adapter";
     const IDD: &str = "Virtual Display Driver";
+    // The guest's IDD enumerates with the same generic name as the emulated
+    // VGA; only the DXGI software-adapter flag distinguishes them.
+    const BASIC_RENDER: &str = "Microsoft Basic Render Driver";
 
     #[test]
     fn recognizes_virtual_display_adapters() {
         assert!(is_virtual_display_adapter(IDD));
         assert!(is_virtual_display_adapter("VirtualDisplayDriver"));
         assert!(!is_virtual_display_adapter(VGA));
+        assert!(!is_virtual_display_adapter(BASIC_RENDER));
         assert!(!is_virtual_display_adapter(""));
+    }
+
+    #[test]
+    fn software_adapter_is_a_virtual_display() {
+        assert!(is_virtual_display(&software_candidate(
+            r"\\.\DISPLAY2",
+            BASIC_RENDER,
+            true,
+            0
+        )));
+        assert!(!is_virtual_display(&candidate(
+            r"\\.\DISPLAY1",
+            BASIC_RENDER,
+            true,
+            0
+        )));
+    }
+
+    #[test]
+    fn defaults_to_software_idd_with_generic_description() {
+        // Both outputs report "Microsoft Basic Render Driver"; the IDD's
+        // adapter is software-flagged, the basic VGA is not.
+        let candidates = [
+            candidate(r"\\.\DISPLAY1", BASIC_RENDER, true, 0),
+            software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, true, 0),
+        ];
+        assert_eq!(select_output(&candidates, 0, None), Some(1));
     }
 
     #[test]
@@ -289,7 +351,7 @@ mod tests {
     fn explicit_name_wins_and_searches_every_adapter() {
         let candidates = [
             candidate(r"\\.\DISPLAY1", VGA, true, 0),
-            candidate(r"\\.\DISPLAY2", IDD, true, 0),
+            software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, true, 0),
         ];
         assert_eq!(
             select_output(&candidates, 0, Some(r"\\.\DISPLAY1")),
@@ -306,7 +368,7 @@ mod tests {
     fn explicit_index_ignores_virtual_display_preference() {
         let candidates = [
             candidate(r"\\.\DISPLAY1", VGA, true, 0),
-            candidate(r"\\.\DISPLAY2", IDD, true, 1),
+            software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, true, 1),
         ];
         assert_eq!(select_output(&candidates, 1, None), Some(1));
     }
@@ -315,7 +377,7 @@ mod tests {
     fn unattached_outputs_are_never_selected() {
         let candidates = [
             candidate(r"\\.\DISPLAY1", VGA, false, 0),
-            candidate(r"\\.\DISPLAY2", IDD, false, 0),
+            software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, false, 0),
         ];
         assert_eq!(select_output(&candidates, 0, None), None);
         assert_eq!(select_output(&candidates, 0, Some(r"\\.\DISPLAY2")), None);
@@ -325,7 +387,7 @@ mod tests {
     fn unattached_virtual_display_falls_back_to_attached_index() {
         let candidates = [
             candidate(r"\\.\DISPLAY1", VGA, true, 0),
-            candidate(r"\\.\DISPLAY2", IDD, false, 0),
+            software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, false, 0),
         ];
         assert_eq!(select_output(&candidates, 0, None), Some(0));
     }
