@@ -39,6 +39,12 @@ table checks, run by both `build-msi.ps1` and CI).
   `f72bb43e-dba8-4dbb-a963-b201e6c0d885` is stable forever. No chart
   bumps or ArgoCD targetRevision changes from tags here — that stays
   separately coordinated (see tracking).
+- Release tags MUST be exact semver `vMAJOR.MINOR.PATCH`. The `msi` job
+  hard-fails any other tag ("MSI release version must be an exact tag"),
+  so a non-semver tag (e.g. `v0.3.3-hotfix-…`) builds no MSI and no
+  release. **Never cut ad-hoc "hotfix" tags or releases** — for a fix,
+  bump the patch version (`v0.3.4`, …) and tag that. Do not delete or
+  deform existing semver releases to work around this.
 - `.github/release.yml` must stay byte-identical with the other
   kube-workspaces repos (`deploy/scripts/check-release-config.sh`).
 - Wire protocol is versioned separately from installer/image/profile
