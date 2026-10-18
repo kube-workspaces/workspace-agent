@@ -1,0 +1,405 @@
+//! Management-v1 asymmetric grant verifier. Independent from display tickets.
+//! This library opens no network listener and creates no process. Enrollment,
+//! mTLS and authenticated current identity/epoch synchronization remain required.
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+const AUDIENCE: &str = "kube-workspaces/management/v1";
+const ISSUER: &str = "kube-workspaces-api/management/v1";
+const GRANT_TYPE: &str = "kw-management-grant+jwt";
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    Invalid,
+    Expired,
+    Binding,
+    Replay,
+    Capacity,
+    Entropy,
+}
+
+/// Expected binding must come from guest enrollment, authenticated current
+/// state, the validated mTLS peer, this connection's challenge and actual framed
+/// request bytes. Never populate expected values from the untrusted token.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub actor_uid: String,
+    pub namespace: String,
+    pub workspace_name: String,
+    pub workspace_uid: String,
+    pub provisioning_generation: String,
+    pub execution_id: String,
+    pub recording_id: String,
+    pub operation: String,
+    pub os_identity: String,
+    pub elevated: bool,
+    pub policy_version: String,
+    pub revocation_epoch: u64,
+    pub challenge: String,
+    pub peer_certificate_sha256: String,
+    pub request_sha256: String,
+}
+
+impl Binding {
+    fn valid(&self) -> bool {
+        let fields = [
+            &self.actor_uid,
+            &self.namespace,
+            &self.workspace_name,
+            &self.workspace_uid,
+            &self.provisioning_generation,
+            &self.execution_id,
+            &self.recording_id,
+            &self.os_identity,
+            &self.policy_version,
+        ];
+        if fields.iter().any(|v| {
+            v.is_empty()
+                || v.len() > 256
+                || v.trim() != v.as_str()
+                || v.chars().any(char::is_control)
+        }) {
+            return false;
+        }
+        if !matches!(self.operation.as_str(), "command" | "script" | "shell") {
+            return false;
+        }
+        if !self.elevated
+            && (self.os_identity.eq_ignore_ascii_case("root")
+                || self.os_identity.eq_ignore_ascii_case("SYSTEM")
+                || self.os_identity == "0")
+        {
+            return false;
+        }
+        valid_nonce(&self.challenge)
+            && valid_digest(&self.peer_certificate_sha256)
+            && valid_digest(&self.request_sha256)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Claims {
+    pub version: u32,
+    pub iss: String,
+    pub aud: String,
+    pub jti: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub binding: Binding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Header {
+    alg: String,
+    typ: String,
+    kid: String,
+}
+
+fn valid_nonce(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|b| b.len() == 32 && URL_SAFE_NO_PAD.encode(b) == value)
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// SHA-256 of exact framed request bytes or the validated peer certificate DER.
+pub fn digest(data: &[u8]) -> String {
+    Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+pub fn key_id(public_key: &[u8; 32]) -> String {
+    digest(public_key)[..32].to_owned()
+}
+
+/// Generate once per authenticated connection. Never restore an old challenge
+/// with an empty replay cache after restart or disconnect.
+pub fn new_challenge() -> Result<String, Error> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| Error::Entropy)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Non-cloneable connection-local replay state. `&mut self` makes consumption
+/// exclusive; a concurrent transport must retain it behind one shared mutex.
+pub struct Verifier {
+    keys: HashMap<String, VerifyingKey>,
+    used: HashMap<String, i64>,
+    capacity: usize,
+    last_time: i64,
+}
+
+impl Verifier {
+    /// Only independently provisioned public keys belong here. Overlap old/new
+    /// keys during rotation; never resolve keys from a token URL or guest input.
+    pub fn new(public_keys: &[[u8; 32]], capacity: usize) -> Result<Self, Error> {
+        if public_keys.is_empty() || public_keys.len() > 16 || !(1..=65536).contains(&capacity) {
+            return Err(Error::Invalid);
+        }
+        let mut keys = HashMap::new();
+        for key in public_keys {
+            let verifying = VerifyingKey::from_bytes(key).map_err(|_| Error::Invalid)?;
+            if keys.insert(key_id(key), verifying).is_some() {
+                return Err(Error::Invalid);
+            }
+        }
+        Ok(Self {
+            keys,
+            used: HashMap::new(),
+            capacity,
+            last_time: 0,
+        })
+    }
+
+    pub fn consume(&mut self, token: &str, expected: &Binding, now: i64) -> Result<Claims, Error> {
+        if token.len() > MAX_TOKEN_BYTES || !expected.valid() {
+            return Err(Error::Invalid);
+        }
+        let mut parts = token.split('.');
+        let h = parts.next().ok_or(Error::Invalid)?;
+        let p = parts.next().ok_or(Error::Invalid)?;
+        let s = parts.next().ok_or(Error::Invalid)?;
+        if parts.next().is_some() {
+            return Err(Error::Invalid);
+        }
+        let header: Header =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(h).map_err(|_| Error::Invalid)?)
+                .map_err(|_| Error::Invalid)?;
+        if header.alg != "EdDSA" || header.typ != GRANT_TYPE {
+            return Err(Error::Invalid);
+        }
+        let key = self.keys.get(&header.kid).ok_or(Error::Invalid)?;
+        let signature =
+            Signature::from_slice(&URL_SAFE_NO_PAD.decode(s).map_err(|_| Error::Invalid)?)
+                .map_err(|_| Error::Invalid)?;
+        key.verify_strict(format!("{h}.{p}").as_bytes(), &signature)
+            .map_err(|_| Error::Invalid)?;
+        let claims: Claims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).map_err(|_| Error::Invalid)?)
+                .map_err(|_| Error::Invalid)?;
+        if claims.version != 1
+            || claims.iss != ISSUER
+            || claims.aud != AUDIENCE
+            || !valid_nonce(&claims.jti)
+            || !claims.binding.valid()
+        {
+            return Err(Error::Invalid);
+        }
+        if claims.iat <= 0
+            || claims.exp <= claims.iat
+            || claims.exp - claims.iat > 60
+            || now < claims.iat
+            || now >= claims.exp
+            || now < self.last_time
+        {
+            return Err(Error::Expired);
+        }
+        if &claims.binding != expected {
+            return Err(Error::Binding);
+        }
+        self.last_time = now;
+        self.used.retain(|_, expiry| *expiry > now);
+        if self.used.contains_key(&claims.jti) {
+            return Err(Error::Replay);
+        }
+        if self.used.len() >= self.capacity {
+            return Err(Error::Capacity);
+        }
+        self.used.insert(claims.jti.clone(), claims.exp);
+        Ok(claims)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Vector {
+        public_key: String,
+        now: i64,
+        binding: Binding,
+        token: String,
+    }
+
+    fn vector() -> Vector {
+        serde_json::from_str(include_str!("../fixtures/management-v1.json")).unwrap()
+    }
+
+    fn verifier(v: &Vector) -> Verifier {
+        let key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&v.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        Verifier::new(&[key], 16).unwrap()
+    }
+
+    #[test]
+    fn go_signature_interoperability_and_replay() {
+        let v = vector();
+        let mut verify = verifier(&v);
+        assert_eq!(
+            verify.consume(&v.token, &v.binding, v.now).unwrap().binding,
+            v.binding
+        );
+        assert_eq!(
+            verify.consume(&v.token, &v.binding, v.now).unwrap_err(),
+            Error::Replay
+        );
+    }
+
+    #[test]
+    fn scope_expiry_signature_and_revocation_denials() {
+        let v = vector();
+        let mut verify = verifier(&v);
+        let mut other = v.binding.clone();
+        other.revocation_epoch += 1;
+        assert_eq!(
+            verify.consume(&v.token, &other, v.now).unwrap_err(),
+            Error::Binding
+        );
+        other = v.binding.clone();
+        other.request_sha256 = digest(b"other request");
+        assert_eq!(
+            verify.consume(&v.token, &other, v.now).unwrap_err(),
+            Error::Binding
+        );
+        other = v.binding.clone();
+        other.challenge = new_challenge().unwrap();
+        assert_eq!(
+            verify.consume(&v.token, &other, v.now).unwrap_err(),
+            Error::Binding
+        );
+        other = v.binding.clone();
+        other.provisioning_generation = "reset".to_string();
+        assert_eq!(
+            verify.consume(&v.token, &other, v.now).unwrap_err(),
+            Error::Binding
+        );
+        assert_eq!(
+            verify.consume(&v.token, &v.binding, v.now - 1).unwrap_err(),
+            Error::Expired
+        );
+        assert_eq!(
+            verify
+                .consume(&v.token, &v.binding, v.now + 30)
+                .unwrap_err(),
+            Error::Expired
+        );
+        assert!(verify
+            .consume(&(v.token.clone() + "A"), &v.binding, v.now)
+            .is_err());
+        assert!(verify.consume("e30.e30.AA", &v.binding, v.now).is_err());
+        assert!(verify.consume(&v.token, &v.binding, v.now).is_ok());
+    }
+
+    #[test]
+    fn all_bindings_are_independent() {
+        let v = vector();
+        let mutations: &[fn(&mut Binding)] = &[
+            |b| b.actor_uid.push('x'),
+            |b| b.namespace.push('x'),
+            |b| b.workspace_name.push('x'),
+            |b| b.workspace_uid.push('x'),
+            |b| b.provisioning_generation.push('x'),
+            |b| b.execution_id.push('x'),
+            |b| b.recording_id.push('x'),
+            |b| b.operation = "script".into(),
+            |b| b.os_identity.push('x'),
+            |b| b.elevated = true,
+            |b| b.policy_version.push('x'),
+            |b| b.revocation_epoch += 1,
+            |b| b.challenge = new_challenge().unwrap(),
+            |b| b.peer_certificate_sha256 = digest(b"other peer"),
+            |b| b.request_sha256 = digest(b"other request"),
+        ];
+        for change in mutations {
+            let mut verify = verifier(&v);
+            let mut other = v.binding.clone();
+            change(&mut other);
+            assert_eq!(
+                verify.consume(&v.token, &other, v.now).unwrap_err(),
+                Error::Binding
+            );
+            assert!(verify.consume(&v.token, &v.binding, v.now).is_ok());
+        }
+    }
+
+    fn signed(claims: &Claims, seed: [u8; 32]) -> String {
+        use ed25519_dalek::Signer;
+        // Intentionally public fixture keys; never provision in an installation.
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let header = serde_json::json!({"alg": "EdDSA", "typ": GRANT_TYPE, "kid": key_id(key.verifying_key().as_bytes())});
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap())
+        );
+        format!(
+            "{input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    #[test]
+    fn cache_capacity_clock_rollback_and_key_rotation() {
+        let v = vector();
+        let mut verify = verifier(&v);
+        verify.capacity = 1;
+        let mut claims = verify.consume(&v.token, &v.binding, v.now).unwrap();
+        claims.jti = new_challenge().unwrap();
+        let token = signed(&claims, [0; 32]);
+        assert_eq!(
+            verify.consume(&token, &v.binding, v.now).unwrap_err(),
+            Error::Capacity
+        );
+        claims.iat += 60;
+        claims.exp += 60;
+        let later = signed(&claims, [0; 32]);
+        assert!(verify.consume(&later, &v.binding, v.now + 60).is_ok());
+        assert_eq!(
+            verify.consume(&v.token, &v.binding, v.now).unwrap_err(),
+            Error::Expired
+        );
+        let old_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&v.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let new_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+            .verifying_key()
+            .to_bytes();
+        let mut rotating = Verifier::new(&[old_key, new_key], 16).unwrap();
+        assert!(rotating.consume(&later, &v.binding, v.now + 60).is_ok());
+        let new_token = signed(&claims, [1; 32]);
+        assert!(rotating
+            .consume(&new_token, &v.binding, v.now + 60)
+            .is_err()); // same jti remains single-use across keys
+        claims.jti = new_challenge().unwrap();
+        assert!(rotating
+            .consume(&signed(&claims, [1; 32]), &v.binding, v.now + 60)
+            .is_ok());
+        let mut retired = Verifier::new(&[new_key], 16).unwrap();
+        assert_eq!(
+            retired.consume(&later, &v.binding, v.now + 60).unwrap_err(),
+            Error::Invalid
+        );
+    }
+}
