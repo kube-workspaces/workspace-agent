@@ -251,6 +251,19 @@ fn token_sid(token: HANDLE) -> Result<String, String> {
         sid
     }
 }
+/// True when the current process token is LocalSystem (S-1-5-18). The
+/// management-exec runner refuses to act as any other identity; a QGA
+/// installation that runs the agent as a lesser user fails closed.
+pub fn process_is_local_system() -> bool {
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let token = Handle(token);
+        matches!(token_sid(token.0), Ok(sid) if sid == "S-1-5-18")
+    }
+}
 fn user_token(session: u32) -> Result<Handle, String> {
     unsafe {
         let mut token = HANDLE::default();

@@ -11,6 +11,7 @@ mod audio;
 mod binding;
 mod capture;
 mod daemon;
+mod management_exec;
 mod platform;
 mod resize;
 // Retirement targets Windows startup artifacts; on other platforms only the
@@ -52,6 +53,7 @@ fn usage(code: i32) -> ! {
     eprintln!("  kw-agent service-config-check [--data-dir DIR]");
     eprintln!("  kw-agent retire-legacy-startup (Windows; removes pre-service scheduled task, Run value and leftover launcher)");
     eprintln!("  kw-agent identity-check [--data-dir DIR] [--workspace-uid UID] [--workspace-generation GEN] (administrator; prints no private key)");
+    eprintln!("  kw-agent management-exec --request-file PATH [--data-dir DIR] [--keys-file PATH] [--state-dir DIR] (QGA pilot runner; prints one JSON result)");
     eprintln!("  kw-agent serve [--data-dir DIR] [--workspace-uid UID --workspace-generation GEN] [--port PORT] [--bind ADDR] [--max-sessions N] [--max-idle-secs N] [--clipboard] [--input] [--synthetic-video [--synthetic-fps N] [--synthetic-size WxH] [--synthetic-bitrate-bps N] | --capture-video [--capture-output N] [--capture-fps N] [--capture-bitrate-bps N]] [--capture-audio]");
     eprintln!(
         "  kw-agent connect-test --server ADDR --workspace-uid UID --workspace-generation GEN [--media-seconds N] [--save-video PATH] [--save-audio PATH]"
@@ -326,6 +328,34 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("status: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("management-exec") => {
+            // Approved QGA pod-exec pilot: one staged envelope in, independent
+            // guest verification, one bounded SYSTEM command out, one JSON
+            // result on stdout. Never interactive, never a shell or PTY.
+            let request_file = match flag_value(&args, "--request-file") {
+                Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
+                _ => {
+                    eprintln!("management-exec: --request-file is required");
+                    usage(2);
+                }
+            };
+            let data_dir = flag_value(&args, "--data-dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(daemon::default_data_dir);
+            let result = management_exec::run(&management_exec::RunArgs {
+                request_file,
+                keys_file: flag_value(&args, "--keys-file").map(std::path::PathBuf::from),
+                data_dir,
+                state_dir: flag_value(&args, "--state-dir").map(std::path::PathBuf::from),
+            });
+            match serde_json::to_string(&result) {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("management-exec: result encoding failed: {error}");
                     std::process::exit(1);
                 }
             }
