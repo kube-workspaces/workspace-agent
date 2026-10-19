@@ -4,6 +4,7 @@
 pub mod installer;
 pub mod inventory;
 pub mod journal;
+pub mod lifetime;
 pub mod persistence;
 
 use ed25519_dalek::{Signature, VerifyingKey};

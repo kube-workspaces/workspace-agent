@@ -50,7 +50,9 @@ The adapter must live in a **dedicated updater process**. MSI UI state is
 process-global: the adapter holds an exclusive in-process owner guard and owns
 the external UI callback for each synchronous MSI call. Do not embed it beside
 uncoordinated MSI API/UI consumers. It is separate from the agent's service and
-desktop worker; SCM packaging and service lifetime are still integration work.
+desktop worker. The [independent SCM host](updater-service.md) now supplies the
+separate lifetime/recovery shell; signed phase-authority/installer dispatch
+wiring remains integration work.
 
 ## Evidence and outages
 

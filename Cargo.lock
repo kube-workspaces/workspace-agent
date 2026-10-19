@@ -195,6 +195,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kw-agent-updater"
+version = "0.1.0"
+dependencies = [
+ "kw-management",
+ "serde_json",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
 name = "kw-audio"
 version = "0.1.0"
 dependencies = [

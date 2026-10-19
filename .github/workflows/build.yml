@@ -92,6 +92,28 @@ jobs:
           path: target/release/${{ matrix.bin }}
           if-no-files-found: error
 
+      - name: Build independent Windows updater helper
+        if: matrix.target == 'windows-amd64'
+        env:
+          KW_UPDATER_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release --locked -p kw-agent-updater
+
+      - name: Verify independent updater version
+        if: matrix.target == 'windows-amd64'
+        shell: bash
+        run: |
+          test "$(target/release/kw-agent-updater.exe --version)" = "kw-agent-updater ${{ steps.version.outputs.version }} (protocol 1)"
+
+      # Kept out of the agent MSI replacement tree. This is a separate CI
+      # artifact; updater publisher signing/release packaging remains separate.
+      - name: Upload independent updater helper
+        if: matrix.target == 'windows-amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-windows-amd64
+          path: target/release/kw-agent-updater.exe
+          if-no-files-found: error
+
   # Stage and archive all three targets in one place: the packaging shell
   # (tar/zip/sha256sum, make package) belongs on the Linux runner that owns
   # SHA256SUMS, exactly like desktop-client's assemble job.
@@ -249,10 +271,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Test native updater MSI compensation
+      - name: Build isolated updater SCM fixture host
+        run: cargo build --locked -p kw-agent-updater --example scm-test-host
+
+      - name: Test independent updater SCM and native MSI compensation
         shell: pwsh
         run: |
-          & packaging/windows/test-updater-msi.ps1 -StagingDir "$env:RUNNER_TEMP/msi-stage/workspace-agent-windows-amd64"
+          & packaging/windows/test-updater-service.ps1 -FixtureHost ./target/debug/examples/scm-test-host.exe -StagingDir "$env:RUNNER_TEMP/msi-stage/workspace-agent-windows-amd64"
 
       - name: Upload installer logs
         if: always()

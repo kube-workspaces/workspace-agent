@@ -201,12 +201,12 @@ fn acquire(root: &Path) -> Result<File, Error> {
 }
 
 #[cfg(windows)]
-fn private_new(path: &Path) -> Result<File, Error> {
+pub(super) fn private_new(path: &Path) -> Result<File, Error> {
     security::native::create_file(path)
 }
 
 #[cfg(unix)]
-fn private_new(path: &Path) -> Result<File, Error> {
+pub(super) fn private_new(path: &Path) -> Result<File, Error> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -232,12 +232,12 @@ fn read_checkpoint(root: &Path) -> Result<Vec<u8>, Error> {
 }
 
 #[cfg(unix)]
-fn replace(from: &Path, to: &Path) -> Result<(), Error> {
+pub(super) fn replace(from: &Path, to: &Path) -> Result<(), Error> {
     fs::rename(from, to).map_err(io_error)
 }
 
 #[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> Result<(), Error> {
+pub(super) fn replace(from: &Path, to: &Path) -> Result<(), Error> {
     use windows::{core::PCWSTR, Win32::Storage::FileSystem::*};
     unsafe {
         MoveFileExW(
@@ -250,14 +250,14 @@ fn replace(from: &Path, to: &Path) -> Result<(), Error> {
 }
 
 #[cfg(unix)]
-fn sync_root(root: &Path) -> Result<(), Error> {
+pub(super) fn sync_root(root: &Path) -> Result<(), Error> {
     File::open(root)
         .and_then(|dir| dir.sync_all())
         .map_err(io_error)
 }
 
 #[cfg(windows)]
-fn sync_root(_: &Path) -> Result<(), Error> {
+pub(super) fn sync_root(_: &Path) -> Result<(), Error> {
     // MoveFileExW above requests synchronous write-through completion.
     Ok(())
 }
