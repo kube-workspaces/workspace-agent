@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "target_id": "windows-agent-0.3.5",
+  "os": "windows",
+  "architecture": "amd64",
+  "agent_version": "0.3.5",
+  "build_sha256": "0f909a79b289c9a2dc881af4c58f2893eebfab58f80f215a57d32a8db8729e56",
+  "msi": {
+    "artifact": {"file": "agent.msi", "sha256": "21b8cd2bd8f82a1d15ead5ad2d8cbb7ccf0ed5b784aebcb3f9711bcf3472c807", "size": 6},
+    "product_code": "12345678-1234-1234-1234-123456789abc",
+    "upgrade_code": "f72bb43e-dba8-4dbb-a963-b201e6c0d885"
+  },
+  "updater": {
+    "artifact": {"file": "updater.exe", "sha256": "5f131b1b85ae96f0876a5ba0c4f238a385350d8cadd3d6bb22dd8d90a626b45f", "size": 9},
+    "protocol_version": 1
+  },
+  "driver": {
+    "artifact": {"file": "idd.zip", "sha256": "9e6c705565bce3e58a5691aa6433b4aaef4845dbd70608d077aecf21df9e576d", "size": 6},
+    "version": "25.7.23.0",
+    "signer_sha256": "8516b67da8ae2d6a1f53090bad04288d670317fe97b8893efab1ffe03f604eb4",
+    "hardware_ids": ["ROOT\\ExampleIDD"]
+  },
+  "compatibility": {
+    "minimum_agent_version": "0.3.0",
+    "maximum_agent_version": "0.3.99",
+    "management_min": 1,
+    "management_max": 1,
+    "desktop_min": 1,
+    "desktop_max": 1
+  },
+  "rollback_predecessors": [{"target_id": "windows-agent-0.3.4", "manifest_sha256": "098c3614c37d68b1c18cfb1e75406670cc936259bc17bb08cd7d439d7b6ee66f"}],
+  "reboot_policy": "may-require"
+}

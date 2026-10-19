@@ -7,6 +7,9 @@
 //! installed runner verifies before any process is created. The runner itself
 //! lives in `kw-agent`; this crate only defines and verifies the contract.
 
+/// Offline publisher-signed update manifest contract; no installation/dispatch.
+pub mod updates;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
