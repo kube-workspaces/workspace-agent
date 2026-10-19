@@ -140,6 +140,23 @@ pub struct Transition {
     ack_kind: String,
 }
 
+/// A single-use local dispatch capability. Only a successfully persisted and
+/// off-guest-acknowledged transition can create it; recovery cannot reconstruct
+/// one from a serialized Action. Current phase authority must still be checked
+/// immediately before the native effect.
+#[derive(Debug)]
+pub struct CommittedAction {
+    action: Action,
+    plan: Plan,
+    owner_fence: u64,
+}
+
+impl CommittedAction {
+    pub(super) fn into_parts(self) -> (Action, Plan, u64) {
+        (self.action, self.plan, self.owner_fence)
+    }
+}
+
 fn encoded<T: Serialize>(value: &T) -> Vec<u8> {
     // This schema contains no custom serializers, floating point or map keys.
     serde_json::to_vec(value).expect("journal schema serialization is infallible")
@@ -818,6 +835,23 @@ fn mutating_action(s: &str) -> bool {
 }
 
 impl Transition {
+    /// Production adapter dispatch uses this consuming permit rather than the
+    /// serializable Action descriptor returned by the offline model interface.
+    pub fn commit_for_dispatch(
+        self,
+        store: &mut impl Store,
+        c: &Context,
+        ack: Option<&Ack>,
+    ) -> Result<(Journal, Option<CommittedAction>), Error> {
+        let (journal, action) = self.commit(store, c, ack)?;
+        let permit = action.map(|action| CommittedAction {
+            action,
+            plan: journal.snapshot.plan.clone(),
+            owner_fence: journal.snapshot.owner_fence,
+        });
+        Ok((journal, permit))
+    }
+
     pub fn bytes(&self) -> Vec<u8> {
         self.next.encode()
     }
