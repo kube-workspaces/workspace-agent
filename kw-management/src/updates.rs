@@ -3,6 +3,7 @@
 
 pub mod inventory;
 pub mod journal;
+pub mod persistence;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
