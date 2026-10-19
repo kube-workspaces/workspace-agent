@@ -107,6 +107,11 @@ fn publisher_and_raw_byte_substitution_fail() {
     message.extend_from_slice(RAW);
     let signature = key.sign(&message).to_bytes();
     let digest = updates::digest(RAW);
+    let crlf = std::str::from_utf8(RAW).unwrap().replace('\n', "\r\n");
+    assert_eq!(
+        updates::verify(crlf.as_bytes(), &signature, &id, &digest, &keys).unwrap_err(),
+        Error::Digest
+    );
     assert_eq!(
         updates::verify(RAW, &signature, "unknown", &digest, &keys).unwrap_err(),
         Error::Untrusted

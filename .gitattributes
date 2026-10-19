@@ -1,0 +1,2 @@
+# Publisher-signed fixtures bind exact bytes, including line endings.
+/kw-management/tests/testdata/*.json text eol=lf
