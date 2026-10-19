@@ -1,6 +1,7 @@
 //! Publisher-authenticated updater artifacts. No download, listener, process or
 //! installation authorization is implemented by this offline contract.
 
+pub mod inventory;
 pub mod journal;
 
 use ed25519_dalek::{Signature, VerifyingKey};
