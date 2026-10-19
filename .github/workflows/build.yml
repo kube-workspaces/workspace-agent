@@ -244,6 +244,16 @@ jobs:
         run: |
           & packaging/windows/test-msi.ps1 -StagingDir "$env:RUNNER_TEMP/msi-stage/workspace-agent-windows-amd64"
 
+      - name: Install pinned Rust toolchain for native updater regression
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test native updater MSI compensation
+        shell: pwsh
+        run: |
+          & packaging/windows/test-updater-msi.ps1 -StagingDir "$env:RUNNER_TEMP/msi-stage/workspace-agent-windows-amd64"
+
       - name: Upload installer logs
         if: always()
         uses: actions/upload-artifact@v7

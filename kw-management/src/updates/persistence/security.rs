@@ -63,12 +63,12 @@ fn check_parents(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-pub(super) fn check_root(path: &Path) -> Result<(), Error> {
+pub(crate) fn check_root(path: &Path) -> Result<(), Error> {
     check_parents(path)?;
     check(path, true)
 }
 
-pub(super) fn check_file(path: &Path) -> Result<(), Error> {
+pub(crate) fn check_file(path: &Path) -> Result<(), Error> {
     check(path, false)
 }
 
@@ -114,7 +114,7 @@ pub(super) fn wide(path: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-pub(super) mod native {
+pub(crate) mod native {
     use super::{wide, Error};
     use std::{
         fs::File,

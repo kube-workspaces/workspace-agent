@@ -12,7 +12,7 @@
 //! authority. An uncertain write result requires reopening/reconciliation, never
 //! retrying the installer. No installer, service or management transport runs here.
 
-mod security;
+pub(crate) mod security;
 #[cfg(test)]
 mod tests;
 

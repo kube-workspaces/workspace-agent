@@ -1,8 +1,8 @@
 //! Typed MSI transaction dispatch boundary for the independent updater.
 //!
-//! No service/listener is wired to this module. Native package verification,
-//! Windows Installer inventory and current phase authority are required adapter
-//! contracts. The dispatcher never accepts installer flags, scripts or arbitrary
+//! No service/listener is wired to this module. Windows supplies native package
+//! verification and Installer inventory; current phase authority remains a
+//! required adapter contract. The dispatcher never accepts installer flags, scripts or arbitrary
 //! ProductCodes. Driver-changing transactions require their own qualified adapter.
 
 use super::{
@@ -10,6 +10,8 @@ use super::{
     version, VerifiedManifest, AGENT_UPGRADE_CODE,
 };
 
+#[cfg(windows)]
+pub mod native;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +24,7 @@ pub enum Error {
     Busy,
     RebootPending,
     Package,
+    Recording,
     /// An effect may have started or an observed result contradicts its return
     /// code. Reconcile the active journal action; never automatically retry it.
     Uncertain,

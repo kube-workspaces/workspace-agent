@@ -52,15 +52,18 @@ health, unchanged machine identity, or upgrade/rollback success from MSI results
 
 ## Native adapter obligations
 
-No production `MsiAdapter` or `PhaseAuthority` implementation is supplied yet.
-The native implementation must use protected staged files pinned against
-replacement throughout the installer operation, bound artifact size/digest and
+`Transaction::windows_adapter` now supplies the Windows `MsiAdapter`; see
+[native MSI adapter](updater-native-msi.md). No production `PhaseAuthority`
+implementation or management/service dispatch is enabled yet.
+The native implementation uses protected staged files pinned against
+replacement throughout the installer operation, bounded artifact size/digest and
 MSI Property-table checks, Windows Installer APIs rather than `Win32_Product`,
 fixed machine-wide silent/reboot-suppressed operations, and bounded evidence
 capture. Target and predecessor artifacts may have the same basename; resolve
 them by their separately pinned identities/staging locations.
 
-Native effects must preserve ProgramData, enrolled identity and private keys.
-Never kill a running MSI to implement cancellation. SCM lifetime, native
-installer/driver integration, authenticated management phase grants and actual
+Native effects preserve ProgramData; enrolled identity/private-key preservation
+still requires installed-guest integration proof.
+Never kill a running MSI to implement cancellation. SCM lifetime, qualified
+driver integration, authenticated management phase grants and actual
 installed-build compensation/reboot proof remain separate integration work.
