@@ -4,7 +4,7 @@
 //!
 //! Contract: one staged envelope file → independent guest verification of the
 //! signed QGA grant (pinned public keys, enrolled workspace UID, request
-//! bounds, single-use) → one bounded child process under a Windows Job Object
+//! bounds, single-use) → one bounded process tree under a Windows Job Object
 //! (deadline, combined output cap, process-tree cleanup) → one bounded JSON
 //! result on stdout. No interactive stdin, no detached jobs, no shell/PTY.
 //! The API must treat this result as the authoritative guest outcome; loss of
@@ -321,8 +321,8 @@ fn spawn_bounded(_spec: &CommandSpec) -> RunOutcome {
     RunOutcome::unsupported()
 }
 
-/// Windows Job Object supervised process spawn: KILL_ON_JOB_CLOSE, one
-/// active process, redirected pipes, combined output cap, deadline
+/// Windows Job Object supervised process spawn: KILL_ON_JOB_CLOSE, bounded
+/// active processes, redirected pipes, combined output cap, deadline
 /// termination and process-tree cleanup.
 #[cfg(windows)]
 mod windows_runner {
@@ -357,6 +357,10 @@ mod windows_runner {
     /// the child runs instead of only after it exits.
     const POLL_SLICE_MS: u32 = 50;
     const REAP_TIMEOUT_MS: u32 = 5_000;
+    // PowerShell and cmd must be able to invoke native commands. All children
+    // inherit this job; breakaway stays disabled and the entire tree shares
+    // the command's lifetime, output cap and deadline.
+    const MAX_ACTIVE_PROCESSES: u32 = 16;
 
     fn spawn_failed(context: &str, detail: String) -> RunOutcome {
         RunOutcome {
@@ -532,9 +536,9 @@ mod windows_runner {
             std::thread::spawn(move || read_pipe(stderr_read, &sink, true))
         };
 
-        // KILL_ON_JOB_CLOSE ties the child's lifetime to this process and
-        // ActiveProcessLimit=1 forbids grandchildren: nothing can outlive or
-        // escape the job.
+        // KILL_ON_JOB_CLOSE ties the whole tree's lifetime to this process.
+        // A bounded process count permits shell-invoked native utilities while
+        // preventing an unbounded tree; no process may break away from the job.
         let job = match unsafe { CreateJobObjectW(None, PCWSTR::null()) } {
             Ok(job) => job,
             Err(error) => {
@@ -550,7 +554,7 @@ mod windows_runner {
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags =
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        limits.BasicLimitInformation.ActiveProcessLimit = MAX_ACTIVE_PROCESSES;
         if let Err(error) = unsafe {
             SetInformationJobObject(
                 job,
@@ -663,22 +667,22 @@ mod windows_runner {
                 break;
             }
         }
-        if outcome != "completed" {
-            unsafe {
-                let _ = TerminateJobObject(job, 1);
-                let _ = WaitForSingleObject(process.hProcess, REAP_TIMEOUT_MS);
-            }
+        // A root that exited successfully may still have descendants holding
+        // the redirected pipes. Terminate the entire tree and close the job
+        // BEFORE joining readers, or those pipes can block past the deadline.
+        // The already-exited root retains its actual exit code.
+        let mut exit_code: u32 = 1;
+        unsafe {
+            let _ = TerminateJobObject(job, 1);
+            let _ = WaitForSingleObject(process.hProcess, REAP_TIMEOUT_MS);
+            let _ = GetExitCodeProcess(process.hProcess, &mut exit_code);
+            let _ = CloseHandle(process.hProcess);
+            let _ = CloseHandle(job);
         }
         stdout_thread.join().ok();
         stderr_thread.join().ok();
         if sink.overflow.load(Ordering::SeqCst) {
             outcome = "output-limit";
-        }
-        let mut exit_code: u32 = 1;
-        unsafe {
-            let _ = GetExitCodeProcess(process.hProcess, &mut exit_code);
-            let _ = CloseHandle(process.hProcess);
-            let _ = CloseHandle(job);
         }
         let outcome = RunOutcome {
             outcome,
@@ -981,5 +985,123 @@ mod tests {
             quote_arg("C:\\dir with space\\"),
             "\"C:\\dir with space\\\\\""
         );
+    }
+
+    #[cfg(windows)]
+    static WINDOWS_RUNNER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    fn powershell_spec(script: &str) -> CommandSpec {
+        let root = std::env::var("SystemRoot").expect("Windows system directory");
+        CommandSpec {
+            executable: format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            args: vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!("$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; {script}"),
+            ],
+            cwd: None,
+            deadline: Duration::from_secs(10),
+            output_limit: 16 * 1024,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_can_launch_native_commands_inside_job() {
+        let _guard = WINDOWS_RUNNER_TEST_LOCK
+            .lock()
+            .expect("native runner tests");
+        for program in ["whoami.exe", "hostname.exe"] {
+            let spec = powershell_spec(&format!(
+                "& \"$env:SystemRoot\\System32\\{program}\"; exit $LASTEXITCODE"
+            ));
+            let result = super::windows_runner::spawn(&spec);
+            assert_eq!(result.outcome, "completed", "{program}: {result:?}");
+            assert_eq!(result.exit_code, Some(0), "{program}: {result:?}");
+            assert!(!result.stdout.is_empty(), "{program} produced no output");
+            assert!(result.stderr.is_empty(), "{program}: {result:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_recorded_child_stopped(result: &RunOutcome) {
+        use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let output = String::from_utf8_lossy(&result.stdout);
+        let pid: u32 = output
+            .lines()
+            .find_map(|line| line.strip_prefix("child="))
+            .expect("spawned child PID was not recorded")
+            .trim()
+            .parse()
+            .expect("child PID");
+        // A reaped child may no longer have a process object to open. If it
+        // does, its exit code must prove it is no longer running.
+        if let Ok(handle) = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            let mut code = 0;
+            let status = unsafe { GetExitCodeProcess(handle, &mut code) };
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            status.expect("child exit code");
+            assert_ne!(
+                code, STILL_ACTIVE.0 as u32,
+                "child survived the command job"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    const START_LONG_CHILD: &str = r#"$child = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @('-n','60','127.0.0.1') -NoNewWindow -PassThru; Write-Output "child=$($child.Id)";"#;
+
+    #[cfg(windows)]
+    #[test]
+    fn root_exit_terminates_descendants_before_draining_pipes() {
+        let _guard = WINDOWS_RUNNER_TEST_LOCK
+            .lock()
+            .expect("native runner tests");
+        let result = super::windows_runner::spawn(&powershell_spec(START_LONG_CHILD));
+        assert_eq!(result.outcome, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(
+            result.duration < Duration::from_secs(10),
+            "reader join outlived root: {result:?}"
+        );
+        assert_recorded_child_stopped(&result);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deadline_terminates_the_entire_command_tree() {
+        let _guard = WINDOWS_RUNNER_TEST_LOCK
+            .lock()
+            .expect("native runner tests");
+        let mut spec = powershell_spec(&format!("{START_LONG_CHILD} Start-Sleep -Seconds 60"));
+        spec.deadline = Duration::from_secs(5);
+        let result = super::windows_runner::spawn(&spec);
+        assert_eq!(result.outcome, "deadline", "{result:?}");
+        assert!(result.duration < Duration::from_secs(15), "{result:?}");
+        assert_recorded_child_stopped(&result);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_limit_terminates_the_entire_command_tree() {
+        let _guard = WINDOWS_RUNNER_TEST_LOCK
+            .lock()
+            .expect("native runner tests");
+        let spec = powershell_spec(&format!(
+            "{START_LONG_CHILD} [Console]::Out.Write(('x' * 65536)); Start-Sleep -Seconds 60"
+        ));
+        let result = super::windows_runner::spawn(&spec);
+        assert_eq!(result.outcome, "output-limit", "{result:?}");
+        assert!(result.truncated);
+        assert!(result.stdout.len() + result.stderr.len() <= spec.output_limit);
+        assert_recorded_child_stopped(&result);
     }
 }
