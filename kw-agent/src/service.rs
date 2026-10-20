@@ -246,6 +246,8 @@ fn run(
                     "worker exited: serve port already in use; another process is holding the configured port"
                 );
                 worker_error = Some("port-in-use");
+                // Back off more when port is held; don't spam restarts
+                retry.failed(origin.elapsed().as_secs());
             } else {
                 eprintln!("worker exited; bounded restart scheduled");
                 worker_error = None;

@@ -421,6 +421,15 @@ fn main() {
                     eprintln!("serve: port {port} already in use: {error}");
                     std::process::exit(EXIT_BIND_IN_USE);
                 }
+                let msg = error.to_string();
+                if msg.contains("10048")
+                    || msg.contains("Only one usage")
+                    || msg.contains("already in use")
+                    || msg.contains("address already in use")
+                {
+                    eprintln!("serve: port {port} already in use: {error}");
+                    std::process::exit(EXIT_BIND_IN_USE);
+                }
                 eprintln!("serve: bind failed: {error}");
                 std::process::exit(1);
             });
