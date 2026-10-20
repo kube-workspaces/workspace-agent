@@ -471,7 +471,11 @@ mod windows_runner {
                     .expect("output sink")
                     .extend_from_slice(&data[..allowed]);
             }
-            previous + data.len() > self.limit
+            let overflow = previous + data.len() > self.limit;
+            if overflow {
+                self.overflow.store(true, Ordering::SeqCst);
+            }
+            overflow
         }
     }
 
@@ -1013,7 +1017,7 @@ mod tests {
     fn powershell_can_launch_native_commands_inside_job() {
         let _guard = WINDOWS_RUNNER_TEST_LOCK
             .lock()
-            .expect("native runner tests");
+            .unwrap_or_else(|poison| poison.into_inner());
         for program in ["whoami.exe", "hostname.exe"] {
             let spec = powershell_spec(&format!(
                 "& \"$env:SystemRoot\\System32\\{program}\"; exit $LASTEXITCODE"
@@ -1064,7 +1068,7 @@ mod tests {
     fn root_exit_terminates_descendants_before_draining_pipes() {
         let _guard = WINDOWS_RUNNER_TEST_LOCK
             .lock()
-            .expect("native runner tests");
+            .unwrap_or_else(|poison| poison.into_inner());
         let result = super::windows_runner::spawn(&powershell_spec(START_LONG_CHILD));
         assert_eq!(result.outcome, "completed", "{result:?}");
         assert_eq!(result.exit_code, Some(0), "{result:?}");
@@ -1080,7 +1084,7 @@ mod tests {
     fn deadline_terminates_the_entire_command_tree() {
         let _guard = WINDOWS_RUNNER_TEST_LOCK
             .lock()
-            .expect("native runner tests");
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut spec = powershell_spec(&format!("{START_LONG_CHILD} Start-Sleep -Seconds 60"));
         spec.deadline = Duration::from_secs(5);
         let result = super::windows_runner::spawn(&spec);
@@ -1094,7 +1098,7 @@ mod tests {
     fn output_limit_terminates_the_entire_command_tree() {
         let _guard = WINDOWS_RUNNER_TEST_LOCK
             .lock()
-            .expect("native runner tests");
+            .unwrap_or_else(|poison| poison.into_inner());
         let spec = powershell_spec(&format!(
             "{START_LONG_CHILD} [Console]::Out.Write(('x' * 65536)); Start-Sleep -Seconds 60"
         ));
