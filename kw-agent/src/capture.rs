@@ -103,6 +103,33 @@ fn reopen<T>(
     }
 }
 
+/// GDI mode readback can lead DXGI topology by several frames. A successful
+/// duplication open is not sufficient: release stale-size duplicators and wait
+/// for the selected output to converge within the resize transaction's budget.
+fn reopen_resized<T>(
+    ended: &std::sync::atomic::AtomicBool,
+    deadline: Instant,
+    delay: Duration,
+    expected: (u32, u32),
+    mut open: impl FnMut() -> Result<T, String>,
+    size: impl Fn(&T) -> (u32, u32),
+) -> Result<T, String> {
+    loop {
+        if ended.load(Ordering::SeqCst) {
+            return Err("display-session-ended".into());
+        }
+        let reason = match open() {
+            Ok(fresh) if size(&fresh) == expected => return Ok(fresh),
+            Ok(_) => "display-capture-mode-mismatch".into(),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(reason);
+        }
+        std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 /// Capture thread body: open, acquire → encode → feed until the session
 /// ends. The duplicator opens per session (fresh mode read every time);
 /// a genuinely unusable desktop reports through `ready` so serve exits
@@ -289,18 +316,17 @@ pub fn run(
                     // DXGI allows one duplication per output per process;
                     // release the old interface before opening its replacement.
                     let _ = duplicator.take();
-                    let fresh = loop {
-                        match open_output(output_index, output_name.as_deref()) {
-                            Ok(fresh) => break fresh,
-                            Err(error) if Instant::now() >= request.deadline => {
-                                return Err(error.to_string())
-                            }
-                            Err(_) => std::thread::sleep(Duration::from_millis(50)),
-                        }
-                    };
-                    if fresh.size() != (actual.width, actual.height) {
-                        return Err("display-capture-mode-mismatch".into());
-                    }
+                    let fresh = reopen_resized(
+                        &gate.ended,
+                        request.deadline,
+                        Duration::from_millis(50),
+                        (actual.width, actual.height),
+                        || {
+                            open_output(output_index, output_name.as_deref())
+                                .map_err(|e| e.to_string())
+                        },
+                        |fresh| fresh.size(),
+                    )?;
                     let (width, height) = fresh.padded_size();
                     if prepared.settings().width != width || prepared.settings().height != height {
                         prepared
@@ -328,7 +354,16 @@ pub fn run(
                     Err(reason) => {
                         let _ = request.reply.send(Err(reason));
                         if duplicator.is_none() {
-                            return;
+                            // The OS may already have changed modes. Rebuild at
+                            // its actual size rather than leaving control alive
+                            // with a permanently dead capture thread.
+                            gate.capture_suspended.store(true, Ordering::SeqCst);
+                            if let Ok(mut video) = gate.video.lock() {
+                                *video = None;
+                            }
+                            encoder = None;
+                            last_frame = None;
+                            continue;
                         }
                     }
                 }
@@ -448,6 +483,53 @@ pub fn run(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    #[test]
+    fn resize_waits_for_dxgi_size_after_gdi_readback() {
+        let ended = AtomicBool::new(false);
+        let mut attempts = 0;
+        let fresh = reopen_resized(
+            &ended,
+            Instant::now() + Duration::from_secs(1),
+            Duration::ZERO,
+            (2560, 1440),
+            || {
+                attempts += 1;
+                match attempts {
+                    1 => Ok((1920, 1080)),
+                    2 => Err("transient access loss".into()),
+                    _ => Ok((2560, 1440)),
+                }
+            },
+            |size| *size,
+        )
+        .unwrap();
+        assert_eq!(fresh, (2560, 1440));
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn resize_topology_wait_is_bounded_and_cancellable() {
+        let ended = AtomicBool::new(false);
+        let result = reopen_resized(
+            &ended,
+            Instant::now(),
+            Duration::ZERO,
+            (2560, 1440),
+            || Ok((1920, 1080)),
+            |size| *size,
+        );
+        assert_eq!(result.unwrap_err(), "display-capture-mode-mismatch");
+        ended.store(true, Ordering::SeqCst);
+        let result = reopen_resized::<()>(
+            &ended,
+            Instant::now() + Duration::from_secs(30),
+            Duration::ZERO,
+            (2560, 1440),
+            || panic!("must not open after cancellation"),
+            |_| (0, 0),
+        );
+        assert_eq!(result.unwrap_err(), "display-session-ended");
+    }
     #[test]
     fn repeated_secure_desktop_denials_do_not_end_capture() {
         let ended = AtomicBool::new(false);
