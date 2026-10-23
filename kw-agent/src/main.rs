@@ -45,6 +45,9 @@ fn usage(code: i32) -> ! {
     eprintln!(
         "  serve --capture-video defaults to a virtual/indirect display output when present (configurable modes)"
     );
+    eprintln!(
+        "  serve --keep-console-display leaves the console VGA active beside the default virtual output"
+    );
     eprintln!("  serve --resize enables guest mode changes with --capture-video in the active console session");
     eprintln!("  kw-agent --version|--platform|--hello");
     eprintln!("  kw-agent daemon --workspace-uid UID --workspace-generation GEN [--data-dir DIR] [--interval-secs N] [--beats N]");
@@ -565,6 +568,25 @@ fn main() {
             if synthetic && capture_video {
                 eprintln!("serve: --synthetic-video and --capture-video are exclusive");
                 usage(2);
+            }
+            // With default selection, stream the virtual display alone. Windows
+            // otherwise keeps the emulated console VGA active, and applications
+            // with saved placements reopen there even after the virtual display
+            // becomes primary. Leaving the VGA attached only for console fallback
+            // does not fix that placement, so default serve detaches it. The
+            // topology change is session-only and is reapplied on every start.
+            if capture_video
+                && capture_output_index == 0
+                && flag_value(&args, "--capture-output-name").is_none()
+                && !args.iter().any(|arg| arg == "--keep-console-display")
+            {
+                if let Some(name) = capture_output_name.as_deref() {
+                    match kw_platform::display::isolate_virtual(name) {
+                        Ok(true) => println!("isolated display {name} as the only active output"),
+                        Ok(false) => {}
+                        Err(error) => eprintln!("serve: display isolation failed: {error}"),
+                    }
+                }
             }
             let video = synthetic || capture_video;
             let synth_settings = kw_encode::Settings {

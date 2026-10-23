@@ -190,6 +190,15 @@ managed service with default `workerArgs` no longer locks to the VGA's single
 mode. An explicit `--capture-output-name` (or a non-zero `--capture-output`
 index) still overrides the preference.
 
+For the same default selection, `serve` also makes that virtual display the
+**only active output**. Windows otherwise keeps the emulated console VGA
+attached, and applications with saved window placements reopen there even when
+the virtual display is primary. Detaching the VGA is the reliable fix. The
+topology change is session-only (not saved to the display database) and is
+reapplied whenever the worker starts. Pass `--keep-console-display` to leave
+the VGA attached; while the virtual display is isolated, Tier 0 captures of the
+console output are unavailable.
+
 The display identity is checked separately from the DXGI rendering adapter.
 An IDD backed by a hardware GPU can report the GPU's vendor name and no
 software-adapter flag; its matching GDI display description still identifies

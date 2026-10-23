@@ -108,6 +108,21 @@ pub fn resize_selected(
     platform::resize(output_index, name, requested)
 }
 
+/// Make a virtual output the only active display.
+///
+/// Default selection streams a virtual display, but Windows can leave the
+/// emulated console VGA active and primary beside it. Applications then reopen
+/// saved placements on the console monitor even when the virtual display is
+/// primary. Disabling every other path and promoting the selected output is
+/// the only reliable way to keep those windows on the captured display.
+///
+/// This is a session-only topology change: it is not written to the display
+/// database, so it cannot strand a guest after the worker exits. Returns
+/// `false` when the selected output is not virtual or is already alone.
+pub fn isolate_virtual(name: &str) -> Result<bool, String> {
+    platform::isolate_virtual(name)
+}
+
 #[cfg(not(target_os = "windows"))]
 mod platform {
     use super::Size;
@@ -124,16 +139,27 @@ mod platform {
     ) -> Result<Size, String> {
         Err("display-backend-unavailable".into())
     }
+    pub fn isolate_virtual(_name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::Size;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+        SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
+        SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    };
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND, WIN32_ERROR};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     use windows::Win32::Graphics::Gdi::{
-        ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE, DEVMODEW,
+        ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE,
+        DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
         DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
     };
 
@@ -199,6 +225,103 @@ mod platform {
             width: mode.dmPelsWidth,
             height: mode.dmPelsHeight,
         })
+    }
+
+    pub fn isolate_virtual(name: &str) -> Result<bool, String> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        if !super::is_virtual_display_adapter(&super::display_description(&wide)) {
+            return Ok(false);
+        }
+        let (paths, modes) = query_active_topology()?;
+        let selected = paths.iter().position(|path| {
+            path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+                && source_device_name(path).is_some_and(|source| source.eq_ignore_ascii_case(name))
+        });
+        let selected = selected.ok_or_else(|| "display-topology-output-not-found".to_string())?;
+        if paths.len() == 1 {
+            return Ok(false);
+        }
+        let only = [paths[selected]];
+        let flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_APPLY;
+        let result = unsafe { SetDisplayConfig(Some(&only), Some(&modes), flags) };
+        if result != 0 {
+            return Err(format!("display-topology-isolate-failed:{result}"));
+        }
+        if !primary_display_name().is_some_and(|primary| primary.eq_ignore_ascii_case(name)) {
+            return Err("display-primary-not-selected".into());
+        }
+        Ok(true)
+    }
+
+    fn query_active_topology(
+    ) -> Result<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>), String> {
+        for _ in 0..4 {
+            let mut path_count = 0;
+            let mut mode_count = 0;
+            unsafe {
+                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+            }
+            .map_err(|error| format!("display-topology-buffer-query-failed:{}", error.code().0))?;
+            let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+            let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+            match unsafe {
+                QueryDisplayConfig(
+                    QDC_ONLY_ACTIVE_PATHS,
+                    &mut path_count,
+                    paths.as_mut_ptr(),
+                    &mut mode_count,
+                    modes.as_mut_ptr(),
+                    None,
+                )
+            } {
+                Ok(()) => {
+                    paths.truncate(path_count as usize);
+                    modes.truncate(mode_count as usize);
+                    return Ok((paths, modes));
+                }
+                Err(error)
+                    if WIN32_ERROR::from_error(&error) == Some(ERROR_INSUFFICIENT_BUFFER) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("display-topology-query-failed:{}", error.code().0));
+                }
+            }
+        }
+        Err("display-topology-query-unstable".into())
+    }
+
+    fn source_device_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+        let mut request = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut request.header) } != 0 {
+            return None;
+        }
+        Some(super::wide_to_string(&request.viewGdiDeviceName))
+    }
+
+    fn primary_display_name() -> Option<String> {
+        for index in 0..32 {
+            let mut device = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool() {
+                break;
+            }
+            if device.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0 {
+                return Some(super::wide_to_string(&device.DeviceName));
+            }
+        }
+        None
     }
 }
 
@@ -434,5 +557,11 @@ mod tests {
             software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, false, 0),
         ];
         assert_eq!(select_output(&candidates, 0, None), Some(0));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn isolation_is_a_noop_off_windows() {
+        assert_eq!(isolate_virtual(r"\\.\DISPLAY1"), Ok(false));
     }
 }
