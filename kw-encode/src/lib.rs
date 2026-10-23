@@ -203,7 +203,23 @@ pub struct StreamEncoder {
     state: inner::Stream,
 }
 
+/// Backend actually constructed by this encoder, not enumerated capabilities.
+#[derive(Clone, Debug, Serialize)]
+pub struct EncoderInfo {
+    pub name: &'static str,
+    pub codec: &'static str,
+    pub hardware: bool,
+}
+
 impl StreamEncoder {
+    pub fn info(&self) -> EncoderInfo {
+        EncoderInfo {
+            name: "Microsoft H.264 Encoder MFT",
+            codec: "H.264",
+            hardware: false,
+        }
+    }
+
     pub fn new(settings: &Settings) -> Result<Self, Error> {
         if settings.width == 0 || settings.height == 0 || settings.fps == 0 {
             return Err(Error::Configure("zero dimension or rate".into()));

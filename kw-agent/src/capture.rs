@@ -68,6 +68,22 @@ fn attempt_establish(
     }
 }
 
+/// Publish only the capture and encoder objects that were actually opened.
+fn report_video(
+    capture: &kw_platform::capture::Duplicator,
+    encoder: &kw_encode::StreamEncoder,
+    gate: &MediaGate,
+) {
+    if let Ok(mut video) = gate.video.lock() {
+        *video = capture.info().map(|info| {
+            serde_json::json!({
+                "capture": info,
+                "encoder": encoder.info(),
+            })
+        });
+    }
+}
+
 /// Keep the admitted transport alive while Windows owns the secure desktop.
 /// Polling is bounded and cancellable, including repeated access-denied errors.
 fn reopen<T>(
@@ -143,6 +159,9 @@ pub fn run(
         }
     };
     if let Some(duplicator) = duplicator.as_ref() {
+        if let Some(encoder) = encoder.as_ref() {
+            report_video(duplicator, encoder, &gate);
+        }
         gate.capture_width
             .store(duplicator.size().0, Ordering::SeqCst);
         gate.capture_height
@@ -199,6 +218,7 @@ pub fn run(
                 &resize,
             ) {
                 Ok(Some((fresh, fresh_encoder))) => {
+                    report_video(&fresh, &fresh_encoder, &gate);
                     duplicator = Some(fresh);
                     encoder = Some(fresh_encoder);
                     last_frame = None;
@@ -293,6 +313,7 @@ pub fn run(
                             })
                             .map_err(|error| format!("display-encoder-reconfigure:{error}"))?;
                     }
+                    report_video(&fresh, &prepared, &gate);
                     encoder = Some(prepared);
                     duplicator = Some(fresh);
                     last_frame = None;
@@ -327,6 +348,9 @@ pub fn run(
             Err(error) if kw_platform::capture::recoverable(&error) => {
                 eprintln!("capture: desktop temporarily unavailable ({error}); waiting to recover");
                 gate.capture_suspended.store(true, Ordering::SeqCst);
+                if let Ok(mut video) = gate.video.lock() {
+                    *video = None;
+                }
                 let _ = duplicator.take();
                 encoder = None;
                 last_frame = None;

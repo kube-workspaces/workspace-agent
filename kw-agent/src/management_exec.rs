@@ -1086,10 +1086,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let mut spec = powershell_spec(&format!("{START_LONG_CHILD} Start-Sleep -Seconds 60"));
-        spec.deadline = Duration::from_secs(5);
+        // A cold hosted Windows runner can spend five seconds starting
+        // PowerShell/Start-Process before it records the child. Use the pilot's
+        // maximum deadline so this still proves descendant termination rather
+        // than accidentally testing only cancellation during interpreter startup.
+        spec.deadline = Duration::from_secs(20);
         let result = super::windows_runner::spawn(&spec);
         assert_eq!(result.outcome, "deadline", "{result:?}");
-        assert!(result.duration < Duration::from_secs(15), "{result:?}");
+        assert!(result.duration < Duration::from_secs(30), "{result:?}");
         assert_recorded_child_stopped(&result);
     }
 

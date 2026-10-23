@@ -211,6 +211,15 @@ It reports selected output, capture size, mode count, five seconds of acquired
 frame counts and adapter inventory. It saves no pixels. A single static frame
 does not establish animated rendering, encoding or end-to-end viewer readiness.
 
+Interactive `hello` and `telemetry` messages optionally report `video.capture`
+(backend, output, adapter, PCI vendor/device IDs and software flag) and
+`video.encoder` (backend name, codec and hardware flag). These facts come from
+the opened duplicator and encoder, not a list of installed capabilities. Capture
+loss clears the video facts; successful recovery/resize republishes the actual
+backends. The current encoder is the Microsoft software H.264 MFT even when
+capture uses a hardware GPU. Neither capture-adapter identity nor encoder choice
+establishes an application's rendering adapter or GPU utilization.
+
 The legacy `--capture-output N` selects that output index on the first adapter
 exposing it. GPU vendor, onboard/discrete/vGPU/passthrough presence and KVM CPU
 acceleration are not substitutes for actual output, driver or codec capability.

@@ -52,6 +52,8 @@ pub struct SessionOutcome {
 /// arbitrarily dropping encoded reference frames. Drop-to-IDR is later work.
 #[derive(Debug, Default)]
 pub struct MediaGate {
+    /// Actual active capture/encoder facts; absent before setup or while lost.
+    pub video: Mutex<Option<serde_json::Value>>,
     /// Negotiated before admitted is set; media producers drop their resources.
     pub control_only: AtomicBool,
     /// True desktop dimensions, excluding encoder macroblock padding.
@@ -497,6 +499,7 @@ fn serve_connection(
             "role": "controller-only",
             "capabilityEpoch": 1,
             "capture": capture,
+            "video": media_gate.as_ref().and_then(|gate| gate.video.lock().ok().and_then(|v| v.clone())),
             "displayModes": display_modes,
             "clipboardText": clipboard.is_some(),
             "telemetryAvailable": true,
@@ -836,6 +839,7 @@ fn serve_control(
                     "session": input.map(|backend| backend.status()),
                     "captureSuspended": gate.map(|gate| gate.capture_suspended.load(Ordering::SeqCst)),
                     "captureRecoveries": gate.map(|gate| gate.capture_recoveries.load(Ordering::SeqCst)),
+                    "video": gate.and_then(|gate| gate.video.lock().ok().and_then(|v| v.clone())),
                 }),
             );
             *sequence += 1;
@@ -1524,6 +1528,53 @@ mod tests {
             &mut client,
         );
         assert_eq!(handle.join().unwrap().resize_acks, 3);
+    }
+
+    #[test]
+    fn video_facts_follow_capture_loss_and_recovery() {
+        let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+        let port = server.local_address().unwrap().port();
+        let gate = Arc::new(MediaGate::default());
+        let facts = serde_json::json!({"capture":{"adapter":"Example GPU","software":false},"encoder":{"name":"Software encoder","hardware":false}});
+        *gate.video.lock().unwrap() = Some(facts.clone());
+        let server_gate = gate.clone();
+        let (_tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            server
+                .serve_one_media(server_gate, rx, Arc::new(MediaStats::default()))
+                .unwrap()
+        });
+        let mut client = connect(port);
+        let hello = read_envelope(&mut client);
+        assert_eq!(hello.payload["video"], facts);
+        let session = hello.session_id;
+        send(
+            &control(
+                &session,
+                "attach",
+                2,
+                serde_json::json!({"ticket":test_ticket(&session)}),
+            ),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+        *gate.video.lock().unwrap() = None;
+        send(
+            &control(&session, "telemetry", 3, serde_json::json!({})),
+            &mut client,
+        );
+        assert!(read_envelope(&mut client).payload["video"].is_null());
+        *gate.video.lock().unwrap() = Some(facts.clone());
+        send(
+            &control(&session, "telemetry", 4, serde_json::json!({})),
+            &mut client,
+        );
+        assert_eq!(read_envelope(&mut client).payload["video"], facts);
+        send(
+            &control(&session, "bye", 5, serde_json::json!({})),
+            &mut client,
+        );
+        handle.join().unwrap();
     }
 
     #[test]

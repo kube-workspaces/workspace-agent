@@ -10,6 +10,18 @@
 //! Cursor shape, dirty-rect pacing and move-rect composition are later
 //! milestones — this ships full frames honestly, never partial updates
 //! mislabeled as complete.
+/// Facts about the adapter actually opened for desktop duplication, not an
+/// assertion about which adapter an application uses to render.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureInfo {
+    pub backend: &'static str,
+    pub output: String,
+    pub adapter: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub software: bool,
+}
 /// One captured desktop frame: mod-16-padded NV12 plus the true desktop
 /// dimensions (the viewer crops to actual size; the encoder needs the
 /// padded size — see the alignment contract on [`kw_encode::Settings`]).
@@ -165,6 +177,7 @@ mod platform {
     /// One duplicated desktop output. Owns D3D objects on the constructing
     /// thread; COM is MTA-initialized per instance like the encoder.
     pub struct Duplicator {
+        info: super::CaptureInfo,
         _device: ID3D11Device,
         context: ID3D11DeviceContext,
         duplication: IDXGIOutputDuplication,
@@ -201,6 +214,8 @@ mod platform {
             let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory1 =
                 CreateDXGIFactory1().map_err(os)?;
             let (adapter, output) = crate::display::choose_output(&factory, output_index, name)?;
+            let mut adapter_desc = Default::default();
+            adapter.GetDesc1(&mut adapter_desc).map_err(os)?;
             let base: windows::Win32::Graphics::Dxgi::IDXGIAdapter = adapter.cast().map_err(os)?;
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
@@ -251,7 +266,23 @@ mod platform {
                 .CreateTexture2D(&staging_desc, None, Some(&mut staging))
                 .map_err(os)?;
             let staging = staging.ok_or(Error::Empty)?;
+            let text = |wide: &[u16]| {
+                String::from_utf16_lossy(
+                    &wide[..wide.iter().position(|v| *v == 0).unwrap_or(wide.len())],
+                )
+            };
             Ok(Self {
+                info: super::CaptureInfo {
+                    backend: "DXGI Desktop Duplication",
+                    output: text(&desc.DeviceName),
+                    adapter: text(&adapter_desc.Description),
+                    vendor_id: adapter_desc.VendorId,
+                    device_id: adapter_desc.DeviceId,
+                    software: adapter_desc.Flags
+                        & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32
+                        != 0
+                        || (adapter_desc.VendorId == 0x1414 && adapter_desc.DeviceId == 0x8c),
+                },
                 _device: device,
                 context,
                 duplication,
@@ -265,6 +296,10 @@ mod platform {
 
         pub fn size(&self) -> (u32, u32) {
             (self.width, self.height)
+        }
+
+        pub fn info(&self) -> Option<&super::CaptureInfo> {
+            Some(&self.info)
         }
 
         pub fn padded_size(&self) -> (u32, u32) {
@@ -357,6 +392,10 @@ mod platform {
     impl Duplicator {
         pub fn new(_output_index: u32) -> Result<Self, Error> {
             Err(Error::Gated("non-Windows capture backends (P5)"))
+        }
+
+        pub fn info(&self) -> Option<&super::CaptureInfo> {
+            None
         }
 
         pub fn new_named(_name: &str) -> Result<Self, Error> {
