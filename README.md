@@ -190,6 +190,27 @@ managed service with default `workerArgs` no longer locks to the VGA's single
 mode. An explicit `--capture-output-name` (or a non-zero `--capture-output`
 index) still overrides the preference.
 
+The display identity is checked separately from the DXGI rendering adapter.
+An IDD backed by a hardware GPU can report the GPU's vendor name and no
+software-adapter flag; its matching GDI display description still identifies
+the virtual display.
+
+For a bounded, read-only capture diagnostic, build and run the platform example
+in an already logged-in Windows console:
+
+```sh
+cargo build --locked --release -p kw-platform --example capture-check
+```
+
+```powershell
+.\target\release\examples\capture-check.exe
+.\target\release\examples\capture-check.exe '\\.\DISPLAY2'
+```
+
+It reports selected output, capture size, mode count, five seconds of acquired
+frame counts and adapter inventory. It saves no pixels. A single static frame
+does not establish animated rendering, encoding or end-to-end viewer readiness.
+
 The legacy `--capture-output N` selects that output index on the first adapter
 exposing it. GPU vendor, onboard/discrete/vGPU/passthrough presence and KVM CPU
 acceleration are not substitutes for actual output, driver or codec capability.

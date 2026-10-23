@@ -18,9 +18,11 @@ pub struct Size {
 pub(crate) struct OutputCandidate {
     pub name: String,
     pub adapter_description: String,
-    /// The DXGI adapter is flagged `DXGI_ADAPTER_FLAG_SOFTWARE`. The pinned
-    /// MikeTheTech IDD is a root-enumerated software device and reports this
-    /// flag, whereas the emulated basic VGA is a PCI hardware device.
+    /// GDI display-device description for this output name. An IDD backed by
+    /// a hardware render adapter reports the GPU's name through DXGI instead.
+    pub display_description: String,
+    /// DXGI software-adapter flag, used by software-backed IDD topologies.
+    /// A hardware-backed IDD need not set this flag.
     pub software: bool,
     pub attached: bool,
     pub output_index: u32,
@@ -37,14 +39,14 @@ pub(crate) fn is_virtual_display_adapter(description: &str) -> bool {
     lowered.contains("virtual display") || lowered.contains("virtualdisplay")
 }
 
-/// Whether a candidate is a virtual/indirect display: the adapter advertises a
-/// virtual-display name, or DXGI flags the adapter as software. In the premium
-/// Windows guest the fixed-mode basic VGA (PCI `VEN_1234:1111`) is the only
-/// hardware-flagged output, and the configurable IDD is the software-flagged
-/// one, so either signal identifies the display whose modes the host controls.
+/// Recognize the display independently of its rendering adapter. An IDD can
+/// use either WARP or a hardware GPU; GDI retains the display driver's name
+/// even when DXGI reports the hardware GPU and clears the software flag.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) fn is_virtual_display(candidate: &OutputCandidate) -> bool {
-    candidate.software || is_virtual_display_adapter(&candidate.adapter_description)
+    candidate.software
+        || is_virtual_display_adapter(&candidate.adapter_description)
+        || is_virtual_display_adapter(&candidate.display_description)
 }
 
 /// Pick the output to stream from an adapter-major candidate list.
@@ -240,6 +242,7 @@ pub(crate) fn choose_output(
             candidates.push(OutputCandidate {
                 name: wide_to_string(&desc.DeviceName),
                 adapter_description: adapter_description.clone(),
+                display_description: display_description(&desc.DeviceName),
                 software,
                 attached: desc.AttachedToDesktop.as_bool(),
                 output_index: index,
@@ -251,6 +254,27 @@ pub(crate) fn choose_output(
         Some(index) => Ok(handles.swap_remove(index)),
         None => Err(crate::Error::Empty),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn display_description(output_name: &[u16]) -> String {
+    use windows::core::PCWSTR;
+    use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+
+    let wanted = wide_to_string(output_name);
+    for index in 0..32 {
+        let mut device = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool() {
+            break;
+        }
+        if wide_to_string(&device.DeviceName).eq_ignore_ascii_case(&wanted) {
+            return wide_to_string(&device.DeviceString);
+        }
+    }
+    String::new()
 }
 
 #[cfg(target_os = "windows")]
@@ -267,6 +291,7 @@ mod tests {
         OutputCandidate {
             name: name.into(),
             adapter_description: adapter.into(),
+            display_description: String::new(),
             software: false,
             attached,
             output_index: index,
@@ -325,6 +350,25 @@ mod tests {
             software_candidate(r"\\.\DISPLAY2", BASIC_RENDER, true, 0),
         ];
         assert_eq!(select_output(&candidates, 0, None), Some(1));
+    }
+
+    #[test]
+    fn hardware_backed_idd_uses_display_identity_not_render_adapter() {
+        let candidates = [
+            candidate(r"\\.\DISPLAY1", BASIC_RENDER, true, 0),
+            OutputCandidate {
+                display_description: IDD.into(),
+                ..candidate(r"\\.\DISPLAY4", "Intel(R) Graphics", true, 0)
+            },
+        ];
+        assert_eq!(select_output(&candidates, 0, None), Some(1));
+        assert_eq!(
+            select_output(&candidates, 0, Some(r"\\.\DISPLAY1")),
+            Some(0)
+        );
+        let mut detached = candidates.clone();
+        detached[1].attached = false;
+        assert_eq!(select_output(&detached, 0, None), Some(0));
     }
 
     #[test]
