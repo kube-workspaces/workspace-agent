@@ -133,7 +133,58 @@ pub fn recover_console_topology() -> Result<bool, String> {
     platform::recover_console_topology()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::Size;
+    use crate::linux;
+    use serde_json::json;
+    pub fn selected_name(index: u32, name: Option<&str>) -> Result<String, String> {
+        linux::selected(index, name).map(|o| o.name)
+    }
+    pub fn modes(index: u32, name: Option<&str>) -> Vec<crate::DisplayMode> {
+        linux::selected(index, name)
+            .map(|o| o.modes)
+            .unwrap_or_default()
+    }
+    pub fn resize(index: u32, name: Option<&str>, requested: Size) -> Result<Size, String> {
+        let selected = selected_name(index, name)?;
+        linux::desktop_for(Some(&selected))?
+            .lock()
+            .map_err(|_| "linux-desktop-lock")?
+            .call(
+                json!({"op":"resize", "width":requested.width, "height":requested.height}),
+                &[],
+            )?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let actual = linux::selected(0, Some(&selected))?;
+            if actual.width == requested.width && actual.height == requested.height {
+                return Ok(requested);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("display-readback-timeout".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    pub fn isolate_virtual(_name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    pub struct VirtualDisplaySession;
+    impl Drop for VirtualDisplaySession {
+        fn drop(&mut self) {}
+    }
+    impl VirtualDisplaySession {
+        pub fn begin(_name: &str) -> Result<Self, String> {
+            Ok(Self)
+        }
+    }
+    pub fn recover_console_topology() -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     use super::Size;
     pub fn selected_name(_output_index: u32, _name: Option<&str>) -> Result<String, String> {

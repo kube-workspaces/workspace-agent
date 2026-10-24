@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${XDG_SESSION_TYPE:-} == wayland && ${XDG_CURRENT_DESKTOP:-} == *GNOME* ]] || exit 0
+[[ -r /etc/workspace-agent/public/binding.json ]] || exit 0
+for name in XDG_SESSION_TYPE XDG_SESSION_ID XDG_CURRENT_DESKTOP WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS; do
+  if [[ -n ${!name:-} ]]; then
+    systemctl --user import-environment "$name"
+  fi
+done
+systemctl --user daemon-reload
+exec systemctl --user start workspace-agent.service

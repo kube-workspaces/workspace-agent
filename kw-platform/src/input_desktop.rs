@@ -27,7 +27,12 @@ fn classify(same_desktop: bool, process: Option<u32>, foreground: Option<u32>) -
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn status() -> Access {
+    classify(crate::input::session_state().can_inject(), None, None)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn status() -> Access {
     classify(true, None, None)
 }

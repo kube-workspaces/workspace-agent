@@ -208,8 +208,10 @@ dependencies = [
 name = "kw-audio"
 version = "0.1.0"
 dependencies = [
+ "kw-platform",
  "opus-rs",
  "serde",
+ "serde_json",
  "windows",
 ]
 
@@ -227,7 +229,9 @@ dependencies = [
 name = "kw-encode"
 version = "0.1.0"
 dependencies = [
+ "kw-platform",
  "serde",
+ "serde_json",
  "windows",
 ]
 

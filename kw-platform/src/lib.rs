@@ -15,6 +15,8 @@ pub mod clipboard;
 pub mod display;
 pub mod input;
 pub mod input_desktop;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,8 @@ pub enum Error {
     /// A held session was revoked (mode change, lock, UAC, device
     /// removal): rebuild the backend, do not end the session for it.
     SessionLost(&'static str),
+    /// A named Linux desktop/media operation failed without OS error codes.
+    Backend(String),
 }
 
 impl std::fmt::Display for Error {
@@ -39,6 +43,7 @@ impl std::fmt::Display for Error {
             Error::Os(code) => write!(f, "os call failed: 0x{code:08x}"),
             Error::Empty => write!(f, "no data enumerated"),
             Error::SessionLost(what) => write!(f, "session revoked, rebuild: {what}"),
+            Error::Backend(what) => write!(f, "desktop backend: {what}"),
         }
     }
 }
@@ -377,7 +382,20 @@ mod inner {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod inner {
+    use super::*;
+    pub fn inventory() -> Result<Inventory, Error> {
+        crate::linux::inventory()
+    }
+    pub fn output_modes(device_name: &str) -> Vec<DisplayMode> {
+        crate::linux::selected(0, Some(device_name))
+            .map(|o| o.modes)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod inner {
     use super::*;
 
@@ -394,7 +412,7 @@ mod inner {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     #[test]
     fn linux_inventory_reports_its_gate() {
         assert_eq!(

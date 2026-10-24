@@ -214,7 +214,11 @@ pub struct EncoderInfo {
 impl StreamEncoder {
     pub fn info(&self) -> EncoderInfo {
         EncoderInfo {
-            name: "Microsoft H.264 Encoder MFT",
+            name: if cfg!(target_os = "linux") {
+                "GStreamer x264enc"
+            } else {
+                "Microsoft H.264 Encoder MFT"
+            },
             codec: "H.264",
             hardware: false,
         }
@@ -689,7 +693,11 @@ mod inner {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+#[path = "linux.rs"]
+mod inner;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod inner {
     use super::*;
 
@@ -934,12 +942,44 @@ mod tests {
         assert!(total > 0, "nontrivial post-reconfigure payload");
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     #[test]
     fn non_windows_reports_its_gate() {
         assert_eq!(
             encode_nv12(&Settings::default(), &[]),
             Err(Error::Gated("non-Windows software encode backends"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Python GI, GStreamer and x264enc; run on the guest"]
+    fn linux_encoder_preserves_access_units_timestamps_idr_and_resize() {
+        let mut encoder = StreamEncoder::new(&Settings::default()).expect("Linux x264 encoder");
+        for index in 0..8 {
+            let timestamp = index * 333_333;
+            let frame = vec![128; 320 * 240 * 3 / 2];
+            let chunks = encoder
+                .push(&frame, timestamp, index == 5)
+                .expect("encode frame");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].timestamp_100ns, timestamp);
+            if index == 0 || index == 5 {
+                assert!(chunks[0].keyframe, "fresh or forced keyframe");
+                assert!(chunks[0].nal_types.contains(&7) && chunks[0].nal_types.contains(&8));
+            }
+        }
+        encoder
+            .reconfigure(&Settings {
+                width: 640,
+                height: 480,
+                ..Settings::default()
+            })
+            .expect("resize encoder");
+        let chunks = encoder
+            .push(&vec![128; 640 * 480 * 3 / 2], 3_000_000, false)
+            .expect("resized frame");
+        assert!(chunks[0].keyframe);
+        assert!(encoder.finish().expect("no delayed frames").is_empty());
     }
 }

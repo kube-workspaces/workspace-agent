@@ -66,6 +66,8 @@ package: ## Stage and archive release targets from bin/<target>/
 		cp README.md LICENSE "$$stage/"; \
 		if [ "$$os" = windows ]; then \
 			cp packaging/windows/install.ps1 packaging/windows/uninstall.ps1 packaging/windows/Register-ServeTask.ps1 packaging/windows/Start-Serve.ps1 packaging/windows/Migrate-LegacyStartup.ps1 "$$stage/"; \
+		else \
+			cp packaging/linux/install.sh packaging/linux/workspace-agent-session packaging/linux/workspace-agent.desktop "$$stage/"; \
 		fi; \
 		if [ "$$os" = windows ]; then \
 			(cd $(DIST_DIR) && zip -qr "$(PACKAGE_NAME)-$(VERSION)-$$os-$$arch.zip" "$(PACKAGE_NAME)-$$os-$$arch"); \

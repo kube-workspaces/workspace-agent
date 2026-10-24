@@ -1,7 +1,7 @@
 # workspace-agent
 
 Baked-in cross-platform guest agent for kube-workspaces VM workspaces
-(Windows first, Linux after parity). Same-console-session streaming:
+(Windows and Linux GNOME/Wayland). Same-console-session streaming:
 H.264 video, Opus playback audio and true guest resolution changes,
 in native and integrated web viewers, with KubeVirt VNC retained as the
 setup/recovery path.
@@ -30,12 +30,56 @@ not treat fixtures or CI green as guest acceptance.
 | `protocol/v1/vectors/` | Conformance fixtures (JSON) |
 | `kw-protocol/` | Protocol types + validation (Rust; parses every fixture) |
 | `kw-core/` | Session/seat, bounded queues, resize debounce (pure logic) |
-| `kw-agent/` | Service binary skeleton (platform stubs; backends P0-gated) |
+| `kw-agent/` | Service/worker binary, diagnostics and guest acceptance examples |
 | `tools/validate_fixtures.py` | Fixture validator (no dependencies) |
 | `tools/test_validate_fixtures.py` | Validator unit tests |
 | `Makefile` | `lint` / `test` / `package` targets used by CI |
 | `scripts/verify-release-archives.py` | Release archive contract check |
 | `packaging/windows/` | Unsigned MSI (WiX) build, verify and lifecycle test |
+| `packaging/linux/` | GNOME console-user systemd service and XDG startup installer |
+
+## Linux GNOME/Wayland startup
+
+The Linux backend captures the active ordinary user's GNOME console through
+Mutter RemoteDesktop/ScreenCast and PipeWire. It provides software H.264 through
+GStreamer x264, Pulse/PipeWire loopback audio, input, Unicode clipboard and real
+guest mode changes. X11, other Wayland compositors and locked/inactive-console
+capture are not supported by this backend. Arch GNOME 51 is the initial guest
+acceptance target; Linux arm64 packages build, but runtime acceptance is separate.
+
+Install the matching release archive's verified contents as root:
+
+```sh
+sudo bash workspace-agent-linux-amd64/install.sh desktopuser
+```
+
+The guest needs Python GI (`Gio`, `Gst`, `GstVideo`), GStreamer base/good/ugly
+plugins and its PipeWire plugin, PipeWire/Pulse, WirePlumber and `pactl`.
+On Arch these are `python-gobject gst-python gst-plugins-base gst-plugins-good
+gst-plugins-ugly gst-plugin-pipewire pipewire-pulse wireplumber libpulse`.
+GNOME/GDM, a connected display head and an ordinary Wayland console login are
+also required. No host Python modules are bundled into the archive.
+
+The controller provisions `/etc/workspace-agent/public/binding.json` containing
+only `workspaceUid` and `workspaceGeneration`. The API must read the Linux
+`kubeworkspaces.io/agent-generation` annotation when issuing tickets. The agent
+installer does not invent or override a workspace binding.
+
+At graphical login the XDG entry imports the console environment and starts
+`workspace-agent.service` in that user's systemd manager. It intentionally omits
+`X-GNOME-Autostart-Phase`, which GNOME 51 no longer supports. Capture never runs
+as root, from an SSH login shell, or through user lingering. After installing
+into an existing session, log out/in to exercise the normal startup path.
+
+```sh
+systemctl --user status workspace-agent.service
+journalctl --user -u workspace-agent.service -b
+```
+
+Keep the KubeVirt console available for boot, session recovery and screen
+unlocking. The platform's Arch catalog recipe configures a permanently connected
+virtio head and an initial GNOME mode so recovery-viewer disconnects do not
+remove the capture output. See the deployment documentation for provisioning.
 
 ## Windows desktop startup and identity
 

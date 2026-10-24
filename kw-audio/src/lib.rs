@@ -183,7 +183,35 @@ mod inner {
     fn _use_bool(_: BOOL) {}
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod inner {
+    use super::*;
+    pub fn capture_loopback(seconds: u64) -> Result<Capture, Error> {
+        let tap = tap::LoopbackTap::start()?;
+        let format = tap.mix_format();
+        let mut result = Capture {
+            mix_rate: format.rate,
+            mix_channels: format.channels as u32,
+            mix_bits: format.bits as u32,
+            packets: 0,
+            frames: 0,
+            silent: true,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds.min(10));
+        while std::time::Instant::now() < deadline {
+            if let Some((format, bytes, frames)) = tap.read(200)? {
+                result.packets += 1;
+                result.frames += frames as u64;
+                result.silent &= tap::pcm_to_f32(&bytes, format)?
+                    .iter()
+                    .all(|v| v.abs() < 0.00001);
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod inner {
     use super::*;
 
@@ -216,7 +244,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     #[test]
     fn non_windows_reports_its_gate() {
         assert_eq!(

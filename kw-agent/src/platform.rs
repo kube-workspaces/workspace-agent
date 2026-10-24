@@ -43,9 +43,11 @@ mod inner {
     }
 
     fn context() -> &'static str {
-        // Real detection (logind session, X11/Wayland presence) arrives with
-        // the Linux adapters. Never assume a desktop session here.
-        "unknown-session"
+        if kw_platform::input::session_state().can_inject() {
+            "gnome-wayland-console"
+        } else {
+            "no-active-gnome-wayland-console"
+        }
     }
 }
 

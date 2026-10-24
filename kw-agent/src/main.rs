@@ -460,7 +460,7 @@ fn main() {
                 None
             };
             let server = if args.iter().any(|arg| arg == "--clipboard") {
-                if !cfg!(target_os = "windows") {
+                if !cfg!(any(target_os = "windows", target_os = "linux")) {
                     eprintln!("serve: clipboard backend unavailable on this platform");
                     std::process::exit(2);
                 }

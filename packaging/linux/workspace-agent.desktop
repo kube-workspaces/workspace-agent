@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Kube Workspaces Agent
+Exec=/usr/local/libexec/workspace-agent-session
+TryExec=/usr/local/bin/kw-agent
+OnlyShowIn=GNOME;
+Terminal=false
+NoDisplay=true

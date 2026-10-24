@@ -368,7 +368,11 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+#[path = "linux_capture.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     use super::super::Error;
     use super::CapturedFrame;

@@ -22,7 +22,24 @@ pub fn write_text(text: &str) -> Result<(), String> {
     platform::write_text(text)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use serde_json::json;
+    pub fn read_text() -> Result<Option<String>, String> {
+        let (meta, body) = crate::linux::call(json!({"op":"clipboardRead"}), &[])?;
+        if meta["present"] != true {
+            return Ok(None);
+        }
+        let text = String::from_utf8(body).map_err(|_| "clipboard-invalid-unicode")?;
+        super::validate_text(&text)?;
+        Ok(Some(text))
+    }
+    pub fn write_text(text: &str) -> Result<(), String> {
+        crate::linux::call(json!({"op":"clipboardWrite"}), text.as_bytes()).map(|_| ())
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     pub fn read_text() -> Result<Option<String>, String> {
         Err("clipboard-backend-unavailable".into())

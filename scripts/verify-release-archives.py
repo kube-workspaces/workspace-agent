@@ -70,7 +70,10 @@ def verify(directory: Path, version: str, require_msi: bool = False) -> None:
         if os_name == "windows":
             required |= {f"{root}/install.ps1", f"{root}/uninstall.ps1",
                          f"{root}/Register-ServeTask.ps1", f"{root}/Start-Serve.ps1",
-                         f"{root}/Migrate-LegacyStartup.ps1"}
+                          f"{root}/Migrate-LegacyStartup.ps1"}
+        else:
+            required |= {f"{root}/install.sh", f"{root}/workspace-agent-session",
+                         f"{root}/workspace-agent.desktop"}
         missing = required - set(members)
         assert not missing, f"{name}: missing members {sorted(missing)}"
         assert_binary_runnable(archive, os_name)

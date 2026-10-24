@@ -30,6 +30,8 @@ pub struct Injector {
     output_name: Option<String>,
     buttons: u8,
     keys: std::collections::BTreeSet<u32>,
+    #[cfg(target_os = "linux")]
+    _desktop: std::sync::Arc<Mutex<crate::linux::Helper>>,
 }
 
 impl Injector {
@@ -39,10 +41,14 @@ impl Injector {
 
     pub fn for_output(output_name: Option<String>) -> Result<Self, String> {
         platform::pointer_space(output_name.as_deref())?;
+        #[cfg(target_os = "linux")]
+        let desktop = crate::linux::desktop_for(output_name.as_deref())?;
         Ok(Self {
             output_name,
             buttons: 0,
             keys: std::collections::BTreeSet::new(),
+            #[cfg(target_os = "linux")]
+            _desktop: desktop,
         })
     }
 
@@ -319,7 +325,85 @@ impl PointerSpace {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::{PointerSpace, SessionState};
+    use crate::linux;
+    use serde_json::json;
+
+    pub fn pointer_space(name: Option<&str>) -> Result<PointerSpace, String> {
+        let (meta, _) = linux::desktop_for(name)?
+            .lock()
+            .map_err(|_| "linux-desktop-lock")?
+            .call(json!({"op":"geometry"}), &[])?;
+        let output: crate::OutputInfo = serde_json::from_value(meta["output"].clone())
+            .map_err(|_| "invalid-pointer-geometry")?;
+        Ok(PointerSpace {
+            left: 0,
+            top: 0,
+            width: output.width as i32,
+            height: output.height as i32,
+            virtual_left: 0,
+            virtual_top: 0,
+            virtual_width: output.width as i32,
+            virtual_height: output.height as i32,
+        })
+    }
+    pub fn session_state() -> SessionState {
+        linux::Helper::new(linux::Role::Inventory)
+            .and_then(|mut h| h.call(json!({"op":"session"}), &[]))
+            .ok()
+            .and_then(|(m, _)| m["session"].as_u64())
+            .map(|id| SessionState {
+                current: Some(id as u32),
+                active_console: Some(id as u32),
+            })
+            .unwrap_or_default()
+    }
+    pub fn key(keysym: u32, down: bool) -> Result<(), String> {
+        linux::call(json!({"op":"key", "keysym":keysym, "down":down}), &[]).map(|_| ())
+    }
+    pub fn pointer(
+        buttons: &mut u8,
+        space: PointerSpace,
+        x: i32,
+        y: i32,
+        mask: u8,
+    ) -> Result<(), String> {
+        let changes: Vec<_> = [(1u8, 272), (2, 274), (4, 273)]
+            .into_iter()
+            .filter(|(bit, _)| *buttons & bit != mask & bit)
+            .map(|(bit, code)| json!([code, mask & bit != 0]))
+            .collect();
+        linux::call(
+            json!({"op":"pointer", "x":x.clamp(0, space.width.saturating_sub(1)),
+            "y":y.clamp(0, space.height.saturating_sub(1)), "buttons":changes}),
+            &[],
+        )?;
+        *buttons = mask;
+        Ok(())
+    }
+    pub fn wheel(dx: i32, dy: i32) -> Result<(), String> {
+        linux::call(json!({"op":"wheel", "dx":dx, "dy":dy}), &[]).map(|_| ())
+    }
+    pub fn release(buttons: &mut u8) {
+        if *buttons == 0 {
+            return;
+        }
+        let changes: Vec<_> = [(1u8, 272), (2, 274), (4, 273)]
+            .into_iter()
+            .filter(|(bit, _)| *buttons & bit != 0)
+            .map(|(_, code)| json!([code, false]))
+            .collect();
+        let _ = linux::call(
+            json!({"op":"pointer", "x":0, "y":0, "buttons":changes}),
+            &[],
+        );
+        *buttons = 0;
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod platform {
     use super::{Key, PointerSpace, SessionState, WHEEL_DELTA};
 
