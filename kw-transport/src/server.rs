@@ -56,6 +56,9 @@ pub struct MediaGate {
     pub video: Mutex<Option<serde_json::Value>>,
     /// Negotiated before admitted is set; media producers drop their resources.
     pub control_only: AtomicBool,
+    /// Explicit display intent stamped by the proxy. Missing on older edges:
+    /// preserve the console rather than isolating for an ambiguous helper.
+    pub display_session: AtomicBool,
     /// True desktop dimensions, excluding encoder macroblock padding.
     pub capture_width: AtomicU32,
     pub capture_height: AtomicU32,
@@ -665,6 +668,11 @@ fn serve_control(
             write_envelope(writer, &reply).is_ok()
         }
         "attach" => {
+            let display_session = match message.payload.get("displaySession") {
+                None | Some(serde_json::Value::Bool(false)) => false,
+                Some(serde_json::Value::Bool(true)) => true,
+                Some(_) => return false,
+            };
             let control_only = match message.payload.get("controlOnly") {
                 None | Some(serde_json::Value::Bool(false)) => false,
                 Some(serde_json::Value::Bool(true)) => true,
@@ -732,6 +740,8 @@ fn serve_control(
                 outcome.control_only = control_only;
                 if let Some(gate) = gate {
                     gate.control_only.store(control_only, Ordering::SeqCst);
+                    gate.display_session
+                        .store(display_session && !control_only, Ordering::SeqCst);
                     gate.admitted.store(true, Ordering::SeqCst);
                 }
             }
@@ -1275,7 +1285,7 @@ mod tests {
                 &session,
                 "attach",
                 2,
-                serde_json::json!({"ticket":test_ticket(&session),"controlOnly":true}),
+                serde_json::json!({"ticket":test_ticket(&session),"controlOnly":true,"displaySession":true}),
             ),
             &mut client,
         );
@@ -1292,6 +1302,7 @@ mod tests {
         assert!(telemetry.payload["session"]["desktop"].is_object());
         assert_eq!(telemetry.payload["inputAvailable"], false);
         assert!(check_gate.control_only.load(Ordering::SeqCst));
+        assert!(!check_gate.display_session.load(Ordering::SeqCst));
         send(
             &control(&session, "bye", 4, serde_json::json!({})),
             &mut client,
@@ -1300,6 +1311,47 @@ mod tests {
         assert!(outcome.control_only);
         assert_eq!(outcome.video_bytes_sent + outcome.audio_bytes_sent, 0);
         assert_eq!(backend.reset.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn display_topology_intent_requires_explicit_admission() {
+        for intent in [
+            None,
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(true)),
+        ] {
+            let server = Server::bind("127.0.0.1:0", "ws-1".into(), "gen-1".into()).unwrap();
+            let port = server.local_address().unwrap().port();
+            let gate = Arc::new(MediaGate::default());
+            let check = gate.clone();
+            let (_tx, rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                server
+                    .serve_one_media(gate, rx, Arc::new(MediaStats::default()))
+                    .unwrap()
+            });
+            let mut client = connect(port);
+            let hello = read_envelope(&mut client);
+            assert!(!check.display_session.load(Ordering::SeqCst));
+            let mut payload = serde_json::json!({"ticket": test_ticket(&hello.session_id)});
+            if let Some(ref intent) = intent {
+                payload["displaySession"] = intent.clone();
+            }
+            send(
+                &control(&hello.session_id, "attach", 2, payload),
+                &mut client,
+            );
+            assert_eq!(read_envelope(&mut client).payload["admitted"], true);
+            send(
+                &control(&hello.session_id, "bye", 3, serde_json::json!({})),
+                &mut client,
+            );
+            handle.join().unwrap();
+            assert_eq!(
+                check.display_session.load(Ordering::SeqCst),
+                intent == Some(serde_json::json!(true))
+            );
+        }
     }
 
     #[test]

@@ -116,11 +116,21 @@ pub fn resize_selected(
 /// primary. Disabling every other path and promoting the selected output is
 /// the only reliable way to keep those windows on the captured display.
 ///
-/// This is a session-only topology change: it is not written to the display
-/// database, so it cannot strand a guest after the worker exits. Returns
+/// This is a temporary topology change, not written to the display database.
+/// Callers must use [`VirtualDisplaySession`] to restore paths on exit. Returns
 /// `false` when the selected output is not virtual or is already alone.
 pub fn isolate_virtual(name: &str) -> Result<bool, String> {
     platform::isolate_virtual(name)
+}
+
+/// A viewer-scoped topology change. Helpers never construct this guard. Restore
+/// the original active paths before accepting another connection or exiting.
+pub use platform::VirtualDisplaySession;
+
+/// Recover a console path left detached by an interrupted worker. Only used by
+/// the managed worker, before choosing its capture output; never by diagnostics.
+pub fn recover_console_topology() -> Result<bool, String> {
+    platform::recover_console_topology()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -142,6 +152,18 @@ mod platform {
     pub fn isolate_virtual(_name: &str) -> Result<bool, String> {
         Ok(false)
     }
+    pub struct VirtualDisplaySession;
+    impl Drop for VirtualDisplaySession {
+        fn drop(&mut self) {}
+    }
+    impl VirtualDisplaySession {
+        pub fn begin(_name: &str) -> Result<Self, String> {
+            Ok(Self)
+        }
+    }
+    pub fn recover_console_topology() -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -153,14 +175,15 @@ mod platform {
         SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
         DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
         DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS, SDC_ALLOW_CHANGES, SDC_APPLY,
-        SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+        SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
     };
     use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND, WIN32_ERROR};
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
     use windows::Win32::Graphics::Gdi::{
         ChangeDisplaySettingsExW, EnumDisplayDevicesW, EnumDisplaySettingsW, CDS_TEST, CDS_TYPE,
-        DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE, DISPLAY_DEVICEW, DISPLAY_DEVICE_PRIMARY_DEVICE,
-        DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
+        DEVMODEW, DISPLAYCONFIG_PATH_ACTIVE, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+        DISPLAY_DEVICE_PRIMARY_DEVICE, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH,
+        ENUM_CURRENT_SETTINGS,
     };
 
     pub fn selected_name(
@@ -241,14 +264,119 @@ mod platform {
         if paths.len() == 1 {
             return Ok(false);
         }
-        let only = [paths[selected]];
+        let mut path = paths[selected];
+        // A subset of paths needs a subset of modes with rebased indices.
+        // In particular, a formerly secondary source must move to (0,0) to
+        // become the sole primary output. Passing its old offset and unrelated
+        // modes makes SetDisplayConfig reject the topology (ERROR_INVALID_PARAMETER).
+        let source_index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+        let target_index = unsafe { path.targetInfo.Anonymous.modeInfoIdx };
+        let mut selected_modes = Vec::new();
+        if let Some(mode) = modes.get(source_index as usize) {
+            let mut source = *mode;
+            source.Anonymous.sourceMode.position.x = 0;
+            source.Anonymous.sourceMode.position.y = 0;
+            path.sourceInfo.Anonymous.modeInfoIdx = selected_modes.len() as u32;
+            selected_modes.push(source);
+        }
+        if let Some(mode) = modes.get(target_index as usize) {
+            path.targetInfo.Anonymous.modeInfoIdx = selected_modes.len() as u32;
+            selected_modes.push(*mode);
+        }
+        let only = [path];
         let flags = SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_APPLY;
-        let result = unsafe { SetDisplayConfig(Some(&only), Some(&modes), flags) };
+        let result = unsafe { SetDisplayConfig(Some(&only), Some(&selected_modes), flags) };
         if result != 0 {
             return Err(format!("display-topology-isolate-failed:{result}"));
         }
         if !primary_display_name().is_some_and(|primary| primary.eq_ignore_ascii_case(name)) {
             return Err("display-primary-not-selected".into());
+        }
+        Ok(true)
+    }
+
+    pub struct VirtualDisplaySession {
+        original: Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)>,
+    }
+
+    impl VirtualDisplaySession {
+        pub fn begin(name: &str) -> Result<Self, String> {
+            let original = query_active_topology()?;
+            let mut guard = Self {
+                original: Some(original),
+            };
+            match isolate_virtual(name) {
+                Ok(true) => {
+                    println!("display: isolated virtual output for admitted viewer");
+                    Ok(guard)
+                }
+                Ok(false) => {
+                    guard.original = None;
+                    Ok(guard)
+                }
+                Err(error) => {
+                    // SetDisplayConfig may have applied a topology even if the
+                    // subsequent primary-output verification failed.
+                    drop(guard);
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    impl Drop for VirtualDisplaySession {
+        fn drop(&mut self) {
+            if let Some((paths, modes)) = self.original.take() {
+                let result = unsafe {
+                    SetDisplayConfig(
+                        Some(&paths),
+                        Some(&modes),
+                        SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_APPLY,
+                    )
+                };
+                if result != 0 {
+                    eprintln!(
+                        "display topology restore failed:{result}; attempting console recovery"
+                    );
+                    if let Err(error) = recover_console_topology() {
+                        eprintln!("display console recovery failed:{error}");
+                    }
+                } else {
+                    println!("display: restored console topology after viewer");
+                }
+            }
+        }
+    }
+
+    pub fn recover_console_topology() -> Result<bool, String> {
+        // GDI retains inactive display devices. A missing BasicDisplay path
+        // after a worker crash is different from an absent console device.
+        let mut detached_console = false;
+        for index in 0..32 {
+            let mut device = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool() {
+                break;
+            }
+            let description = String::from_utf16_lossy(&device.DeviceString);
+            let id = String::from_utf16_lossy(&device.DeviceID).to_ascii_uppercase();
+            if description.trim_end_matches('\0') == "Microsoft Basic Display Adapter"
+                && id.starts_with(r"PCI\VEN_1234&DEV_1111&")
+                && device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == 0
+            {
+                detached_console = true;
+            }
+        }
+        if !detached_console {
+            return Ok(false);
+        }
+        // A fresh extend topology accounts for current devices after crash or
+        // driver recovery. It is not saved to the Windows display database.
+        let result = unsafe { SetDisplayConfig(None, None, SDC_TOPOLOGY_EXTEND | SDC_APPLY) };
+        if result != 0 {
+            return Err(format!("display-console-extend-failed:{result}"));
         }
         Ok(true)
     }

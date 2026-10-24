@@ -200,7 +200,18 @@ fn run(
     // Last worker failure worth surfacing; cleared only after a worker has run
     // long enough to have bound and served, never merely because it was spawned.
     let mut worker_error: Option<&'static str> = None;
+    let mut console_recovery = crate::console_recovery::Recovery::default();
+    let mut console_recovery_error = None;
     loop {
+        if console_recovery.due(origin.elapsed().as_secs()) {
+            let error = console_recovery.check().err();
+            if error != console_recovery_error {
+                if let Some(ref error) = error {
+                    eprintln!("console recovery: {error}");
+                }
+                console_recovery_error = error;
+            }
+        }
         if identity.is_none() {
             match crate::daemon::initialize(dir) {
                 Ok(value) => {
@@ -292,6 +303,7 @@ fn run(
             "no-console-worker"
         };
         let mut snapshot = serde_json::json!({"schemaVersion":1,"serviceState":"running","state":state,"workerEnabled":config.as_ref().ok().map(|c| c.worker_enabled),"workerPid":worker.as_ref().map(|w| w.pid),"consoleSession":target,"mediaReady":null,"workerError":worker_error,"configurationError":config.as_ref().err(),"enrollmentError":enrollment_error});
+        snapshot["consoleRecoveryError"] = serde_json::json!(console_recovery_error);
         // Status is machine-authored. Process liveness is never labeled as media readiness.
         let text = snapshot.to_string();
         if text != last_status

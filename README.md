@@ -190,14 +190,28 @@ managed service with default `workerArgs` no longer locks to the VGA's single
 mode. An explicit `--capture-output-name` (or a non-zero `--capture-output`
 index) still overrides the preference.
 
-For the same default selection, `serve` also makes that virtual display the
+For the same default selection, an admitted **display session** makes that virtual display the
 **only active output**. Windows otherwise keeps the emulated console VGA
 attached, and applications with saved window placements reopen there even when
 the virtual display is primary. Detaching the VGA is the reliable fix. The
-topology change is session-only (not saved to the display database) and is
-reapplied whenever the worker starts. Pass `--keep-console-display` to leave
-the VGA attached; while the virtual display is isolated, Tier 0 captures of the
-console output are unavailable.
+topology change is session-only (not saved to the display database). The original
+active paths are restored when that viewer disconnects, is taken over, or the
+worker stops. Idle workers and telemetry/clipboard helpers do not isolate the
+display. The proxy stamps the optional `attach.displaySession` boolean from the
+authorized bridge purpose; older proxies omit it, which conservatively keeps the
+console attached. Pass `--keep-console-display` to leave the VGA attached even
+during an interactive display session. While the virtual display is isolated,
+Tier 0 captures of the console output are unavailable until the viewer releases.
+The managed worker also attempts a temporary extend topology at startup if the
+QEMU Basic Display console was left detached by an interrupted worker.
+
+The Windows service checks the QEMU VGA (`PCI\\VEN_1234&DEV_1111`, `BasicDisplay`)
+for post-start failure **Code 43** every 15 seconds. Only that exact device/driver
+failure permits a SetupAPI restart, with at most three attempts per service run.
+Healthy, disabled, unrelated and absent devices are left alone; the service does
+not install drivers, disable a GPU, reboot Windows or elevate the desktop worker.
+An accepted restart is not proof of visible console output: validate it with the
+hypervisor's independent screenshot and actual console input.
 
 The display identity is checked separately from the DXGI rendering adapter.
 An IDD backed by a hardware GPU can report the GPU's vendor name and no

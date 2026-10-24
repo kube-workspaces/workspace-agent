@@ -45,7 +45,12 @@ impl Config {
         let mut args = self.worker_args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--capture-video" | "--capture-audio" | "--clipboard" | "--input" | "--resize" => {}
+                "--capture-video"
+                | "--capture-audio"
+                | "--clipboard"
+                | "--input"
+                | "--resize"
+                | "--keep-console-display" => {}
                 "--capture-output" | "--capture-fps" | "--capture-bitrate-bps" => {
                     let value = args
                         .next()

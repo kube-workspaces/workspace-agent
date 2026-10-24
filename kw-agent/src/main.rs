@@ -10,6 +10,8 @@
 mod audio;
 mod binding;
 mod capture;
+#[cfg(any(windows, test))]
+mod console_recovery;
 mod daemon;
 mod management_exec;
 mod platform;
@@ -387,20 +389,10 @@ fn main() {
             let capture_output_index = flag_value(&args, "--capture-output")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-            let capture_output_name = if args.iter().any(|arg| arg == "--capture-video") {
-                Some(
-                    kw_platform::display::selected_name(
-                        capture_output_index,
-                        flag_value(&args, "--capture-output-name").as_deref(),
-                    )
-                    .unwrap_or_else(|error| {
-                        eprintln!("serve: selected output unavailable: {error}");
-                        std::process::exit(2);
-                    }),
-                )
-            } else {
-                None
-            };
+            let isolate_display = args.iter().any(|arg| arg == "--capture-video")
+                && capture_output_index == 0
+                && flag_value(&args, "--capture-output-name").is_none()
+                && !args.iter().any(|arg| arg == "--keep-console-display");
             let port: u16 = flag_value(&args, "--port")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
@@ -442,6 +434,31 @@ fn main() {
                     eprintln!("serve: shutdown setup: {error}");
                     std::process::exit(1);
                 });
+            // Own the listening port before editing topology: a duplicate
+            // worker must not "recover" a live viewer's intentional isolation.
+            if isolate_display && flag_value(&args, "--stop-event").is_some() {
+                match kw_platform::display::recover_console_topology() {
+                    Ok(true) => {
+                        println!("restored detached console topology before capture selection")
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!("serve: console topology recovery failed: {error}"),
+                }
+            }
+            let capture_output_name = if args.iter().any(|arg| arg == "--capture-video") {
+                Some(
+                    kw_platform::display::selected_name(
+                        capture_output_index,
+                        flag_value(&args, "--capture-output-name").as_deref(),
+                    )
+                    .unwrap_or_else(|error| {
+                        eprintln!("serve: selected output unavailable: {error}");
+                        std::process::exit(2);
+                    }),
+                )
+            } else {
+                None
+            };
             let server = if args.iter().any(|arg| arg == "--clipboard") {
                 if !cfg!(target_os = "windows") {
                     eprintln!("serve: clipboard backend unavailable on this platform");
@@ -569,25 +586,8 @@ fn main() {
                 eprintln!("serve: --synthetic-video and --capture-video are exclusive");
                 usage(2);
             }
-            // With default selection, stream the virtual display alone. Windows
-            // otherwise keeps the emulated console VGA active, and applications
-            // with saved placements reopen there even after the virtual display
-            // becomes primary. Leaving the VGA attached only for console fallback
-            // does not fix that placement, so default serve detaches it. The
-            // topology change is session-only and is reapplied on every start.
-            if capture_video
-                && capture_output_index == 0
-                && flag_value(&args, "--capture-output-name").is_none()
-                && !args.iter().any(|arg| arg == "--keep-console-display")
-            {
-                if let Some(name) = capture_output_name.as_deref() {
-                    match kw_platform::display::isolate_virtual(name) {
-                        Ok(true) => println!("isolated display {name} as the only active output"),
-                        Ok(false) => {}
-                        Err(error) => eprintln!("serve: display isolation failed: {error}"),
-                    }
-                }
-            }
+            // Isolation belongs to an admitted interactive viewer, not to the
+            // listening worker (which also handles console-side helpers).
             let video = synthetic || capture_video;
             let synth_settings = kw_encode::Settings {
                 width: 320,
@@ -727,6 +727,7 @@ fn main() {
                                     thread_output_name,
                                     capture_fps,
                                     capture_bitrate_bps,
+                                    isolate_display,
                                     thread_gate,
                                     thread_feed,
                                     thread_stats,

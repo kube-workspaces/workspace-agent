@@ -142,6 +142,7 @@ pub fn run(
     output_name: Option<String>,
     fps: u32,
     bitrate_bps: u32,
+    isolate_display: bool,
     gate: Arc<MediaGate>,
     feed: mpsc::SyncSender<MediaPacket>,
     stats: Arc<MediaStats>,
@@ -205,6 +206,28 @@ pub fn run(
     if gate.control_only.load(Ordering::SeqCst) {
         return; // Drop duplication/encoder; the admitted watcher needs status only.
     }
+    // Construct only after admission, and never for a telemetry-only helper.
+    // Drop restores the console on disconnect/takeover/service stop and on
+    // every capture failure return. Reopen duplication after the topology edit.
+    let _display_session = if isolate_display && gate.display_session.load(Ordering::SeqCst) {
+        match output_name
+            .as_deref()
+            .map(kw_platform::display::VirtualDisplaySession::begin)
+        {
+            Some(Ok(session)) => {
+                duplicator = None;
+                encoder = None;
+                Some(session)
+            }
+            Some(Err(error)) => {
+                eprintln!("capture: display isolation failed: {error}");
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let cadence = Duration::from_nanos(1_000_000_000 / fps as u64);
     let _awake = match kw_platform::capture::DisplayAwake::new() {
         Ok(guard) => guard,
