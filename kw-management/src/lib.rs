@@ -310,7 +310,7 @@ impl QgaBinding {
         }
         // Bounded elevated commands only. The platform runner additionally
         // enforces that the signed identity matches its actual OS identity.
-        if self.operation != "command"
+        if (self.operation != "command" && self.operation != "script")
             || self.transport != TRANSPORT_QGA_POD_EXEC
             || !(self.os_identity.eq_ignore_ascii_case("SYSTEM") || self.os_identity == "root")
             || !self.elevated
@@ -370,8 +370,8 @@ impl QgaCommandRequest {
         if self.version != 1 {
             return Err("unsupported request version".into());
         }
-        if self.operation != "command" {
-            return Err("pilot transport admits command operations only".into());
+        if self.operation != "command" && self.operation != "script" {
+            return Err("pilot transport admits command or script operations only".into());
         }
         if !(self.os_identity.eq_ignore_ascii_case("SYSTEM") || self.os_identity == "root")
             || !self.elevated
@@ -776,7 +776,7 @@ mod tests {
         assert!(request.validate("uid").is_ok());
         let mutations: &[fn(&mut QgaCommandRequest)] = &[
             |r| r.version = 2,
-            |r| r.operation = "script".into(),
+            |r| r.operation = "shell".into(),
             |r| r.os_identity = "workspace".into(),
             |r| r.elevated = false,
             |r| r.deadline_seconds = 0,
@@ -797,6 +797,9 @@ mod tests {
                 "mutation must deny: {mutated:?}"
             );
         }
+        let mut script_req = request.clone();
+        script_req.operation = "script".into();
+        assert!(script_req.validate("uid").is_ok());
         // Expected binding is always SYSTEM/command over the fixed transport.
         let binding = request.expected_binding(digest(b"request"));
         assert!(binding.valid());
