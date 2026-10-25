@@ -15,6 +15,8 @@ install -D -m 0755 "$source_dir/kw-agent" /usr/local/bin/kw-agent
 install -D -m 0755 "$source_dir/workspace-agent-session" /usr/local/libexec/workspace-agent-session
 install -D -m 0644 "$source_dir/workspace-agent.desktop" /etc/xdg/autostart/workspace-agent.desktop
 install -d -m 0755 /etc/systemd/user /etc/workspace-agent/public
+# QGA management staging/replay state is machine-owned, never desktop-writable.
+install -d -o root -g root -m 0700 /var/lib/workspace-agent
 {
   printf '[Unit]\nConditionUser=%s\n' "$desktop_user"
   printf 'Description=Kube Workspaces GNOME Wayland desktop agent\n'

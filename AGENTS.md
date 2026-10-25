@@ -75,7 +75,8 @@ table checks, run by both `build-msi.ps1` and CI).
   installed command (no listener, no other guest command is reachable). The
   runner re-verifies everything guest-side: pinned public keys, the enrolled
   workspace UID, request bounds and persistent single-use grant IDs, and it
-  additionally requires Windows + LocalSystem, an executable with explicit
+  additionally requires Windows + LocalSystem or Linux + root with cgroup v2
+  supervision, an executable with explicit
   argv (no shell/PTY/interactive stdin), a guest deadline of at most 20 s,
   and a 16 KiB combined stdout/stderr cap with truncation reporting. Never
   fall back to this transport from a failed dedicated mutually authenticated

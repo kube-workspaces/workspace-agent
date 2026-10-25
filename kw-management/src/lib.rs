@@ -308,12 +308,11 @@ impl QgaBinding {
         }) {
             return false;
         }
-        // The pilot transport admits bounded commands under an explicit SYSTEM
-        // identity only; scripts, shells and other identities arrive with
-        // later transports.
+        // Bounded elevated commands only. The platform runner additionally
+        // enforces that the signed identity matches its actual OS identity.
         if self.operation != "command"
             || self.transport != TRANSPORT_QGA_POD_EXEC
-            || !self.os_identity.eq_ignore_ascii_case("SYSTEM")
+            || !(self.os_identity.eq_ignore_ascii_case("SYSTEM") || self.os_identity == "root")
             || !self.elevated
         {
             return false;
@@ -374,8 +373,10 @@ impl QgaCommandRequest {
         if self.operation != "command" {
             return Err("pilot transport admits command operations only".into());
         }
-        if !self.os_identity.eq_ignore_ascii_case("SYSTEM") || !self.elevated {
-            return Err("pilot transport requires the explicit SYSTEM identity".into());
+        if !(self.os_identity.eq_ignore_ascii_case("SYSTEM") || self.os_identity == "root")
+            || !self.elevated
+        {
+            return Err("pilot transport requires explicit SYSTEM or root identity".into());
         }
         if !(1..=QGA_MAX_DEADLINE_SECONDS).contains(&self.deadline_seconds) {
             return Err(format!(

@@ -1,10 +1,11 @@
-//! Bounded SYSTEM command runner for the approved QGA pilot transport
+//! Bounded root/SYSTEM command runner for the opt-in QGA pilot transport
 //! (`qga-pod-exec/v1`). Invoked as a fixed installed command by the API's
 //! Kubernetes-authenticated launcher bridge; it opens no listener.
 //!
 //! Contract: one staged envelope file → independent guest verification of the
 //! signed QGA grant (pinned public keys, enrolled workspace UID, request
 //! bounds, single-use) → one bounded process tree under a Windows Job Object
+//! or Linux cgroup v2
 //! (deadline, combined output cap, process-tree cleanup) → one bounded JSON
 //! result on stdout. No interactive stdin, no detached jobs, no shell/PTY.
 //! The API must treat this result as the authoritative guest outcome; loss of
@@ -63,9 +64,7 @@ impl CommandResult {
 }
 
 #[derive(Clone, Debug)]
-// args/cwd are consumed only by the Windows Job Object spawn path; the
-// non-Windows build exists to deny, not to run.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub struct CommandSpec {
     pub executable: String,
     pub args: Vec<String>,
@@ -85,7 +84,7 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     fn unsupported() -> Self {
         Self {
             outcome: "spawn-failed",
@@ -142,6 +141,25 @@ pub fn load_keys(path: &Path) -> Result<Vec<[u8; 32]>, String> {
 /// any read/parse/write problem denies instead of running the command.
 fn claim_jti(state_dir: &Path, jti: &str, expiry: i64, now: i64) -> Result<(), String> {
     std::fs::create_dir_all(state_dir).map_err(|e| format!("state directory: {e}"))?;
+    // Separate QGA processes can arrive concurrently. Hold a kernel lock for
+    // the complete read/claim/publish transaction, not just the final rename.
+    #[cfg(target_os = "linux")]
+    let _lock = {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(state_dir.join("replay.lock"))
+            .map_err(|e| format!("replay lock: {e}"))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err("replay lock unavailable".into());
+        }
+        file
+    };
     let path = state_dir.join(JTI_FILE_NAME);
     let mut store = match std::fs::read(&path) {
         Ok(data) => {
@@ -171,8 +189,18 @@ fn claim_jti(state_dir: &Path, jti: &str, expiry: i64, now: i64) -> Result<(), S
     store.entries.insert(jti.to_owned(), expiry);
     let raw = serde_json::to_vec(&store).map_err(|_| "grant replay store render".to_string())?;
     let temp = state_dir.join(format!("{JTI_FILE_NAME}.tmp"));
-    std::fs::write(&temp, raw).map_err(|e| format!("grant replay store write: {e}"))?;
-    std::fs::rename(&temp, &path).map_err(|e| format!("grant replay store publish: {e}"))
+    use std::io::Write;
+    let mut file =
+        std::fs::File::create(&temp).map_err(|e| format!("grant replay store create: {e}"))?;
+    file.write_all(&raw)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("grant replay store write: {e}"))?;
+    std::fs::rename(&temp, &path).map_err(|e| format!("grant replay store publish: {e}"))?;
+    #[cfg(target_os = "linux")]
+    std::fs::File::open(state_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("grant replay store sync: {e}"))?;
+    Ok(())
 }
 
 /// Verify the staged envelope end to end. On success the grant is consumed
@@ -218,9 +246,8 @@ fn result_from_run(outcome: RunOutcome) -> CommandResult {
     }
 }
 
-/// Full runner lifecycle with an injectable spawn for tests. `spawn` receives
-/// the bounded command spec; the production path uses the Windows Job Object
-/// implementation.
+/// Full runner lifecycle with an injectable spawn for tests. Production uses
+/// the platform's bounded process supervisor.
 pub fn run_with<F>(
     envelope: &[u8],
     keys: &[[u8; 32]],
@@ -250,6 +277,31 @@ where
 /// Production entry: enrolled identity from the agent data dir, pinned keys
 /// from the data dir, persistent single-use state beside them.
 pub fn run(args: &RunArgs) -> CommandResult {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return CommandResult::denied("runner is not running as root");
+        }
+        match std::fs::symlink_metadata(&args.data_dir) {
+            Ok(meta) if meta.is_dir() && meta.uid() == 0 && meta.mode() & 0o077 == 0 => (),
+            _ => {
+                return CommandResult::denied(
+                    "management data directory must be root-owned mode 0700",
+                )
+            }
+        }
+        for path in [
+            Path::new("/etc/workspace-agent"),
+            Path::new("/etc/workspace-agent/public"),
+            Path::new("/etc/workspace-agent/public/binding.json"),
+        ] {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.uid() == 0 && meta.mode() & 0o022 == 0 && !meta.file_type().is_symlink() => (),
+                _ => return CommandResult::denied("management state and binding must be root-owned and not writable by other users"),
+            }
+        }
+    }
     let envelope = match read_bounded(&args.request_file, QGA_MAX_ENVELOPE_BYTES) {
         Ok(envelope) => envelope,
         Err(reason) => return CommandResult::runner_error(reason),
@@ -262,10 +314,16 @@ pub fn run(args: &RunArgs) -> CommandResult {
         Ok(keys) => keys,
         Err(reason) => return CommandResult::denied(reason),
     };
+    #[cfg(not(target_os = "linux"))]
     let enrolled = match kw_core::load(&args.data_dir) {
         Ok(Some(identity)) => identity.workspace_uid,
         Ok(None) => return CommandResult::denied("identity.json missing: guest is not enrolled"),
         Err(error) => return CommandResult::denied(format!("identity unreadable: {error}")),
+    };
+    #[cfg(target_os = "linux")]
+    let enrolled = match super::binding::read(Path::new("/etc/workspace-agent")) {
+        Ok(Some(binding)) => binding.workspace_uid,
+        _ => return CommandResult::denied("controller workspace binding is missing or unreadable"),
     };
     let state_dir = args
         .state_dir
@@ -278,6 +336,19 @@ pub fn run(args: &RunArgs) -> CommandResult {
     #[cfg(windows)]
     if !crate::windows_runtime::process_is_local_system() {
         return CommandResult::denied("runner is not running as SYSTEM");
+    }
+    // A valid grant for the other OS must never be interpreted as authority
+    // for this machine's privileged identity.
+    let (_, raw) = match split_qga_envelope(&envelope) {
+        Ok(parts) => parts,
+        Err(_) => return CommandResult::denied("envelope malformed"),
+    };
+    let request: QgaCommandRequest = match serde_json::from_str(raw.get()) {
+        Ok(request) => request,
+        Err(_) => return CommandResult::denied("request malformed"),
+    };
+    if !platform_identity_matches(&request.os_identity) {
+        return CommandResult::denied("target identity does not match the runner OS");
     }
     run_with(
         &envelope,
@@ -314,10 +385,26 @@ fn spawn_bounded(spec: &CommandSpec) -> RunOutcome {
     windows_runner::spawn(spec)
 }
 
-#[cfg(not(windows))]
+fn platform_identity_matches(identity: &str) -> bool {
+    if cfg!(windows) {
+        identity.eq_ignore_ascii_case("SYSTEM")
+    } else {
+        cfg!(target_os = "linux") && identity == "root"
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[path = "management_exec_linux.rs"]
+mod linux_runner;
+
+#[cfg(target_os = "linux")]
+fn spawn_bounded(spec: &CommandSpec) -> RunOutcome {
+    linux_runner::spawn(spec)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn spawn_bounded(_spec: &CommandSpec) -> RunOutcome {
-    // The pilot transport admits Windows SYSTEM commands only. A non-Windows
-    // invocation must never run the command.
+    // Other operating systems have no management supervisor.
     RunOutcome::unsupported()
 }
 
@@ -900,6 +987,49 @@ mod tests {
             .unwrap_or_default()
             .contains("consumed"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_grant_is_single_use_under_concurrent_runner_process_claims() {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mut request: serde_json::Value =
+            serde_json::from_str(&valid_request_json(&challenge, &digest(b"target"))).unwrap();
+        request["os_identity"] = "root".into();
+        request["executable"] = "/usr/bin/id".into();
+        request["args"] = serde_json::json!(["-u"]);
+        let envelope = signed_qga_envelope(&request.to_string(), 0, fixture_binding);
+        let dir = temp_dir("root-concurrency");
+        let barrier = std::sync::Barrier::new(8);
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let result = run_with(
+                        envelope.as_bytes(),
+                        &[test_key(0)],
+                        "11111111-1111-4111-8111-111111111111",
+                        &dir,
+                        1_800_000_000,
+                        |_| {
+                            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            RunOutcome {
+                                outcome: "completed",
+                                exit_code: Some(0),
+                                stdout: b"0\n".to_vec(),
+                                stderr: Vec::new(),
+                                truncated: false,
+                                duration: Duration::ZERO,
+                            }
+                        },
+                    );
+                    assert!(result.outcome == "completed" || result.outcome == "denied");
+                });
+            }
+        });
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

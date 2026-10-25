@@ -40,6 +40,10 @@ not treat fixtures or CI green as guest acceptance.
 
 ## Linux GNOME/Wayland startup
 
+Bounded root command execution is independent of desktop startup; see
+[Linux recorded management commands](docs/linux-management-exec.md) for the
+QGA backend, installation prerequisites and verification.
+
 The Linux backend captures the active ordinary user's GNOME console through
 Mutter RemoteDesktop/ScreenCast and PipeWire. It provides software H.264 through
 GStreamer x264, Pulse/PipeWire loopback audio, input, Unicode clipboard and real
