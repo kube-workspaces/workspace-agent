@@ -256,6 +256,49 @@ pub const QGA_MAX_ARG_BYTES: usize = 8 * 1024;
 pub const QGA_MAX_EXECUTABLE_BYTES: usize = 1024;
 pub const QGA_MAX_CWD_BYTES: usize = 1024;
 pub const QGA_MAX_ENVELOPE_BYTES: usize = 96 * 1024;
+pub const QGA_MAX_SCRIPT_BYTES: usize = 64 * 1024;
+
+/// Version 2 Linux script payload. The exact request bytes, including this
+/// policy, body and basename hint, are covered by the grant request digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QgaScript {
+    pub body: String,
+    pub name: Option<String>,
+    pub interpreter_policy: String,
+}
+
+impl QgaScript {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.interpreter_policy != "linux-shebang-v1"
+            || self.body.is_empty()
+            || self.body.len() > QGA_MAX_SCRIPT_BYTES
+            || self.body.contains('\0')
+        {
+            return Err("script body or interpreter policy is unsupported".into());
+        }
+        // Fixed absolute interpreters only; no env/PATH lookup, interpreter
+        // arguments, CRLF shebangs or shell-string construction.
+        if !matches!(
+            self.body.split('\n').next().unwrap_or_default(),
+            "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash" | "#!/usr/bin/python3"
+        ) {
+            return Err("unsupported Linux script shebang".into());
+        }
+        if let Some(name) = &self.name {
+            if name.is_empty()
+                || name.len() > 128
+                || matches!(name.as_str(), "." | "..")
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            {
+                return Err("script name must be a bounded basename hint".into());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum QgaError {
@@ -356,8 +399,12 @@ pub struct QgaCommandRequest {
     pub elevated: bool,
     pub policy_version: String,
     pub revocation_epoch: u64,
+    #[serde(default)]
     pub executable: String,
+    #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<QgaScript>,
     pub cwd: Option<String>,
     pub deadline_seconds: u32,
 }
@@ -367,11 +414,16 @@ impl QgaCommandRequest {
     /// enrolled workspace UID — the one binding the runner can verify
     /// independently of the API-supplied envelope.
     pub fn validate(&self, enrolled_uid: &str) -> Result<(), String> {
-        if self.version != 1 {
-            return Err("unsupported request version".into());
-        }
-        if self.operation != "command" && self.operation != "script" {
-            return Err("pilot transport admits command or script operations only".into());
+        match (self.version, self.operation.as_str(), &self.script) {
+            (1, "command", None) => (),
+            (2, "script", Some(script))
+                if self.os_identity == "root"
+                    && self.executable.is_empty()
+                    && self.args.is_empty() =>
+            {
+                script.validate()?
+            }
+            _ => return Err("unsupported request version, operation or script framing".into()),
         }
         if !(self.os_identity.eq_ignore_ascii_case("SYSTEM") || self.os_identity == "root")
             || !self.elevated
@@ -383,10 +435,11 @@ impl QgaCommandRequest {
                 "deadline_seconds must be within 1..={QGA_MAX_DEADLINE_SECONDS}"
             ));
         }
-        if self.executable.is_empty()
-            || self.executable.len() > QGA_MAX_EXECUTABLE_BYTES
-            || self.executable.trim() != self.executable.as_str()
-            || self.executable.chars().any(char::is_control)
+        if self.script.is_none()
+            && (self.executable.is_empty()
+                || self.executable.len() > QGA_MAX_EXECUTABLE_BYTES
+                || self.executable.trim() != self.executable.as_str()
+                || self.executable.chars().any(char::is_control))
         {
             return Err("executable is missing or out of bounds".into());
         }
@@ -770,6 +823,7 @@ mod tests {
             revocation_epoch: 0,
             executable: "cmd.exe".into(),
             args: vec!["/c".into(), "echo hi".into()],
+            script: None,
             cwd: None,
             deadline_seconds: 20,
         };
@@ -799,7 +853,29 @@ mod tests {
         }
         let mut script_req = request.clone();
         script_req.operation = "script".into();
+        assert!(script_req.validate("uid").is_err());
+        script_req.version = 2;
+        script_req.os_identity = "root".into();
+        script_req.executable.clear();
+        script_req.args.clear();
+        script_req.script = Some(QgaScript {
+            body: "#!/bin/sh\nid\n".into(),
+            name: Some("test.sh".into()),
+            interpreter_policy: "linux-shebang-v1".into(),
+        });
         assert!(script_req.validate("uid").is_ok());
+        for change in [
+            |r: &mut QgaCommandRequest| r.version = 1,
+            |r: &mut QgaCommandRequest| r.operation = "command".into(),
+            |r: &mut QgaCommandRequest| r.os_identity = "SYSTEM".into(),
+            |r: &mut QgaCommandRequest| r.executable = "/bin/sh".into(),
+            |r: &mut QgaCommandRequest| r.args.push("-c".into()),
+            |r: &mut QgaCommandRequest| r.script = None,
+        ] {
+            let mut invalid = script_req.clone();
+            change(&mut invalid);
+            assert!(invalid.validate("uid").is_err());
+        }
         // Expected binding is always SYSTEM/command over the fixed transport.
         let binding = request.expected_binding(digest(b"request"));
         assert!(binding.valid());
@@ -812,6 +888,59 @@ mod tests {
         mtlspirit = binding.clone();
         mtlspirit.elevated = false;
         assert!(!mtlspirit.valid());
+    }
+
+    #[test]
+    fn script_body_basename_and_interpreter_boundaries() {
+        let mut script = QgaScript {
+            body: "#!/bin/sh\n".into(),
+            name: None,
+            interpreter_policy: "linux-shebang-v1".into(),
+        };
+        for body in [
+            "#!/bin/sh\n",
+            "#!/bin/bash\n",
+            "#!/usr/bin/bash\n",
+            "#!/usr/bin/python3\n",
+        ] {
+            script.body = body.into();
+            assert!(script.validate().is_ok());
+        }
+        for body in [
+            "",
+            "echo hi",
+            "#!/usr/bin/env sh\n",
+            "#!/bin/sh -e\n",
+            "#!/bin/sh\r\n",
+            "#!/bin/sh\nx\0",
+        ] {
+            script.body = body.into();
+            assert!(script.validate().is_err());
+        }
+        script.body = format!("#!/bin/sh\n{}", "x".repeat(QGA_MAX_SCRIPT_BYTES - 10));
+        assert_eq!(script.body.len(), QGA_MAX_SCRIPT_BYTES);
+        assert!(script.validate().is_ok());
+        script.body.push('x');
+        assert!(script.validate().is_err());
+        script.body = "#!/bin/sh\n".into();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../test",
+            "/tmp/test",
+            "a/b",
+            "a\\b",
+            "a\n",
+            "a:b",
+        ] {
+            script.name = Some(name.into());
+            assert!(script.validate().is_err());
+        }
+        script.name = Some("maintenance-1.sh".into());
+        assert!(script.validate().is_ok());
+        script.interpreter_policy = "unknown".into();
+        assert!(script.validate().is_err());
     }
 
     #[test]

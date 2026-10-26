@@ -69,15 +69,18 @@ table checks, run by both `build-msi.ps1` and CI).
   This supersedes the blanket prohibition for that endpoint only; there is
   still no capability-discovery or arbitrary-argv execute endpoint.
 - **QGA pod-exec pilot transport (`qga-pod-exec/v1`), operator-approved:**
-  the `command` operation may instead arrive as a single staged envelope file
+  the `command` operation (request v1), and bounded Linux root `script`
+  operations (request v2, `linux-shebang-v1` policy), may instead arrive as a
+  single staged envelope file
   consumed by the fixed `kw-agent management-exec` command, which the API
   invokes through a Kubernetes-authenticated QGA guest-exec of that exact
   installed command (no listener, no other guest command is reachable). The
   runner re-verifies everything guest-side: pinned public keys, the enrolled
   workspace UID, request bounds and persistent single-use grant IDs, and it
   additionally requires Windows + LocalSystem or Linux + root with cgroup v2
-  supervision, an executable with explicit
-  argv (no shell/PTY/interactive stdin), a guest deadline of at most 20 s,
+  supervision, an executable with explicit argv or a digest-bound script body
+  staged exclusively by the verified Linux runner (no PTY/interactive stdin),
+  a guest deadline of at most 20 s,
   and a 16 KiB combined stdout/stderr cap with truncation reporting. Never
   fall back to this transport from a failed dedicated mutually authenticated
   connection; the dedicated management listener remains the follow-up.

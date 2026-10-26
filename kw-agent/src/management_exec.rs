@@ -259,8 +259,7 @@ pub fn run_with<F>(
 where
     F: FnOnce(&CommandSpec) -> RunOutcome,
 {
-    let (request, _jti) = match verify_envelope(envelope, keys, enrolled_uid, state_dir, now_epoch)
-    {
+    let (request, jti) = match verify_envelope(envelope, keys, enrolled_uid, state_dir, now_epoch) {
         Ok(verified) => verified,
         Err(result) => return result,
     };
@@ -271,8 +270,37 @@ where
         deadline: Duration::from_secs(request.deadline_seconds as u64),
         output_limit: kw_management::QGA_MAX_OUTPUT_BYTES,
     };
+    if let Some(script) = &request.script {
+        #[cfg(target_os = "linux")]
+        {
+            let mut spec = spec;
+            let staged = match scripts::StagedScript::create(state_dir, &jti, script) {
+                Ok(staged) => staged,
+                Err(reason) => return CommandResult::runner_error(reason),
+            };
+            spec.executable = staged.path().to_string_lossy().into_owned();
+            let result = result_from_run(spawn(&spec));
+            if staged.finish().is_err() {
+                return CommandResult {
+                    outcome: "runner-error".into(),
+                    denial: Some("script cleanup failed; do not rerun".into()),
+                    ..result
+                };
+            }
+            return result;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (script, jti);
+            return CommandResult::denied("script execution is not supported on this OS");
+        }
+    }
     result_from_run(spawn(&spec))
 }
+
+#[cfg(target_os = "linux")]
+#[path = "management_exec_scripts.rs"]
+mod scripts;
 
 /// Production entry: enrolled identity from the agent data dir, pinned keys
 /// from the data dir, persistent single-use state beside them.
@@ -874,7 +902,187 @@ mod tests {
         request.expected_binding(request_sha)
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    fn script_request_json(body: &str) -> String {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mut request: serde_json::Value =
+            serde_json::from_str(&valid_request_json(&challenge, &digest(b"target"))).unwrap();
+        request["version"] = 2.into();
+        request["operation"] = "script".into();
+        request["os_identity"] = "root".into();
+        request["executable"] = "".into();
+        request["args"] = serde_json::json!([]);
+        request["script"] = serde_json::json!({
+            "body": body,
+            "name": "maintenance.sh",
+            "interpreter_policy": "linux-shebang-v1"
+        });
+        request.to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signed_script_stages_privately_executes_shebang_and_cleans_up() {
+        use std::os::unix::fs::MetadataExt;
+        let body = "#!/bin/sh\nprintf 'script output\\n'\nprintf 'script stderr\\n' >&2\nexit 7\n";
+        let request_json = script_request_json(body);
+        let envelope = signed_qga_envelope(&request_json, 0, fixture_binding);
+        let dir = temp_dir("script");
+        let mut staged_path = None;
+        let result = run_with(
+            envelope.as_bytes(),
+            &[test_key(0)],
+            "11111111-1111-4111-8111-111111111111",
+            &dir,
+            1_800_000_000,
+            |spec| {
+                let path = PathBuf::from(&spec.executable);
+                assert_eq!(std::fs::read(&path).unwrap(), body.as_bytes());
+                assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
+                assert_eq!(
+                    std::fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+                    0o700
+                );
+                assert!(spec.args.is_empty());
+                assert_eq!(spec.deadline, Duration::from_secs(20));
+                assert_eq!(spec.output_limit, kw_management::QGA_MAX_OUTPUT_BYTES);
+                // Real kernel shebang execution. Supervision is tested separately
+                // by the existing privileged cgroup runner suite.
+                let output = std::process::Command::new(&path).output().unwrap();
+                staged_path = Some(path);
+                RunOutcome {
+                    outcome: "completed",
+                    exit_code: output.status.code(),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                    truncated: false,
+                    duration: Duration::from_millis(1),
+                }
+            },
+        );
+        assert_eq!(result.outcome, "completed");
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(
+            STANDARD.decode(result.stdout_b64).unwrap(),
+            b"script output\n"
+        );
+        assert_eq!(
+            STANDARD.decode(result.stderr_b64).unwrap(),
+            b"script stderr\n"
+        );
+        assert!(!staged_path.unwrap().exists());
+        let replay = run_with(
+            envelope.as_bytes(),
+            &[test_key(0)],
+            "11111111-1111-4111-8111-111111111111",
+            &dir,
+            1_800_000_000,
+            |_| panic!("a replayed script must never execute"),
+        );
+        assert_eq!(replay.outcome, "denied");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_body_tampering_denies_without_staging() {
+        let original = script_request_json("#!/bin/sh\necho original\n");
+        let envelope = signed_qga_envelope(&original, 0, fixture_binding)
+            .replace("echo original", "echo tampered");
+        let dir = temp_dir("script-tamper");
+        let result = run_with(
+            envelope.as_bytes(),
+            &[test_key(0)],
+            "11111111-1111-4111-8111-111111111111",
+            &dir,
+            1_800_000_000,
+            |_| panic!("tampered scripts must not spawn"),
+        );
+        assert_eq!(result.outcome, "denied");
+        assert!(!dir.join("scripts").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_raw_and_encoded_envelope_limits_are_independent() {
+        // Both bodies fit the 64 KiB UTF-8 bound, but JSON escaping makes the
+        // second exceed the independent 96 KiB staged-envelope bound.
+        for (fill, expected) in [('x', "completed"), ('\t', "denied")] {
+            let body = format!(
+                "#!/bin/sh\n{}",
+                fill.to_string()
+                    .repeat(kw_management::QGA_MAX_SCRIPT_BYTES - 10)
+            );
+            let envelope = signed_qga_envelope(&script_request_json(&body), 0, fixture_binding);
+            assert_eq!(
+                envelope.len() > QGA_MAX_ENVELOPE_BYTES,
+                expected == "denied"
+            );
+            let dir = temp_dir("script-envelope-limit");
+            let result = run_with(
+                envelope.as_bytes(),
+                &[test_key(0)],
+                "11111111-1111-4111-8111-111111111111",
+                &dir,
+                1_800_000_000,
+                |_| {
+                    assert_eq!(expected, "completed");
+                    RunOutcome {
+                        outcome: "completed",
+                        exit_code: Some(0),
+                        stdout: vec![],
+                        stderr: vec![],
+                        truncated: false,
+                        duration: Duration::ZERO,
+                    }
+                },
+            );
+            assert_eq!(result.outcome, expected);
+            if expected == "denied" {
+                assert!(!dir.join("scripts").exists());
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_cleanup_preserves_deadline_output_limit_and_spawn_failure() {
+        for outcome in ["deadline", "output-limit", "spawn-failed"] {
+            let envelope = signed_qga_envelope(
+                &script_request_json("#!/bin/sh\nexit 0\n"),
+                0,
+                fixture_binding,
+            );
+            let dir = temp_dir(outcome);
+            let mut path = None;
+            let result = run_with(
+                envelope.as_bytes(),
+                &[test_key(0)],
+                "11111111-1111-4111-8111-111111111111",
+                &dir,
+                1_800_000_000,
+                |spec| {
+                    path = Some(PathBuf::from(&spec.executable));
+                    RunOutcome {
+                        outcome,
+                        exit_code: None,
+                        stdout: vec![],
+                        stderr: vec![],
+                        truncated: outcome == "output-limit",
+                        duration: Duration::ZERO,
+                    }
+                },
+            );
+            assert_eq!(result.outcome, outcome);
+            assert_eq!(result.truncated, outcome == "output-limit");
+            assert!(!path.unwrap().exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    pub(super) fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "kw-mgmt-exec-{label}-{}-{}",
             std::process::id(),

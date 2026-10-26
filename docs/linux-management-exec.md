@@ -1,10 +1,14 @@
-# Linux recorded management commands
+# Linux recorded management commands and script runner
 
 The explicitly enabled `qga-pod-exec/v1` backend supports bounded commands as
 **root** on Linux agent-equipped VMs. It is independent of GNOME, desktop
-capture, user login and SSH. This is the command-only backend: an executable
+capture, user login and SSH. The v1 command request takes an executable
 and argv, optional cwd, no interactive stdin or PTY. Running `/bin/sh -c` or
 another interpreter is an explicit command and uses the same bounds.
+
+The guest runner also implements the v2 script contract below. End-to-end Script
+mode requires a matching API issuer, protected recording and guest capability
+gating; runner support alone does not enable it in the API or browser.
 
 ## Installation and prerequisites
 
@@ -55,6 +59,54 @@ success. Lost guest transport is an explicit unknown result; never auto-retry.
 The workspace `execution_identity` field is a configured support hint, not a
 claim of live guest readiness. Admission checks the current target and the
 installed runner checks actual prerequisites.
+
+## Linux script request v2
+
+The transport, grant audience/type and existing command request v1 are unchanged.
+Script requests use `version: 2`, `operation: script`, explicit elevated `root`,
+empty/omitted `executable` and `args`, and this nested payload:
+
+```json
+{
+  "body": "#!/bin/sh\nprintf 'hello\\n'\n",
+  "name": "maintenance.sh",
+  "interpreter_policy": "linux-shebang-v1"
+}
+```
+
+The script shares the request's optional `cwd`; there is no nested cwd or
+interpreter argv. The exact serialized request digest binds body, basename hint,
+cwd, policy, identity, operation and bounds into the signed grant. Version 1
+requests labelled `script` are rejected: executable/argv framing is insufficient
+to authorize an inline script. Older command-only runners reject request v2.
+Windows script requests are not implemented by this Linux contract.
+
+- UTF-8 body: at most 64 KiB, no NUL. The entire encoded envelope must also fit
+  96 KiB; JSON escaping can exhaust this separate limit before the raw-body limit.
+  A matching API must check both before admission/dispatch.
+- Accepted first lines are exactly `#!/bin/sh`, `#!/bin/bash`,
+  `#!/usr/bin/bash`, or `#!/usr/bin/python3`. No PATH/`env` lookup, shebang
+  arguments, BOM or CRLF shebang. Missing interpreters yield a supervised spawn
+  failure. Script input is never interpolated into a command string.
+- `name` is optional, at most 128 ASCII alphanumeric/`.`/`_`/`-` characters,
+  excluding `.` and `..`; it is a recorded hint, never a guest path.
+- After signature verification and durable single-use claim, the runner creates
+  an exclusive directory and file, both mode `0700`, under the management state
+  directory's private `scripts` root. The file is closed before kernel shebang
+  execution. The existing cgroup supervisor enforces the same deadline, output
+  budget, fixed environment, stdin closure and descendant cleanup as commands.
+- One script can hold the nonblocking per-guest staging lock at a time. A second
+  request fails without dispatch and is not automatically retried. Commands
+  retain their existing concurrency behavior.
+- Files are removed after success, nonzero exit, deadline, output limit or spawn
+  failure. Cleanup failure is a runner error, never success. A later verified
+  script request removes crash leftovers while holding the lock; leftover scripts
+  are never replayed. Unexpected entries/permissions deny recovery rather than
+  recursively deleting unrelated files. This is recovery on the next script
+  request, not an independent boot-time scavenger.
+
+Protected off-guest admission must include the complete script before issuing its
+grant. Script bodies belong only in encrypted recordings, not metadata or logs.
 
 ## Verification
 
