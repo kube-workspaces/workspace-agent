@@ -6,9 +6,13 @@ capture, user login and SSH. The v1 command request takes an executable
 and argv, optional cwd, no interactive stdin or PTY. Running `/bin/sh -c` or
 another interpreter is an explicit command and uses the same bounds.
 
-The guest runner also implements the v2 script contract below. End-to-end Script
-mode requires a matching API issuer, protected recording and guest capability
-gating; runner support alone does not enable it in the API or browser.
+The guest runner also implements the v2 script contract below. A matching API
+checks `kw-agent management-exec --capabilities` through the authenticated QGA
+path before admission. This fixed probe reports request/policy support without
+reading identity, keys, execution input or state, and creates no user process.
+It is not proof of actual root/cgroup/storage readiness. Older runners return no
+compatible advertisement and must not receive script requests. Browser Script
+mode additionally requires client capability gating.
 
 ## Installation and prerequisites
 

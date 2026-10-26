@@ -84,5 +84,8 @@ table checks, run by both `build-msi.ps1` and CI).
   and a 16 KiB combined stdout/stderr cap with truncation reporting. Never
   fall back to this transport from a failed dedicated mutually authenticated
   connection; the dedicated management listener remains the follow-up.
+  A fixed `management-exec --capabilities` invocation may report protocol support
+  over the same authenticated QGA path; it reads no execution input or keys,
+  opens no listener and grants no execution authority.
 - Fixture changes must keep `tools/validate_fixtures.py` and its tests
   green. Headless fixtures do not close driver/A/V acceptance.

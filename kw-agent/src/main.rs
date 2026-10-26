@@ -338,6 +338,19 @@ fn main() {
             }
         }
         Some("management-exec") => {
+            // Fixed read-only protocol probe over the authenticated QGA path.
+            // No request/key/state access and no user process is created.
+            if args.len() == 2 && args[1] == "--capabilities" {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "version": 1,
+                        "script_request_version": if cfg!(target_os = "linux") { 2 } else { 0 },
+                        "interpreter_policy": if cfg!(target_os = "linux") { "linux-shebang-v1" } else { "" }
+                    })
+                );
+                return;
+            }
             // Approved QGA pod-exec pilot: one staged envelope in, independent
             // guest verification, one bounded SYSTEM command out, one JSON
             // result on stdout. Never interactive, never a shell or PTY.

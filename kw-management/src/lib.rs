@@ -944,6 +944,58 @@ mod tests {
     }
 
     #[test]
+    fn go_script_v2_signature_interoperability_and_tamper_replay() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            now: i64,
+            public_key: String,
+            request: Box<serde_json::value::RawValue>,
+            token: String,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../fixtures/linux-script-v2.json")).unwrap();
+        let public: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&fixture.public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let request: QgaCommandRequest = serde_json::from_str(fixture.request.get()).unwrap();
+        request.validate("workspace-uid").unwrap();
+        assert_eq!(request.version, 2);
+        assert_eq!(
+            request.script.as_ref().unwrap().body,
+            "#!/bin/sh\nprintf 'hello\\n'\n"
+        );
+        let binding = request.expected_binding(digest(fixture.request.get().as_bytes()));
+        let mut verifier = QgaVerifier::new(&[public], 4).unwrap();
+        verifier
+            .consume(&fixture.token, &binding, fixture.now)
+            .unwrap();
+        assert!(matches!(
+            verifier.consume(&fixture.token, &binding, fixture.now),
+            Err(QgaError::Replay)
+        ));
+        for change in [
+            |r: &mut QgaCommandRequest| r.script.as_mut().unwrap().body.push_str("id\n"),
+            |r: &mut QgaCommandRequest| r.script.as_mut().unwrap().name = Some("other.sh".into()),
+            |r: &mut QgaCommandRequest| {
+                r.script.as_mut().unwrap().interpreter_policy = "other".into()
+            },
+            |r: &mut QgaCommandRequest| r.cwd = Some("/tmp".into()),
+        ] {
+            let mut tampered = request.clone();
+            change(&mut tampered);
+            let expected =
+                tampered.expected_binding(digest(&serde_json::to_vec(&tampered).unwrap()));
+            let mut verifier = QgaVerifier::new(&[public], 4).unwrap();
+            assert!(matches!(
+                verifier.consume(&fixture.token, &expected, fixture.now),
+                Err(QgaError::Binding)
+            ));
+        }
+    }
+
+    #[test]
     fn qga_verifier_cross_type_and_binding_denials() {
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../fixtures/management-qga-v1.json")).unwrap();
