@@ -120,6 +120,11 @@ impl StagedScript {
         self.directory.join("script")
     }
 
+    pub(super) fn configure(&self, spec: &mut super::CommandSpec) {
+        spec.executable = self.path().to_string_lossy().into_owned();
+        spec.args.clear();
+    }
+
     pub(super) fn finish(self) -> Result<(), String> {
         cleanup(&self.directory)
     }

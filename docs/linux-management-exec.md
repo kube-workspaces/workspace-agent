@@ -83,7 +83,9 @@ interpreter argv. The exact serialized request digest binds body, basename hint,
 cwd, policy, identity, operation and bounds into the signed grant. Version 1
 requests labelled `script` are rejected: executable/argv framing is insufficient
 to authorize an inline script. Older command-only runners reject request v2.
-Windows script requests are not implemented by this Linux contract.
+Windows scripts use the separate
+[SYSTEM PowerShell policy](windows-management-scripts.md); this Linux policy is
+never accepted as authority for SYSTEM execution.
 
 - UTF-8 body: at most 64 KiB, no NUL. The entire encoded envelope must also fit
   96 KiB; JSON escaping can exhaust this separate limit before the raw-body limit.

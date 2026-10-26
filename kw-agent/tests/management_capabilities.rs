@@ -12,12 +12,18 @@ fn fixed_probe_reports_protocol_without_identity_keys_or_request_files() {
     assert_eq!(caps["version"], 1);
     assert_eq!(
         caps["script_request_version"],
-        if cfg!(target_os = "linux") { 2 } else { 0 }
+        if cfg!(any(target_os = "linux", windows)) {
+            2
+        } else {
+            0
+        }
     );
     assert_eq!(
         caps["interpreter_policy"],
         if cfg!(target_os = "linux") {
             "linux-shebang-v1"
+        } else if cfg!(windows) {
+            "windows-powershell-v1"
         } else {
             ""
         }

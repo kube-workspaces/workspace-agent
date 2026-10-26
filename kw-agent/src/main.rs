@@ -345,8 +345,8 @@ fn main() {
                     "{}",
                     serde_json::json!({
                         "version": 1,
-                        "script_request_version": if cfg!(target_os = "linux") { 2 } else { 0 },
-                        "interpreter_policy": if cfg!(target_os = "linux") { "linux-shebang-v1" } else { "" }
+                        "script_request_version": if cfg!(any(target_os = "linux", windows)) { 2 } else { 0 },
+                        "interpreter_policy": if cfg!(target_os = "linux") { "linux-shebang-v1" } else if cfg!(windows) { "windows-powershell-v1" } else { "" }
                     })
                 );
                 return;

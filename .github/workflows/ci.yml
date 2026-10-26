@@ -63,6 +63,11 @@ jobs:
           ./packaging/windows/test-legacy-migration.ps1
           ./packaging/windows/test-legacy-retirement.ps1 -AgentPath ./target/debug/kw-agent.exe
 
+      - name: Windows SYSTEM script ACL and process regression
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: ./packaging/windows/test-management-scripts.ps1
+
       # Windows runners have real inbox APIs: --hello must emit valid JSON,
       # the inbox H.264 MFT must encode synthetic frames, and WASAPI must
       # initialize (silence is an ok outcome).

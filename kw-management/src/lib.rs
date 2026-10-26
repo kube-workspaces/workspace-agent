@@ -258,7 +258,7 @@ pub const QGA_MAX_CWD_BYTES: usize = 1024;
 pub const QGA_MAX_ENVELOPE_BYTES: usize = 96 * 1024;
 pub const QGA_MAX_SCRIPT_BYTES: usize = 64 * 1024;
 
-/// Version 2 Linux script payload. The exact request bytes, including this
+/// Version 2 OS-policy-bound script payload. The exact request bytes, including this
 /// policy, body and basename hint, are covered by the grant request digest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,20 +270,24 @@ pub struct QgaScript {
 
 impl QgaScript {
     pub fn validate(&self) -> Result<(), String> {
-        if self.interpreter_policy != "linux-shebang-v1"
-            || self.body.is_empty()
+        if self.body.is_empty()
             || self.body.len() > QGA_MAX_SCRIPT_BYTES
             || self.body.contains('\0')
         {
             return Err("script body or interpreter policy is unsupported".into());
         }
-        // Fixed absolute interpreters only; no env/PATH lookup, interpreter
-        // arguments, CRLF shebangs or shell-string construction.
-        if !matches!(
-            self.body.split('\n').next().unwrap_or_default(),
-            "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash" | "#!/usr/bin/python3"
-        ) {
-            return Err("unsupported Linux script shebang".into());
+        let first = self.body.split('\n').next().unwrap_or_default();
+        match self.interpreter_policy.as_str() {
+            "linux-shebang-v1"
+                if matches!(
+                    first,
+                    "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash" | "#!/usr/bin/python3"
+                ) => {}
+            // A fixed marker, not an executable path or PATH/env lookup. The
+            // Windows runner maps it to installed Windows PowerShell with -File.
+            "windows-powershell-v1"
+                if first.strip_suffix('\r').unwrap_or(first) == "#!powershell" => {}
+            _ => return Err("unsupported script interpreter policy or shebang".into()),
         }
         if let Some(name) = &self.name {
             if name.is_empty()
@@ -417,7 +421,10 @@ impl QgaCommandRequest {
         match (self.version, self.operation.as_str(), &self.script) {
             (1, "command", None) => (),
             (2, "script", Some(script))
-                if self.os_identity == "root"
+                if ((self.os_identity == "root"
+                    && script.interpreter_policy == "linux-shebang-v1")
+                    || (self.os_identity.eq_ignore_ascii_case("SYSTEM")
+                        && script.interpreter_policy == "windows-powershell-v1"))
                     && self.executable.is_empty()
                     && self.args.is_empty() =>
             {
@@ -944,6 +951,43 @@ mod tests {
     }
 
     #[test]
+    fn windows_script_policy_is_bound_to_system_and_fixed_powershell_marker() {
+        let mut script = QgaScript {
+            body: "#!powershell\r\nWrite-Output 'héllo'\r\n".into(),
+            name: Some("run.ps1".into()),
+            interpreter_policy: "windows-powershell-v1".into(),
+        };
+        script.validate().unwrap();
+        for first in [
+            "#!/usr/bin/env pwsh",
+            "#!powershell -Command",
+            "#!powershell\r\r",
+            "#!/bin/sh",
+            "\u{feff}#!powershell",
+        ] {
+            script.body = format!("{first}\nexit 0\n");
+            assert!(script.validate().is_err());
+        }
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/linux-script-v2.json")).unwrap();
+        let mut request: QgaCommandRequest =
+            serde_json::from_value(fixture["request"].clone()).unwrap();
+        request.script = Some(QgaScript {
+            body: "#!powershell\nexit 0\n".into(),
+            name: None,
+            interpreter_policy: "windows-powershell-v1".into(),
+        });
+        assert!(request.validate("workspace-uid").is_err());
+        request.os_identity = "SYSTEM".into();
+        request.validate("workspace-uid").unwrap();
+        request.elevated = false;
+        assert!(request.validate("workspace-uid").is_err());
+        request.elevated = true;
+        request.version = 1;
+        assert!(request.validate("workspace-uid").is_err());
+    }
+
+    #[test]
     fn go_script_v2_signature_interoperability_and_tamper_replay() {
         #[derive(Deserialize)]
         struct Fixture {
@@ -952,46 +996,56 @@ mod tests {
             request: Box<serde_json::value::RawValue>,
             token: String,
         }
-        let fixture: Fixture =
-            serde_json::from_str(include_str!("../fixtures/linux-script-v2.json")).unwrap();
-        let public: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(&fixture.public_key)
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let request: QgaCommandRequest = serde_json::from_str(fixture.request.get()).unwrap();
-        request.validate("workspace-uid").unwrap();
-        assert_eq!(request.version, 2);
-        assert_eq!(
-            request.script.as_ref().unwrap().body,
-            "#!/bin/sh\nprintf 'hello\\n'\n"
-        );
-        let binding = request.expected_binding(digest(fixture.request.get().as_bytes()));
-        let mut verifier = QgaVerifier::new(&[public], 4).unwrap();
-        verifier
-            .consume(&fixture.token, &binding, fixture.now)
-            .unwrap();
-        assert!(matches!(
-            verifier.consume(&fixture.token, &binding, fixture.now),
-            Err(QgaError::Replay)
-        ));
-        for change in [
-            |r: &mut QgaCommandRequest| r.script.as_mut().unwrap().body.push_str("id\n"),
-            |r: &mut QgaCommandRequest| r.script.as_mut().unwrap().name = Some("other.sh".into()),
-            |r: &mut QgaCommandRequest| {
-                r.script.as_mut().unwrap().interpreter_policy = "other".into()
-            },
-            |r: &mut QgaCommandRequest| r.cwd = Some("/tmp".into()),
+        for raw in [
+            include_str!("../fixtures/linux-script-v2.json"),
+            include_str!("../fixtures/windows-script-v2.json"),
         ] {
-            let mut tampered = request.clone();
-            change(&mut tampered);
-            let expected =
-                tampered.expected_binding(digest(&serde_json::to_vec(&tampered).unwrap()));
+            let fixture: Fixture = serde_json::from_str(raw).unwrap();
+            let public: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&fixture.public_key)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let request: QgaCommandRequest = serde_json::from_str(fixture.request.get()).unwrap();
+            request.validate("workspace-uid").unwrap();
+            assert_eq!(request.version, 2);
+            assert_eq!(
+                request.script.as_ref().unwrap().body,
+                if request.os_identity == "root" {
+                    "#!/bin/sh\nprintf 'hello\\n'\n"
+                } else {
+                    "#!powershell\nWrite-Output 'héllo'\n"
+                }
+            );
+            let binding = request.expected_binding(digest(fixture.request.get().as_bytes()));
             let mut verifier = QgaVerifier::new(&[public], 4).unwrap();
+            verifier
+                .consume(&fixture.token, &binding, fixture.now)
+                .unwrap();
             assert!(matches!(
-                verifier.consume(&fixture.token, &expected, fixture.now),
-                Err(QgaError::Binding)
+                verifier.consume(&fixture.token, &binding, fixture.now),
+                Err(QgaError::Replay)
             ));
+            for change in [
+                |r: &mut QgaCommandRequest| r.script.as_mut().unwrap().body.push_str("id\n"),
+                |r: &mut QgaCommandRequest| {
+                    r.script.as_mut().unwrap().name = Some("other.sh".into())
+                },
+                |r: &mut QgaCommandRequest| {
+                    r.script.as_mut().unwrap().interpreter_policy = "other".into()
+                },
+                |r: &mut QgaCommandRequest| r.cwd = Some("/tmp".into()),
+            ] {
+                let mut tampered = request.clone();
+                change(&mut tampered);
+                let expected =
+                    tampered.expected_binding(digest(&serde_json::to_vec(&tampered).unwrap()));
+                let mut verifier = QgaVerifier::new(&[public], 4).unwrap();
+                assert!(matches!(
+                    verifier.consume(&fixture.token, &expected, fixture.now),
+                    Err(QgaError::Binding)
+                ));
+            }
         }
     }
 

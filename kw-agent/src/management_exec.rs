@@ -160,6 +160,20 @@ fn claim_jti(state_dir: &Path, jti: &str, expiry: i64, now: i64) -> Result<(), S
         }
         file
     };
+    #[cfg(windows)]
+    let _lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Exclusive sharing fences the complete read/claim/publish transaction
+        // across separate QGA runner processes, including command/script races.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(state_dir.join("replay.lock"))
+            .map_err(|_| "replay lock unavailable".to_string())?
+    };
     let path = state_dir.join(JTI_FILE_NAME);
     let mut store = match std::fs::read(&path) {
         Ok(data) => {
@@ -271,14 +285,14 @@ where
         output_limit: kw_management::QGA_MAX_OUTPUT_BYTES,
     };
     if let Some(script) = &request.script {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let mut spec = spec;
             let staged = match scripts::StagedScript::create(state_dir, &jti, script) {
                 Ok(staged) => staged,
                 Err(reason) => return CommandResult::runner_error(reason),
             };
-            spec.executable = staged.path().to_string_lossy().into_owned();
+            staged.configure(&mut spec);
             let result = result_from_run(spawn(&spec));
             if staged.finish().is_err() {
                 return CommandResult {
@@ -289,7 +303,7 @@ where
             }
             return result;
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (script, jti);
             return CommandResult::denied("script execution is not supported on this OS");
@@ -300,6 +314,10 @@ where
 
 #[cfg(target_os = "linux")]
 #[path = "management_exec_scripts.rs"]
+mod scripts;
+
+#[cfg(windows)]
+#[path = "management_exec_scripts_windows.rs"]
 mod scripts;
 
 /// Production entry: enrolled identity from the agent data dir, pinned keys
@@ -1197,14 +1215,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
-    fn root_grant_is_single_use_under_concurrent_runner_process_claims() {
+    fn grant_is_single_use_under_concurrent_runner_process_claims() {
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
         let mut request: serde_json::Value =
             serde_json::from_str(&valid_request_json(&challenge, &digest(b"target"))).unwrap();
-        request["os_identity"] = "root".into();
-        request["executable"] = "/usr/bin/id".into();
+        request["os_identity"] = if cfg!(windows) { "SYSTEM" } else { "root" }.into();
+        request["executable"] = if cfg!(windows) {
+            "whoami.exe"
+        } else {
+            "/usr/bin/id"
+        }
+        .into();
         request["args"] = serde_json::json!(["-u"]);
         let envelope = signed_qga_envelope(&request.to_string(), 0, fixture_binding);
         let dir = temp_dir("root-concurrency");
