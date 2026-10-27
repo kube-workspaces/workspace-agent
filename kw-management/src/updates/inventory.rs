@@ -236,7 +236,7 @@ pub fn verify(
     })
 }
 
-fn valid_nonce(value: &str) -> bool {
+pub(super) fn valid_nonce(value: &str) -> bool {
     URL_SAFE_NO_PAD
         .decode(value)
         .is_ok_and(|b| b.len() == 32 && URL_SAFE_NO_PAD.encode(b) == value)

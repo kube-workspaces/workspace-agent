@@ -169,7 +169,7 @@ impl Plan {
         digest(&raw)
     }
 
-    fn valid(&self) -> bool {
+    pub(super) fn valid(&self) -> bool {
         let b = &self.binding;
         if [
             &b.attempt_id,

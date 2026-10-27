@@ -6,6 +6,7 @@ pub mod inventory;
 pub mod journal;
 pub mod lifetime;
 pub mod persistence;
+pub mod phase;
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
