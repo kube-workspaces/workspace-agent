@@ -137,3 +137,19 @@ Use only a disposable proof VM: this test stages a fresh verification key. Its
 account/authentication fixtures and recording store are local; policy, fresh
 target resolution, Kubernetes pod exec, QGA and guest verification are real.
 Production rollout and browser acceptance are separate from that harness.
+
+For the installed request-v2 script path (also supported for Windows using its
+separate policy), opt in explicitly to the API's script harness:
+
+```sh
+KW_EXECUTION_SCRIPT_LIVE_NAMESPACE=execution-proof \
+KW_EXECUTION_SCRIPT_LIVE_WORKSPACE=linux-vm \
+go test -v -run '^TestScriptExecutionLive$' .
+```
+
+This stages a fresh test verification key and uses the same disposable-VM
+constraint. It checks identity, cwd/streams/nonzero exit, explicit UTF-8, deadline/
+output/root-exit descendant cleanup via independently recorded liveness probes,
+and complete protected script input/result. It never retries a script and stops
+after any failure or uncertain result. HTTP identity fixtures and recording are
+local/ephemeral, so this is not production IAM/browser or durable-storage proof.

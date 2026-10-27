@@ -838,7 +838,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn test_key(seed: u8) -> [u8; 32] {
+    pub(super) fn test_key(seed: u8) -> [u8; 32] {
         // The verifier is pinned with public keys; derive the point that
         // matches the throwaway signing seed.
         ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
@@ -846,7 +846,7 @@ mod tests {
             .to_bytes()
     }
 
-    fn signed_qga_envelope(
+    pub(super) fn signed_qga_envelope(
         request_json: &str,
         seed: u8,
         binding_from: impl FnOnce(&QgaCommandRequest, String) -> kw_management::QgaBinding,
@@ -1393,11 +1393,16 @@ mod tests {
 
     #[cfg(windows)]
     fn assert_recorded_child_stopped(result: &RunOutcome) {
+        assert_recorded_child_output_stopped(&result.stdout);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn assert_recorded_child_output_stopped(stdout: &[u8]) {
         use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
         use windows::Win32::System::Threading::{
             GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-        let output = String::from_utf8_lossy(&result.stdout);
+        let output = String::from_utf8_lossy(stdout);
         let pid: u32 = output
             .lines()
             .find_map(|line| line.strip_prefix("child="))
@@ -1422,7 +1427,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const START_LONG_CHILD: &str = r#"$child = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @('-n','60','127.0.0.1') -NoNewWindow -PassThru; Write-Output "child=$($child.Id)";"#;
+    pub(super) const START_LONG_CHILD: &str = r#"$child = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @('-n','60','127.0.0.1') -NoNewWindow -PassThru; Write-Output "child=$($child.Id)";"#;
 
     #[cfg(windows)]
     #[test]

@@ -75,11 +75,19 @@ policy/identity substitutions and replay; cross-compilation checks the Windows
 implementation but cannot prove its native ACL/process behavior.
 
 On a disposable Windows checkout in an explicitly authorized **LocalSystem** test
-session, run the native staging/ACL/BOM/fixed-File/nonzero-result/recovery test:
+session, run the native SYSTEM script matrix:
 
 ```powershell
 cargo test -p kw-agent system_script_acl_file_execution_and_recovery -- --ignored --nocapture
 ```
+
+The matrix covers protected ACLs/BOM/fixed-File/nonzero results and locking/
+recovery, followed by full signed request verification/replay consumption through
+real staging and supervision. Signed cases exercise explicit UTF-8 output,
+root-exit/deadline/output-limit descendant teardown and removal of staged scripts.
+It also rejects inherited/unprotected script roots and hardlinked files, then
+verifies cleanup recovery after the extra hardlink is removed. Script deadlines
+remain 20 seconds; the isolated SYSTEM task bounds the whole matrix.
 
 Ordinary Windows CI runs the non-SYSTEM denial and concurrent replay-claim tests.
 The privileged test is deliberately ignored in an ordinary user session. Windows
@@ -92,3 +100,10 @@ Follow
 with installed API/browser checks for recording, deadline/descendant cleanup,
 output flooding, missing/old guest rejection, transport loss and recovery. These
 are separate from compilation and fixture-backed UI tests.
+
+The API repository's opt-in `TestScriptExecutionLive` provides installed QGA,
+script/descendant and protected-recording proof on either OS, using
+`KW_EXECUTION_SCRIPT_LIVE_NAMESPACE` / `KW_EXECUTION_SCRIPT_LIVE_WORKSPACE`.
+It stages a fresh test verification key and must use a disposable workspace.
+The HTTP account/authentication fixtures and encrypted ephemeral recording store
+are local; deployed browser and persistent-storage acceptance remain separate.

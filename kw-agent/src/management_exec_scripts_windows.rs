@@ -384,6 +384,34 @@ impl Drop for StagedScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    fn signed_envelope(body: &str, deadline: u32) -> String {
+        // Public test-only seed/fixture, never an installed signing key.
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../kw-management/fixtures/windows-script-v2.json"
+        ))
+        .unwrap();
+        let request = &mut fixture["request"];
+        request["script"]["body"] = body.into();
+        request["deadline_seconds"] = deadline.into();
+        let challenge = kw_management::new_challenge().unwrap();
+        let id = digest(challenge.as_bytes());
+        request["execution_id"] = format!("exec_{}", &id[..24]).into();
+        request["recording_id"] = format!("rec_{}", &id[..24]).into();
+        request["challenge"] = challenge.into();
+        super::super::tests::signed_qga_envelope(&request.to_string(), 0, |request, digest| {
+            request.expected_binding(digest)
+        })
+    }
+
+    fn assert_no_staged_scripts(state: &Path) {
+        let entries: Vec<_> = fs::read_dir(state.join("scripts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("lock")]);
+    }
 
     #[test]
     fn no_ordinary_identity_can_stage_system_scripts() {
@@ -442,6 +470,74 @@ mod tests {
         let next = StagedScript::create(&state, "second", &script).unwrap();
         assert!(!leftover.exists());
         next.finish().unwrap();
+
+        // Exercise actual signature/replay admission -> private staging -> -File
+        // -> Job Object supervision, not just the isolated staging helper.
+        let child = super::super::tests::START_LONG_CHILD;
+        let cases = [
+            ("unicode", "#!powershell\n[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); [Console]::WriteLine('héllo ✓'); exit 0\n".to_string(), "completed", false, false),
+            ("root-exit-tree", format!("#!powershell\n{child} exit 0\n"), "completed", false, true),
+            ("deadline-tree", format!("#!powershell\n{child} Start-Sleep -Seconds 60\n"), "deadline", false, true),
+            ("output-limit-tree", format!("#!powershell\n{child} [Console]::Out.Write(('x' * 65536)); Start-Sleep -Seconds 60\n"), "output-limit", true, true),
+        ];
+        for (label, body, expected, truncated, has_child) in cases {
+            let envelope = signed_envelope(&body, 20);
+            let result = super::super::run_with(
+                envelope.as_bytes(),
+                &[super::super::tests::test_key(0)],
+                "workspace-uid",
+                &state,
+                1_800_000_000,
+                super::super::windows_runner::spawn,
+            );
+            assert_eq!(result.outcome, expected, "{label}: {result:?}");
+            if expected == "completed" {
+                assert_eq!(result.exit_code, Some(0), "{label}: {result:?}");
+            }
+            assert_eq!(result.truncated, truncated, "{label}: {result:?}");
+            assert!(result.duration_ms < 30_000, "{label}: {result:?}");
+            let stdout = STANDARD.decode(&result.stdout_b64).unwrap();
+            let stderr = STANDARD.decode(&result.stderr_b64).unwrap();
+            assert!(stdout.len() + stderr.len() <= kw_management::QGA_MAX_OUTPUT_BYTES);
+            if has_child {
+                super::super::tests::assert_recorded_child_output_stopped(&stdout);
+            } else {
+                assert_eq!(String::from_utf8(stdout).unwrap().trim(), "héllo ✓");
+            }
+            assert_no_staged_scripts(&state);
+            let replay = super::super::run_with(
+                envelope.as_bytes(),
+                &[super::super::tests::test_key(0)],
+                "workspace-uid",
+                &state,
+                1_800_000_000,
+                |_| panic!("replayed SYSTEM script reached spawn"),
+            );
+            assert_eq!(replay.outcome, "denied");
+            assert_no_staged_scripts(&state);
+            println!(
+                "signed SYSTEM script proof: {label}, outcome={expected}, truncated={truncated}"
+            );
+        }
+
+        // An inherited (unprotected) root must never be adopted or ACL-repaired.
+        let bad_state = state.join("inherited-state");
+        fs::create_dir(&bad_state).unwrap();
+        fs::create_dir(bad_state.join("scripts")).unwrap();
+        assert!(StagedScript::create(&bad_state, "unprotected", &script).is_err());
+        fs::remove_dir_all(bad_state).unwrap();
+
+        let hardlinked = StagedScript::create(&state, "hardlink", &script).unwrap();
+        let directory = hardlinked.directory.clone();
+        let alias = state.join("script-link.ps1");
+        fs::hard_link(hardlinked.path(), &alias).unwrap();
+        assert!(hardlinked.finish().is_err());
+        assert!(directory.exists());
+        fs::remove_file(alias).unwrap();
+        let recovered = StagedScript::create(&state, "recover-hardlink", &script).unwrap();
+        assert!(!directory.exists());
+        recovered.finish().unwrap();
+        assert_no_staged_scripts(&state);
         fs::remove_dir_all(state).unwrap();
     }
 }
