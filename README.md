@@ -31,12 +31,26 @@ not treat fixtures or CI green as guest acceptance.
 | `kw-protocol/` | Protocol types + validation (Rust; parses every fixture) |
 | `kw-core/` | Session/seat, bounded queues, resize debounce (pure logic) |
 | `kw-agent/` | Service/worker binary, diagnostics and guest acceptance examples |
+| `kw-management/` | Independent signed management grants and canonical certificate URI identities; no dedicated management listener |
 | `tools/validate_fixtures.py` | Fixture validator (no dependencies) |
 | `tools/test_validate_fixtures.py` | Validator unit tests |
 | `Makefile` | `lint` / `test` / `package` targets used by CI |
 | `scripts/verify-release-archives.py` | Release archive contract check |
 | `packaging/windows/` | Unsigned MSI (WiX) build, verify and lifecycle test |
 | `packaging/linux/` | GNOME console-user systemd service and XDG startup installer |
+
+## Management certificate identity foundation
+
+`kw-management::identity` encodes/parses the same canonical API-replica and
+workspace certificate URI identities as the API PKI. Shared conformance vectors
+cover exact trust-domain/path/role separation, workspace UID/generation/epoch,
+component bounds and rejection of URL aliases, queries and fragments.
+
+Parsing is **not authentication**. Certificate-chain, purpose, lifetime and TLS
+protocol verification plus fresh peer authorization remain required. The module
+opens no listener, provisions no machine key, enrolls no guest and grants no
+execution authority. Existing desktop enrollment and the opt-in QGA runner are
+unchanged; full management mTLS integration remains follow-up work.
 
 ## Linux GNOME/Wayland startup
 

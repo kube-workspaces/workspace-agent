@@ -1,0 +1,42 @@
+{
+  "api": [
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1",
+    "spiffe://kubeworkspaces.io/management/v1/apis/A_1.test-2"
+  ],
+  "guest": [
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/0",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/3",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/Team_1/vm.test/UID-1/Gen_2/18446744073709551615"
+  ],
+  "invalid": [
+    "",
+    "SPIFFE://kubeworkspaces.io/management/v1/apis/api-1",
+    "spiffe://KUBEWORKSPACES.IO/management/v1/apis/api-1",
+    "spiffe://foreign.example/management/v1/apis/api-1",
+    "spiffe://kubeworkspaces.io:443/management/v1/apis/api-1",
+    "spiffe://user@kubeworkspaces.io/management/v1/apis/api-1",
+    "spiffe://kubeworkspaces.io/management/v2/apis/api-1",
+    "spiffe://kubeworkspaces.io/management/v1/apis/",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1/",
+    "spiffe://kubeworkspaces.io/management/v1/apis/.api",
+    "spiffe://kubeworkspaces.io/management/v1/apis/-api",
+    "spiffe://kubeworkspaces.io/management/v1/apis/%61pi-1",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1?",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1?scope=guest",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1#guest",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1#",
+    "spiffe://kubeworkspaces.io/management/v1/apis/api-1\n",
+    "spiffe://kubeworkspaces.io/management/v1/apis/é",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/00",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/+1",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/-1",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/18446744073709551616",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/1/extra",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team//uid-1/gen-2/1",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid%2fother/gen-2/1",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/../gen-2/1",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/1?",
+    "spiffe://kubeworkspaces.io/management/v1/workspaces/team/vm/uid-1/gen-2/1#"
+  ]
+}

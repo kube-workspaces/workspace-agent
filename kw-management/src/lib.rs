@@ -10,6 +10,9 @@
 /// Offline publisher-signed update manifest contract; no installation/dispatch.
 pub mod updates;
 
+/// Management certificate URI contract; parsing alone does not establish trust.
+pub mod identity;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
