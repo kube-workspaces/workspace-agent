@@ -12,6 +12,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod challenges;
+
 pub const DOMAIN: &[u8] = b"kw-agent-upgrade-phase/v1\0";
 pub const MAX_BYTES: usize = 4096;
 pub const MAX_SECONDS: i64 = 15;
@@ -164,10 +166,12 @@ impl<S: CurrentAuthority> SignedPhaseAuthority<S> {
 impl<S: CurrentAuthority> PhaseAuthority for SignedPhaseAuthority<S> {
     fn authorize(&mut self, plan: &Plan, action: &Action, fence: u64) -> Result<(), DispatchError> {
         let (raw, signature, id) = self.response.take().ok_or(DispatchError::Authority)?;
+        // Current authority burns its outstanding challenge even when the plan
+        // or returned signature will subsequently be rejected.
+        let live = self.current.check(plan, action, fence)?;
         if !plan.valid() {
             return Err(DispatchError::Authority);
         }
-        let live = self.current.check(plan, action, fence)?;
         let expected = Permit {
             version: 1,
             audience: "agent-upgrade.phase.v1".into(),

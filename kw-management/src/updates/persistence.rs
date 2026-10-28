@@ -181,7 +181,7 @@ fn io_error(_: std::io::Error) -> Error {
     Error::Persistence
 }
 
-fn acquire(root: &Path) -> Result<File, Error> {
+pub(super) fn acquire(root: &Path) -> Result<File, Error> {
     security::check_root(root)?;
     let path = root.join("owner.lock");
     let lock = match private_new(&path) {
