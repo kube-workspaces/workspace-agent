@@ -13,6 +13,9 @@ pub mod updates;
 /// Management certificate URI contract; parsing alone does not establish trust.
 pub mod identity;
 
+/// Untrusted management leaf profile inspection, not chain/TLS authentication.
+pub mod certificate;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};

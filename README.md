@@ -52,6 +52,15 @@ opens no listener, provisions no machine key, enrolls no guest and grants no
 execution authority. Existing desktop enrollment and the opt-in QGA runner are
 unchanged; full management mTLS integration remains follow-up work.
 
+`kw-management::certificate::parse_leaf_profile` additionally inspects bounded
+DER leaves (64 KiB, at most 64 extensions), rejects duplicate extensions and
+enforces the management URI/DNS, key-purpose, key-usage and maximum-lifetime
+profile. `check_time` requires an independently sourced clock. Go-issued public
+certificate fixtures cover positive/negative profile compatibility; they contain
+no private keys. This parser **does not check certificate signatures or chains**,
+key possession, TLS negotiation or current peer authorization. Its `LeafProfile`
+is untrusted data, not permission to execute or accept a connection.
+
 ## Linux GNOME/Wayland startup
 
 Bounded root command execution is independent of desktop startup; see
