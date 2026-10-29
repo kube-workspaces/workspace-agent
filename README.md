@@ -75,6 +75,34 @@ listener or execution authority is provided by this module. The caller must use
 trusted provisioning/current state for expected identity and time, and complete
 TLS and fresh peer authorization before using any management grant or operation.
 
+`kw-management::tls::Server` supplies management-only TLS 1.3 server state, not a
+listener. It requires client certificates, exact `kw-management/1` ALPN and full
+handshakes; resumption, tickets, early data and TLS 1.2 are disabled. Pending state
+has no plaintext API. `finish` exposes an authenticated connection and the API
+leaf fingerprint only after handshake completion and fresh authorization of both
+the enrolled guest and API replica. The mandatory caller-supplied authorization
+callback must use independent current state and bounded lookup deadlines.
+
+Authority is rechecked before plaintext I/O/flush and can be renewed explicitly.
+A denial/outage or fatal TLS/I/O error permanently poisons the connection. Drivers
+must bound handshake lifetime and transport I/O themselves. Production key/CSR
+storage, enrollment, peer-state lookup, listener wiring, operation grants and
+mandatory recording/ownership are **not** provided or enabled by this foundation.
+The existing QGA runner and desktop transport remain unchanged.
+
+Native tests generate temporary in-memory credentials. A separate opt-in Go-Rust
+TLS campaign uses `tests/tls_probe.rs` as an explicitly selected loopback-only test
+subprocess; it is not a shipped listener. Build its executable with:
+
+```sh
+cargo test -p kw-management --locked --test tls_probe --no-run
+```
+
+Pass the printed absolute executable path to the API's
+`KW_MANAGEMENT_RUST_TLS_PROBE` test variable. The harness uses only generated test
+keys over bounded stdin, no live credentials or cluster access. These tests do not
+constitute guest acceptance.
+
 ## Linux GNOME/Wayland startup
 
 Bounded root command execution is independent of desktop startup; see
