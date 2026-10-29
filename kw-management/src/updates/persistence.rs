@@ -17,7 +17,7 @@ pub(crate) mod security;
 mod tests;
 
 use super::journal::{Error, Journal, Store, MAX_JOURNAL_BYTES};
-use fs2::FileExt;
+use crate::file_lock::ExclusiveFile;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -30,19 +30,11 @@ pub use security::create_root;
 /// Checkpoints are retained by the caller before admitting a subsequent attempt.
 pub struct FileStore {
     root: PathBuf,
-    _lock: File,
+    _lock: ExclusiveFile,
     head: Journal,
     uncertain: bool,
     #[cfg(test)]
     fail_after_replace: bool,
-}
-
-impl Drop for FileStore {
-    fn drop(&mut self) {
-        // Explicitly unlock before close: a concurrent Unix fork can briefly
-        // retain the same open-file description until its CLOEXEC takes effect.
-        let _ = FileExt::unlock(&self._lock);
-    }
 }
 
 impl FileStore {
@@ -181,7 +173,7 @@ fn io_error(_: std::io::Error) -> Error {
     Error::Persistence
 }
 
-pub(super) fn acquire(root: &Path) -> Result<File, Error> {
+pub(super) fn acquire(root: &Path) -> Result<ExclusiveFile, Error> {
     security::check_root(root)?;
     let path = root.join("owner.lock");
     let lock = match private_new(&path) {
@@ -196,8 +188,7 @@ pub(super) fn acquire(root: &Path) -> Result<File, Error> {
         }
     };
     security::check_file(&path)?;
-    lock.try_lock_exclusive().map_err(|_| Error::Conflict)?;
-    Ok(lock)
+    ExclusiveFile::try_lock(lock).map_err(|_| Error::Conflict)
 }
 
 #[cfg(windows)]

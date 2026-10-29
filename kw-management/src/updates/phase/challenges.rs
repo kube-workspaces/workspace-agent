@@ -3,16 +3,16 @@
 //! Use a dedicated protected root, separate from the updater journal root.
 
 use super::{CurrentAuthority, LiveContext, Permit, MAX_SECONDS};
+use crate::file_lock::ExclusiveFile;
 use crate::updates::{
     installer::Error as DispatchError,
     journal::{Action, Error, Plan},
     persistence::{acquire, private_new, replace, security, sync_root},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -62,17 +62,11 @@ struct Snapshot {
 /// the helper lifetime; deletion/backup restore requires independent recovery.
 pub struct FileChallenges {
     root: PathBuf,
-    lock: File,
+    _lock: ExclusiveFile,
     head: Snapshot,
     uncertain: bool,
     #[cfg(test)]
     fail_after_replace: bool,
-}
-
-impl Drop for FileChallenges {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.lock);
-    }
 }
 
 impl FileChallenges {
@@ -87,7 +81,7 @@ impl FileChallenges {
         }
         let mut store = Self {
             root: root.to_owned(),
-            lock,
+            _lock: lock,
             head: Snapshot {
                 version: 1,
                 pending: None,
@@ -113,7 +107,7 @@ impl FileChallenges {
         }
         Ok(Self {
             root: root.to_owned(),
-            lock,
+            _lock: lock,
             head: read(root)?,
             uncertain: false,
             #[cfg(test)]

@@ -1,5 +1,5 @@
 use super::KeyUnavailable;
-use fs2::FileExt;
+use crate::file_lock::ExclusiveFile;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
@@ -44,13 +44,8 @@ pub(super) struct Store {
     kind: Kind,
     root: PathBuf,
     directory: File,
-    file: File,
+    file: ExclusiveFile,
     hash: Option<[u8; 32]>,
-}
-impl Drop for Store {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
 }
 fn owner() -> u32 {
     // SAFETY: geteuid has no pointer arguments or caller-owned resources.
@@ -97,7 +92,11 @@ fn directory(path: &Path) -> Result<File, KeyUnavailable> {
     }
     Ok(file)
 }
-fn record_file(directory: &File, create: bool, kind: Kind) -> Result<File, KeyUnavailable> {
+fn record_file(
+    directory: &File,
+    create: bool,
+    kind: Kind,
+) -> Result<ExclusiveFile, KeyUnavailable> {
     let flags = libc::O_RDWR
         | libc::O_NONBLOCK
         | libc::O_NOFOLLOW
@@ -124,8 +123,8 @@ fn record_file(directory: &File, create: bool, kind: Kind) -> Result<File, KeyUn
     // SAFETY: openat returned a fresh owned descriptor; File closes it on every
     // error path as well as after successful use.
     let file = unsafe { File::from_raw_fd(descriptor) };
-    file.try_lock_exclusive().map_err(|_| KeyUnavailable)?;
-    let metadata = file.metadata().map_err(|_| KeyUnavailable)?;
+    let file = ExclusiveFile::try_lock(file).map_err(|_| KeyUnavailable)?;
+    let metadata = file.file().metadata().map_err(|_| KeyUnavailable)?;
     if !metadata.is_file()
         || metadata.uid() != owner()
         || metadata.mode() & 0o7777 != 0o600
@@ -188,7 +187,7 @@ impl Store {
         }
         let metadata =
             fs::symlink_metadata(self.root.join(self.kind.name())).map_err(|_| KeyUnavailable)?;
-        let held = self.file.metadata().map_err(|_| KeyUnavailable)?;
+        let held = self.file.file().metadata().map_err(|_| KeyUnavailable)?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || id(&metadata) != id(&held)
@@ -212,19 +211,29 @@ impl Store {
         if self.hash.is_some()
             || raw.is_empty()
             || raw.len() as u64 > self.kind.limit()
-            || self.file.metadata().map_err(|_| KeyUnavailable)?.len() != 0
+            || self
+                .file
+                .file()
+                .metadata()
+                .map_err(|_| KeyUnavailable)?
+                .len()
+                != 0
         {
             return Err(KeyUnavailable);
         }
         #[cfg(test)]
         if tests::partial_write_requested() {
             self.file
+                .file_mut()
                 .write_all(&raw[..raw.len() / 2])
                 .map_err(|_| KeyUnavailable)?;
             tests::checkpoint(tests::Stage::PartialWrite)?;
             return Err(KeyUnavailable);
         }
-        self.file.write_all(raw).map_err(|_| KeyUnavailable)?;
+        self.file
+            .file_mut()
+            .write_all(raw)
+            .map_err(|_| KeyUnavailable)?;
         #[cfg(test)]
         tests::checkpoint(tests::Stage::RecordWritten)?;
         self.remember(raw);
@@ -237,7 +246,7 @@ impl Store {
         self.unchanged()?;
         #[cfg(test)]
         tests::checkpoint(tests::Stage::BeforeFileSync)?;
-        self.file.sync_all().map_err(|_| KeyUnavailable)?;
+        self.file.file().sync_all().map_err(|_| KeyUnavailable)?;
         #[cfg(test)]
         tests::checkpoint(tests::Stage::FileSynced)?;
         #[cfg(test)]
@@ -260,10 +269,11 @@ impl Store {
     pub(super) fn read(&mut self) -> Result<Zeroizing<Vec<u8>>, KeyUnavailable> {
         self.check()?;
         self.file
+            .file_mut()
             .seek(SeekFrom::Start(0))
             .map_err(|_| KeyUnavailable)?;
         let mut raw = Zeroizing::new(Vec::new());
-        Read::by_ref(&mut self.file)
+        Read::by_ref(self.file.file_mut())
             .take(self.kind.limit() + 1)
             .read_to_end(&mut raw)
             .map_err(|_| KeyUnavailable)?;

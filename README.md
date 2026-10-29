@@ -176,6 +176,14 @@ cargo test -p kw-management --locked --lib credentials::linux::tests::hard_proce
 This is process-loss and injected boundary evidence, not a power-loss test or a
 guarantee about storage hardware honoring flushes.
 
+Successful file-lock acquisition immediately creates an owning guard, before any
+later validation can fail. That guard explicitly unlocks on every exit path,
+including constructor failures; closing a raw Unix descriptor alone may leave a
+lock alive in a duplicate inherited during fork/exec. The same guard is used for
+credential records, updater checkpoint locks and durable challenge locks. Failed
+contenders never get a guard and cannot unlock the active owner. This changes
+resource cleanup only, not journal recovery/replay or execution authorization.
+
 The opt-in API enrollment campaign uses the `key_probe` test executable:
 
 ```sh

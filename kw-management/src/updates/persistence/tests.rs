@@ -109,6 +109,26 @@ fn recovery_requires_independent_trusted_head_plan_and_floor() {
     assert!(reopen(&root, &next).is_ok());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_validation_scope_releases_lock_despite_inherited_description() {
+    let root = Root::new();
+    let mut inherited = None;
+    // A duplicated descriptor deterministically models the open-file description
+    // retained between a concurrent fork and exec. No unsafe multithreaded fork.
+    let rejected: Result<(), Error> = (|| {
+        let lock = acquire(&root.0)?;
+        inherited = Some(lock.file().try_clone().map_err(io_error)?);
+        Err(Error::Journal)
+    })();
+    assert_eq!(rejected, Err(Error::Journal));
+    let current = acquire(&root.0).expect("failed validation left an inherited lock behind");
+    drop(inherited);
+    assert!(matches!(acquire(&root.0), Err(Error::Conflict)));
+    drop(current);
+    assert!(acquire(&root.0).is_ok());
+}
+
 #[test]
 fn stale_cas_invalid_bytes_and_out_of_band_changes_deny() {
     let root = Root::new();

@@ -25,6 +25,8 @@ pub mod tls;
 /// Guest-held key/CSR foundations; Linux storage only, no enrollment endpoint.
 pub mod credentials;
 
+mod file_lock;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
