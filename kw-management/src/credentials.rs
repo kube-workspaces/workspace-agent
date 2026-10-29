@@ -19,6 +19,8 @@ use ed25519_dalek::{
 #[cfg(any(target_os = "linux", test))]
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use std::{path::Path, sync::Arc};
 #[cfg(any(target_os = "linux", test))]
@@ -44,6 +46,29 @@ impl std::fmt::Display for KeyUnavailable {
     }
 }
 impl std::error::Error for KeyUnavailable {}
+
+/// A certificate response verified for one exact persisted guest CSR. This is
+/// only a point-in-time validation result, not current peer/execution authority.
+/// No deserializer/unchecked constructor exists; installation is not implemented.
+pub struct EnrollmentCertificate {
+    #[cfg(target_os = "linux")]
+    identity: Identity,
+    #[cfg(target_os = "linux")]
+    csr_sha256: [u8; 32],
+    chain: Vec<Vec<u8>>,
+}
+impl std::fmt::Debug for EnrollmentCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("management enrollment certificate (scope and contents redacted)")
+    }
+}
+impl EnrollmentCertificate {
+    /// Public DER, leaf first. Future installers must revalidate after loading;
+    /// these bytes do not carry trusted roots or preserve this verified type.
+    pub fn chain_der(&self) -> &[Vec<u8>] {
+        &self.chain
+    }
+}
 
 fn guest_identity(expected: &Identity) -> Result<(), KeyUnavailable> {
     if !matches!(expected, Identity::Guest { .. }) {
@@ -211,6 +236,74 @@ impl std::fmt::Debug for MachineKey {
     }
 }
 impl MachineKey {
+    /// Verify untrusted enrollment response certificates against independently
+    /// configured roots, current trusted guest identity/time and the exact stored
+    /// CSR's public key. Never adopt trust roots from an enrollment response.
+    /// Callers must bound network input before allocation; this bounds parsing.
+    pub fn verify_enrollment_certificate(
+        &mut self,
+        expected: &Identity,
+        trust: &TrustStore,
+        chain: Vec<Vec<u8>>,
+        now: u64,
+    ) -> Result<EnrollmentCertificate, KeyUnavailable> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut inner = self.inner.lock().map_err(|_| KeyUnavailable)?;
+            inner.check(expected)?;
+            let (leaf, intermediates) = chain.split_first().ok_or(KeyUnavailable)?;
+            // TrustStore applies bounded DER/profile/path parsing before we
+            // inspect SPKI. Identity, time, EKU, DNS and issuer all must match.
+            trust
+                .verify_certificate(leaf, intermediates, expected, now)
+                .map_err(|_| KeyUnavailable)?;
+            let certificate = x509_cert::Certificate::from_der(leaf).map_err(|_| KeyUnavailable)?;
+            if certificate.tbs_certificate.subject_public_key_info
+                != public_key(&inner.request.key)?
+            {
+                return Err(KeyUnavailable);
+            }
+            inner.check(expected)?;
+            Ok(EnrollmentCertificate {
+                identity: expected.clone(),
+                csr_sha256: Sha256::digest(&inner.request.csr).into(),
+                chain,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, trust, chain, now);
+            Err(KeyUnavailable)
+        }
+    }
+
+    /// Recheck custody and exact-CSR binding, then revalidate the chain at the
+    /// current time under the supplied trust store. A prior verified response
+    /// cannot bypass expiry, root removal or replacement by another machine key.
+    pub fn tls_server_from_enrollment(
+        &mut self,
+        expected: &Identity,
+        trust: Arc<TrustStore>,
+        certificate: &EnrollmentCertificate,
+        authorize: Arc<Authorize>,
+    ) -> Result<Server, KeyUnavailable> {
+        #[cfg(target_os = "linux")]
+        {
+            let csr = self.csr_der(expected)?;
+            if &certificate.identity != expected
+                || certificate.csr_sha256 != <[u8; 32]>::from(Sha256::digest(&csr))
+            {
+                return Err(KeyUnavailable);
+            }
+            self.tls_server(expected, trust, certificate.chain.clone(), authorize)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, trust, certificate, authorize);
+            Err(KeyUnavailable)
+        }
+    }
+
     pub fn initialize(root: &Path, expected: &Identity) -> Result<Self, KeyUnavailable> {
         guest_identity(expected)?;
         #[cfg(target_os = "linux")]

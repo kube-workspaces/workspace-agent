@@ -128,6 +128,18 @@ no bootstrap token and installs/renews no certificate, starts no listener and
 grants no execution authority. Windows/other-platform storage fails closed pending
 native protection; there is no desktop-identity or plaintext-file fallback there.
 
+`verify_enrollment_certificate` validates an untrusted leaf-first DER response
+under independently configured roots and trusted current identity/time, including
+chain/profile checks and an exact match to the persisted key's public SPKI. Its
+opaque `EnrollmentCertificate` records the exact CSR digest and guest binding;
+public DER export is not itself a durable verified capability. The
+`tls_server_from_enrollment` adapter checks custody/CSR binding again and validates
+the chain under the supplied trust store at the actual current time. Previously
+verified responses cannot bypass expiry or root removal. Callers must bound input
+before allocating it; the verifier bounds certificate parsing. No response wire
+format, network client, certificate persistence/installation or renewal driver is
+provided, and successful validation grants no execution authority.
+
 The opt-in API enrollment campaign uses the `key_probe` test executable:
 
 ```sh

@@ -251,15 +251,17 @@ mod linux {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert!(MachineKey::reopen(&root, &identity()).is_err());
     }
-    #[test]
-    fn tls_states_retain_custody_and_check_it_before_handshake_processing() {
+    fn certificates_for_csr(csr: &[u8], guest: &Identity) -> (Vec<u8>, Vec<u8>) {
+        certificates_for_csr_at(csr, guest, std::time::SystemTime::now())
+    }
+    fn certificates_for_csr_at(
+        csr: &[u8],
+        guest: &Identity,
+        issued_at: std::time::SystemTime,
+    ) -> (Vec<u8>, Vec<u8>) {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use ed25519_dalek::{Signer, SigningKey};
-        use kw_management::trust::TrustStore;
-        use std::{
-            sync::Arc,
-            time::{Duration, SystemTime},
-        };
+        use std::time::Duration;
         use x509_cert::{
             der::{
                 asn1::{BitString, Ia5String, ObjectIdentifier, OctetString},
@@ -269,10 +271,6 @@ mod linux {
             request::CertReq,
             Certificate,
         };
-        let temp = Temp::new();
-        let root = temp.root();
-        let mut key = MachineKey::initialize(&root, &identity()).unwrap();
-        let csr = key.csr_der(&identity()).unwrap();
         // Fresh synthetic CA signs the stored key's public CSR. No private key
         // is extracted from the machine-key loader to construct this certificate.
         let vectors: serde_json::Value = serde_json::from_str(include_str!(
@@ -307,10 +305,10 @@ mod linux {
             .subject_public_key = BitString::from_bytes(signer.verifying_key().as_bytes()).unwrap();
         leaf.signature_algorithm = issuer.signature_algorithm.clone();
         leaf.tbs_certificate.subject_public_key_info =
-            CertReq::from_der(&csr).unwrap().info.public_key;
+            CertReq::from_der(csr).unwrap().info.public_key;
         let san = SubjectAltName(vec![
             GeneralName::UniformResourceIdentifier(
-                Ia5String::new(&identity().to_uri().unwrap()).unwrap(),
+                Ia5String::new(&guest.to_uri().unwrap()).unwrap(),
             ),
             GeneralName::DnsName(Ia5String::new("management.workspace.internal").unwrap()),
         ]);
@@ -324,14 +322,11 @@ mod linux {
             .extn_value = OctetString::new(san.to_der().unwrap()).unwrap();
         let issue = |cert: &mut Certificate, lifetime| {
             cert.tbs_certificate.signature = cert.signature_algorithm.clone();
-            cert.tbs_certificate.validity.not_before = (SystemTime::now()
-                - Duration::from_secs(30))
-            .try_into()
-            .unwrap();
-            cert.tbs_certificate.validity.not_after = (SystemTime::now()
-                + Duration::from_secs(lifetime))
-            .try_into()
-            .unwrap();
+            cert.tbs_certificate.validity.not_before =
+                (issued_at - Duration::from_secs(30)).try_into().unwrap();
+            cert.tbs_certificate.validity.not_after = (issued_at + Duration::from_secs(lifetime))
+                .try_into()
+                .unwrap();
             cert.signature = BitString::from_bytes(
                 &signer
                     .sign(&cert.tbs_certificate.to_der().unwrap())
@@ -342,6 +337,17 @@ mod linux {
         };
         let root_der = issue(&mut issuer, 86400);
         let leaf_der = issue(&mut leaf, 600);
+        (root_der, leaf_der)
+    }
+    #[test]
+    fn tls_states_retain_custody_and_check_it_before_handshake_processing() {
+        use kw_management::trust::TrustStore;
+        use std::sync::Arc;
+        let temp = Temp::new();
+        let root = temp.root();
+        let mut key = MachineKey::initialize(&root, &identity()).unwrap();
+        let csr = key.csr_der(&identity()).unwrap();
+        let (root_der, leaf_der) = certificates_for_csr(&csr, &identity());
         let server = key
             .tls_server(
                 &identity(),
@@ -371,6 +377,128 @@ mod linux {
         drop(pending);
         let mut reopened = MachineKey::reopen(&root, &identity()).unwrap();
         assert_eq!(reopened.csr_der(&identity()).unwrap(), csr);
+    }
+    #[test]
+    fn enrollment_certificate_is_bound_to_exact_csr_identity_trust_and_time() {
+        use kw_management::trust::TrustStore;
+        use std::{
+            sync::Arc,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let temp = Temp::new();
+        let root = temp.root();
+        let mut key = MachineKey::initialize(&root, &identity()).unwrap();
+        let csr = key.csr_der(&identity()).unwrap();
+        let (root_der, leaf) = certificates_for_csr(&csr, &identity());
+        let trust = Arc::new(TrustStore::new(&[root_der]).unwrap());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let chain = vec![leaf.clone()];
+        let certificate = key
+            .verify_enrollment_certificate(&identity(), &trust, chain.clone(), now)
+            .unwrap();
+        assert_eq!(certificate.chain_der(), &chain);
+        assert_eq!(
+            format!("{certificate:?}"),
+            "management enrollment certificate (scope and contents redacted)"
+        );
+        assert!(key
+            .verify_enrollment_certificate(&identity(), &trust, chain.clone(), now + 700)
+            .is_err());
+        assert!(key
+            .verify_enrollment_certificate(&identity(), &trust, chain.clone(), now - 60)
+            .is_err());
+        for invalid in [
+            vec![],
+            vec![vec![]],
+            vec![vec![0; 128 * 1024 + 1]],
+            vec![leaf.clone(); 10],
+            vec![leaf.clone(), b"invalid-intermediate".to_vec()],
+        ] {
+            assert!(key
+                .verify_enrollment_certificate(&identity(), &trust, invalid, now)
+                .is_err());
+        }
+        let mut damaged = leaf.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        assert!(key
+            .verify_enrollment_certificate(&identity(), &trust, vec![damaged], now)
+            .is_err());
+        let mut other_identity = identity();
+        if let Identity::Guest { generation, .. } = &mut other_identity {
+            *generation = "other".into();
+        }
+        let (other_root, other_leaf) = certificates_for_csr(&csr, &other_identity);
+        let other_trust = Arc::new(TrustStore::new(&[other_root]).unwrap());
+        assert!(key
+            .verify_enrollment_certificate(&identity(), &other_trust, vec![other_leaf], now)
+            .is_err());
+        assert!(key
+            .verify_enrollment_certificate(&identity(), &other_trust, chain.clone(), now)
+            .is_err());
+        assert!(key
+            .tls_server_from_enrollment(
+                &identity(),
+                other_trust,
+                &certificate,
+                Arc::new(|_, _| Ok(()))
+            )
+            .is_err());
+        let second_temp = Temp::new();
+        let mut other_key = MachineKey::initialize(&second_temp.root(), &identity()).unwrap();
+        assert!(other_key
+            .verify_enrollment_certificate(&identity(), &trust, chain, now)
+            .is_err());
+        assert!(other_key
+            .tls_server_from_enrollment(
+                &identity(),
+                trust.clone(),
+                &certificate,
+                Arc::new(|_, _| Ok(()))
+            )
+            .is_err());
+        // Invalid public responses do not poison good custody or change its CSR.
+        assert_eq!(key.csr_der(&identity()).unwrap(), csr);
+        drop(key);
+        let mut reopened = MachineKey::reopen(&root, &identity()).unwrap();
+        let server = reopened
+            .tls_server_from_enrollment(&identity(), trust, &certificate, Arc::new(|_, _| Ok(())))
+            .unwrap();
+        assert!(server.connection().is_ok());
+    }
+    #[test]
+    fn previously_verified_enrollment_does_not_bypass_tls_current_time() {
+        use kw_management::trust::TrustStore;
+        use std::{
+            sync::Arc,
+            time::{Duration, SystemTime, UNIX_EPOCH},
+        };
+        let temp = Temp::new();
+        let mut key = MachineKey::initialize(&temp.root(), &identity()).unwrap();
+        let csr = key.csr_der(&identity()).unwrap();
+        for issued_at in [
+            SystemTime::now() - Duration::from_secs(3600),
+            SystemTime::now() + Duration::from_secs(3600),
+        ] {
+            let (root, leaf) = certificates_for_csr_at(&csr, &identity(), issued_at);
+            let trust = Arc::new(TrustStore::new(&[root]).unwrap());
+            let at = issued_at.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let certificate = key
+                .verify_enrollment_certificate(&identity(), &trust, vec![leaf], at)
+                .unwrap();
+            assert!(key
+                .tls_server_from_enrollment(
+                    &identity(),
+                    trust,
+                    &certificate,
+                    Arc::new(|_, _| Ok(()))
+                )
+                .is_err());
+        }
+        assert_eq!(key.csr_der(&identity()).unwrap(), csr);
     }
     #[test]
     #[ignore = "subprocess lock holder used by process_loss_releases_ownership_without_rotating_key"]

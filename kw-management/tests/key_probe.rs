@@ -53,10 +53,16 @@ fn run() -> Result<(String, bool), KeyUnavailable> {
             .iter()
             .map(|s| STANDARD.decode(s).map_err(|_| KeyUnavailable))
             .collect::<Result<Vec<_>, _>>()?;
-        let server = key.tls_server(
+        let trust = Arc::new(TrustStore::new(&roots).map_err(|_| KeyUnavailable)?);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| KeyUnavailable)?
+            .as_secs();
+        let certificate = key.verify_enrollment_certificate(&identity, &trust, chain, now)?;
+        let server = key.tls_server_from_enrollment(
             &identity,
-            Arc::new(TrustStore::new(&roots).map_err(|_| KeyUnavailable)?),
-            chain,
+            trust,
+            &certificate,
             Arc::new(|_, _| Ok(())),
         )?;
         #[cfg(target_os = "linux")]
