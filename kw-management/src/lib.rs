@@ -22,6 +22,9 @@ pub mod trust;
 /// TLS 1.3 server states; no listener, enrollment route or execution endpoint.
 pub mod tls;
 
+/// Guest-held key/CSR foundations; Linux storage only, no enrollment endpoint.
+pub mod credentials;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};

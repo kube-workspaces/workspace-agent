@@ -103,6 +103,41 @@ Pass the printed absolute executable path to the API's
 keys over bounded stdin, no live credentials or cluster access. These tests do not
 constitute guest acceptance.
 
+### Linux guest key/CSR custody (foundation)
+
+`kw-management::credentials::MachineKey` creates a new guest-held Ed25519 key and
+an exact retry CSR in a dedicated local-filesystem root. Initialization never
+adopts an existing directory; reopening never generates/rebinds missing, corrupt
+or differently scoped material. The CSR has no requested subject/SAN identity:
+the issuer must choose scope from independently authenticated current state.
+
+Linux requires a 0700 root and 0600 single-link regular record owned by the
+effective UID, trusted non-writable ancestors (root-owned sticky temporary
+directories are supported), canonical paths and no symlink traversal. Use the
+privileged machine service in production. The record is fsynced before its public
+CSR is returned. A nonblocking file lock and live inode/permission/content checks
+fence concurrent loaders and out-of-band changes; a detected change poisons the
+live handle. No raw private-key accessor exists. TLS state retains custody after
+the loader is dropped, and checks it before handshake processing and plaintext I/O.
+
+The root contains a **secret, unencrypted** key record, not a public identity
+manifest. Never log, publish or bake it into a base image. This helper does not
+provide TPM/at-rest encryption or privileged-owner rollback protection. Roots and
+certificates supplied to its TLS adapter still need independent trust. It stores
+no bootstrap token and installs/renews no certificate, starts no listener and
+grants no execution authority. Windows/other-platform storage fails closed pending
+native protection; there is no desktop-identity or plaintext-file fallback there.
+
+The opt-in API enrollment campaign uses the `key_probe` test executable:
+
+```sh
+cargo test -p kw-management --locked --test key_probe --no-run
+```
+
+Pass the printed absolute path as `KW_MANAGEMENT_RUST_KEY_PROBE` when running the
+API's `TestRustMachineKeyEnrollmentInterop`. Tests create only synthetic credentials
+in private temporary roots and never print the guest private key.
+
 ## Linux GNOME/Wayland startup
 
 Bounded root command execution is independent of desktop startup; see

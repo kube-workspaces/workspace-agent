@@ -32,15 +32,20 @@ impl std::error::Error for TlsDenied {}
 /// replica authorization. Fail on outages and bound any lookup deadline. Neither
 /// identity may be accepted merely because a certificate has a valid CA signature.
 pub type Authorize = dyn Fn(&Identity, &Identity) -> Result<(), TlsDenied> + Send + Sync;
+pub(crate) type LocalGuard = dyn Fn(&Identity) -> Result<(), TlsDenied> + Send + Sync;
 
 struct Context {
     trust: Arc<TrustStore>,
     enrolled: Identity,
     local_chain: Vec<Vec<u8>>,
     authorize: Arc<Authorize>,
+    local_guard: Option<Arc<LocalGuard>>,
 }
 impl Context {
     fn local(&self, now: u64) -> Result<(), TlsDenied> {
+        if let Some(guard) = &self.local_guard {
+            guard(&self.enrolled)?;
+        }
         self.trust
             .verify_certificate(
                 &self.local_chain[0],
@@ -163,6 +168,16 @@ impl Server {
         pkcs8_key: Vec<u8>,
         authorize: Arc<Authorize>,
     ) -> Result<Self, TlsDenied> {
+        Self::with_local_guard(trust, enrolled, local_chain, pkcs8_key, authorize, None)
+    }
+    pub(crate) fn with_local_guard(
+        trust: Arc<TrustStore>,
+        enrolled: Identity,
+        local_chain: Vec<Vec<u8>>,
+        pkcs8_key: Vec<u8>,
+        authorize: Arc<Authorize>,
+        local_guard: Option<Arc<LocalGuard>>,
+    ) -> Result<Self, TlsDenied> {
         if !matches!(enrolled, Identity::Guest { .. })
             || local_chain.is_empty()
             || local_chain.len() > 9
@@ -176,6 +191,7 @@ impl Server {
             enrolled,
             local_chain,
             authorize,
+            local_guard,
         });
         context.local(now()?)?;
         let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
@@ -291,13 +307,25 @@ pub struct Pending {
     context: Arc<Context>,
 }
 impl Pending {
+    fn check_local(&mut self) -> Result<(), TlsDenied> {
+        if self.wire.failed {
+            return Err(TlsDenied);
+        }
+        let result = now().and_then(|now| self.context.local(now));
+        if result.is_err() {
+            self.wire.failed = true;
+        }
+        result
+    }
     pub fn read_tls(&mut self, input: &mut dyn Read) -> io::Result<usize> {
         self.wire.read_tls(input)
     }
     pub fn write_tls(&mut self, output: &mut dyn Write) -> io::Result<usize> {
+        self.check_local().map_err(|_| io_denied())?;
         self.wire.write_tls(output)
     }
     pub fn process_new_packets(&mut self) -> Result<(), TlsDenied> {
+        self.check_local()?;
         self.wire.process()
     }
     pub fn wants_read(&self) -> bool {

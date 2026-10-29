@@ -279,6 +279,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "getrandom",
+ "libc",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
@@ -287,6 +288,7 @@ dependencies = [
  "sha2",
  "windows",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
