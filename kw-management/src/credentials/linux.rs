@@ -12,9 +12,33 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const NAME: &str = "machine-key.json";
-const LIMIT: u64 = 16 * 1024;
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+    MachineKey,
+    CertificateBundle,
+}
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MachineKey => "machine-key.json",
+            Self::CertificateBundle => "certificate-bundle.json",
+        }
+    }
+    fn c_name(self) -> &'static [u8] {
+        match self {
+            Self::MachineKey => b"machine-key.json\0",
+            Self::CertificateBundle => b"certificate-bundle.json\0",
+        }
+    }
+    fn limit(self) -> u64 {
+        match self {
+            Self::MachineKey => 16 * 1024,
+            Self::CertificateBundle => 288 * 1024,
+        }
+    }
+}
 pub(super) struct Store {
+    kind: Kind,
     root: PathBuf,
     directory: File,
     file: File,
@@ -70,7 +94,7 @@ fn directory(path: &Path) -> Result<File, KeyUnavailable> {
     }
     Ok(file)
 }
-fn key_file(directory: &File, create: bool) -> Result<File, KeyUnavailable> {
+fn record_file(directory: &File, create: bool, kind: Kind) -> Result<File, KeyUnavailable> {
     let flags = libc::O_RDWR
         | libc::O_NONBLOCK
         | libc::O_NOFOLLOW
@@ -86,7 +110,7 @@ fn key_file(directory: &File, create: bool) -> Result<File, KeyUnavailable> {
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
-            b"machine-key.json\0".as_ptr().cast(),
+            kind.c_name().as_ptr().cast(),
             flags,
             0o600 as libc::mode_t,
         )
@@ -103,22 +127,29 @@ fn key_file(directory: &File, create: bool) -> Result<File, KeyUnavailable> {
         || metadata.uid() != owner()
         || metadata.mode() & 0o7777 != 0o600
         || metadata.nlink() != 1
-        || metadata.len() > LIMIT
+        || metadata.len() > kind.limit()
     {
         return Err(KeyUnavailable);
     }
     Ok(file)
 }
 impl Store {
-    pub(super) fn initialize(root: &Path) -> Result<Self, KeyUnavailable> {
+    pub(super) fn require_separate_root(&self, path: &Path) -> Result<(), KeyUnavailable> {
+        if path.starts_with(&self.root) {
+            return Err(KeyUnavailable);
+        }
+        Ok(())
+    }
+    pub(super) fn initialize(root: &Path, kind: Kind) -> Result<Self, KeyUnavailable> {
         parents(root)?;
         fs::DirBuilder::new()
             .mode(0o700)
             .create(root)
             .map_err(|_| KeyUnavailable)?;
         let directory = directory(root)?;
-        let file = key_file(&directory, true)?;
+        let file = record_file(&directory, true, kind)?;
         let store = Self {
+            kind,
             root: root.to_owned(),
             directory,
             file,
@@ -127,10 +158,11 @@ impl Store {
         store.check()?;
         Ok(store)
     }
-    pub(super) fn reopen(root: &Path) -> Result<Self, KeyUnavailable> {
+    pub(super) fn reopen(root: &Path, kind: Kind) -> Result<Self, KeyUnavailable> {
         let directory = directory(root)?;
-        let file = key_file(&directory, false)?;
+        let file = record_file(&directory, false, kind)?;
         let store = Self {
+            kind,
             root: root.to_owned(),
             directory,
             file,
@@ -147,7 +179,8 @@ impl Store {
         {
             return Err(KeyUnavailable);
         }
-        let metadata = fs::symlink_metadata(self.root.join(NAME)).map_err(|_| KeyUnavailable)?;
+        let metadata =
+            fs::symlink_metadata(self.root.join(self.kind.name())).map_err(|_| KeyUnavailable)?;
         let held = self.file.metadata().map_err(|_| KeyUnavailable)?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
@@ -155,13 +188,13 @@ impl Store {
             || held.uid() != owner()
             || held.mode() & 0o7777 != 0o600
             || held.nlink() != 1
-            || held.len() > LIMIT
+            || held.len() > self.kind.limit()
         {
             return Err(KeyUnavailable);
         }
         let entries = fs::read_dir(&self.root).map_err(|_| KeyUnavailable)?;
         for entry in entries {
-            if entry.map_err(|_| KeyUnavailable)?.file_name() != NAME {
+            if entry.map_err(|_| KeyUnavailable)?.file_name() != self.kind.name() {
                 return Err(KeyUnavailable);
             }
         }
@@ -171,7 +204,7 @@ impl Store {
         self.check()?;
         if self.hash.is_some()
             || raw.is_empty()
-            || raw.len() as u64 > LIMIT
+            || raw.len() as u64 > self.kind.limit()
             || self.file.metadata().map_err(|_| KeyUnavailable)?.len() != 0
         {
             return Err(KeyUnavailable);
@@ -196,10 +229,10 @@ impl Store {
             .map_err(|_| KeyUnavailable)?;
         let mut raw = Zeroizing::new(Vec::new());
         Read::by_ref(&mut self.file)
-            .take(LIMIT + 1)
+            .take(self.kind.limit() + 1)
             .read_to_end(&mut raw)
             .map_err(|_| KeyUnavailable)?;
-        if raw.is_empty() || raw.len() as u64 > LIMIT {
+        if raw.is_empty() || raw.len() as u64 > self.kind.limit() {
             return Err(KeyUnavailable);
         }
         self.check()?;

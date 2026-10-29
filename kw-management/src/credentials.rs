@@ -35,6 +35,7 @@ use x509_cert::{
 #[cfg(any(target_os = "linux", test))]
 use zeroize::{Zeroize, Zeroizing};
 
+mod bundles;
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -308,7 +309,7 @@ impl MachineKey {
         guest_identity(expected)?;
         #[cfg(target_os = "linux")]
         {
-            let mut storage = linux::Store::initialize(root)?;
+            let mut storage = linux::Store::initialize(root, linux::Kind::MachineKey)?;
             let request = Request::generate(expected)?;
             storage.write_once(&request.encode()?)?;
             Ok(Self {
@@ -329,7 +330,7 @@ impl MachineKey {
         guest_identity(expected)?;
         #[cfg(target_os = "linux")]
         {
-            let mut storage = linux::Store::reopen(root)?;
+            let mut storage = linux::Store::reopen(root, linux::Kind::MachineKey)?;
             let raw = storage.read()?;
             let request = Request::decode(&raw, expected)?;
             storage.remember(&raw);

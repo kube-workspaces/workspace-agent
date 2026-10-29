@@ -137,8 +137,25 @@ public DER export is not itself a durable verified capability. The
 the chain under the supplied trust store at the actual current time. Previously
 verified responses cannot bypass expiry or root removal. Callers must bound input
 before allocating it; the verifier bounds certificate parsing. No response wire
-format, network client, certificate persistence/installation or renewal driver is
-provided, and successful validation grants no execution authority.
+format, network client, live service installation or renewal driver is provided,
+and successful validation grants no execution authority.
+
+Linux `persist_enrollment_certificate` saves one freshly revalidated public bundle
+to a new, separate private root (`certificate-bundle.json`, 0600 file / 0700 root).
+It records the exact guest identity, CSR SHA-256 and leaf-first chain, but no
+private key, bootstrap token or configured trust roots. The destination cannot be
+the key root or nested inside it. Publication uses exclusive/no-follow opens and
+file/root/parent fsyncs; existing roots are never adopted or overwritten. A failed
+write may leave a partial root, which is not repaired or silently regenerated.
+
+`reopen_enrollment_certificate` checks storage ownership/modes/links/locking,
+bounded canonical encoding, exact CSR/binding, independently configured roots and
+current validity. The result is an immutable verified snapshot, **not a live
+bundle-file guard**: editing/deleting a bundle does not revoke a previously loaded
+certificate. TLS still rechecks its current trust/time and held key custody;
+authoritative revocation must be delivered separately. Snapshot persistence does
+not implement service activation, renewal, selection between generations,
+privileged-owner rollback protection or Windows storage.
 
 The opt-in API enrollment campaign uses the `key_probe` test executable:
 

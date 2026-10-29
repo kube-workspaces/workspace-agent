@@ -501,6 +501,211 @@ mod linux {
         assert_eq!(key.csr_der(&identity()).unwrap(), csr);
     }
     #[test]
+    fn durable_certificate_bundle_roundtrips_without_overwriting_key_or_existing_state() {
+        use kw_management::trust::TrustStore;
+        use std::{
+            sync::Arc,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let temp = Temp::new();
+        let root = temp.root();
+        let bundle_root = temp.0.join("certificates");
+        let mut key = MachineKey::initialize(&root, &identity()).unwrap();
+        let key_bytes = fs::read(root.join("machine-key.json")).unwrap();
+        let csr = key.csr_der(&identity()).unwrap();
+        let (root_der, leaf) = certificates_for_csr(&csr, &identity());
+        let trust = Arc::new(TrustStore::new(&[root_der]).unwrap());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let certificate = key
+            .verify_enrollment_certificate(&identity(), &trust, vec![leaf], now)
+            .unwrap();
+        key.persist_enrollment_certificate(&bundle_root, &identity(), &trust, &certificate, now)
+            .unwrap();
+        assert_eq!(fs::metadata(&bundle_root).unwrap().mode() & 0o7777, 0o700);
+        let record_path = bundle_root.join("certificate-bundle.json");
+        assert_eq!(fs::metadata(&record_path).unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(fs::metadata(&record_path).unwrap().uid(), unsafe {
+            libc::geteuid()
+        });
+        let original = fs::read(&record_path).unwrap();
+        assert!(!String::from_utf8(original.clone())
+            .unwrap()
+            .contains("private_key"));
+        assert!(key
+            .persist_enrollment_certificate(&bundle_root, &identity(), &trust, &certificate, now)
+            .is_err());
+        assert_eq!(fs::read(&record_path).unwrap(), original);
+        assert_eq!(fs::read(root.join("machine-key.json")).unwrap(), key_bytes);
+        // Bundle/key roots are not interchangeable or nested/adopted in place.
+        assert!(key
+            .persist_enrollment_certificate(&root, &identity(), &trust, &certificate, now)
+            .is_err());
+        let nested = root.join("certificates");
+        assert!(key
+            .persist_enrollment_certificate(&nested, &identity(), &trust, &certificate, now)
+            .is_err());
+        assert!(!nested.exists());
+        let empty = temp.0.join("existing-empty");
+        fs::DirBuilder::new().mode(0o700).create(&empty).unwrap();
+        assert!(key
+            .persist_enrollment_certificate(&empty, &identity(), &trust, &certificate, now)
+            .is_err());
+        assert!(key
+            .reopen_enrollment_certificate(&empty, &identity(), &trust, now)
+            .is_err());
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        assert!(key
+            .reopen_enrollment_certificate(&root, &identity(), &trust, now)
+            .is_err());
+        assert!(MachineKey::reopen(&bundle_root, &identity()).is_err());
+        drop(key);
+        let mut key = MachineKey::reopen(&root, &identity()).unwrap();
+        let loaded = key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .unwrap();
+        assert_eq!(loaded.chain_der(), certificate.chain_der());
+        assert_eq!(key.csr_der(&identity()).unwrap(), csr);
+        // Loaded public bytes form an immutable verified snapshot, NOT a live
+        // bundle-file fence. New loads deny the corruption; old snapshots still
+        // must pass TLS's current trust/time and held key-custody checks.
+        fs::write(&record_path, b"corrupt").unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        let server = key
+            .tls_server_from_enrollment(&identity(), trust, &loaded, Arc::new(|_, _| Ok(())))
+            .unwrap();
+        assert!(server.connection().is_ok());
+    }
+    #[test]
+    fn certificate_bundle_reopen_revalidates_binding_chain_time_and_private_storage() {
+        use kw_management::trust::TrustStore;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let temp = Temp::new();
+        let root = temp.root();
+        let bundle_root = temp.0.join("certificates");
+        let mut key = MachineKey::initialize(&root, &identity()).unwrap();
+        let csr = key.csr_der(&identity()).unwrap();
+        let (root_der, leaf) = certificates_for_csr(&csr, &identity());
+        let trust = TrustStore::new(&[root_der]).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let certificate = key
+            .verify_enrollment_certificate(&identity(), &trust, vec![leaf], now)
+            .unwrap();
+        // Invalid/expired input does not create a destination or poison the key.
+        assert!(key
+            .persist_enrollment_certificate(
+                &bundle_root,
+                &identity(),
+                &trust,
+                &certificate,
+                now + 700
+            )
+            .is_err());
+        assert!(!bundle_root.exists());
+        key.persist_enrollment_certificate(&bundle_root, &identity(), &trust, &certificate, now)
+            .unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now + 700)
+            .is_err());
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now - 60)
+            .is_err());
+        let (other_root, _) = certificates_for_csr(&csr, &identity());
+        let other_trust = TrustStore::new(&[other_root]).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &other_trust, now)
+            .is_err());
+        let other = Temp::new();
+        let mut other_key = MachineKey::initialize(&other.root(), &identity()).unwrap();
+        assert!(other_key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        let record_path = bundle_root.join("certificate-bundle.json");
+        let original = fs::read(&record_path).unwrap();
+        let source = String::from_utf8(original.clone()).unwrap();
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let fields: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let digest = fields["csr_sha256"].as_str().unwrap();
+        let encoded_leaf = fields["chain_der"][0].as_str().unwrap();
+        let mut broken_leaf = STANDARD.decode(encoded_leaf).unwrap();
+        let last = broken_leaf.len() - 1;
+        broken_leaf[last] ^= 1;
+        for invalid in [
+            Vec::new(),
+            b"partial".to_vec(),
+            vec![0; 288 * 1024 + 1],
+            format!("{source}\n").into_bytes(),
+            source
+                .replacen("\"version\":1", "\"version\":1,\"version\":1", 1)
+                .into_bytes(),
+            source
+                .replace(digest, &STANDARD.encode([0; 32]))
+                .into_bytes(),
+            source.replace("/uid/gen/1", "/uid/other/1").into_bytes(),
+            source
+                .replace(encoded_leaf, &STANDARD.encode(broken_leaf))
+                .into_bytes(),
+            source
+                .replace(encoded_leaf, &format!("{encoded_leaf}="))
+                .into_bytes(),
+            source
+                .replacen("\"version\":1", "\"version\":2", 1)
+                .into_bytes(),
+            source
+                .replacen("\"version\":1", "\"version\":1,\"unknown\":true", 1)
+                .into_bytes(),
+        ] {
+            fs::write(&record_path, &invalid).unwrap();
+            assert!(key
+                .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+                .is_err());
+            assert_eq!(fs::read(&record_path).unwrap(), invalid);
+        }
+        fs::write(&record_path, &original).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&record_path, temp.0.join("alias")).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        fs::remove_file(temp.0.join("alias")).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&record_path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        drop(held);
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_ok());
+        fs::set_permissions(&bundle_root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        fs::set_permissions(&bundle_root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&record_path, temp.0.join("old-bundle")).unwrap();
+        symlink(temp.0.join("old-bundle"), &record_path).unwrap();
+        assert!(key
+            .reopen_enrollment_certificate(&bundle_root, &identity(), &trust, now)
+            .is_err());
+        assert_eq!(fs::read(temp.0.join("old-bundle")).unwrap(), original);
+        assert_eq!(key.csr_der(&identity()).unwrap(), csr);
+    }
+    #[test]
     #[ignore = "subprocess lock holder used by process_loss_releases_ownership_without_rotating_key"]
     fn key_lock_child() {
         let Some(root) = std::env::var_os("KW_KEY_LOCK_TEST_ROOT") else {

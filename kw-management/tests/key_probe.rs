@@ -22,6 +22,10 @@ struct Config {
     roots: Vec<String>,
     #[serde(default)]
     certificates: Vec<String>,
+    #[serde(default)]
+    bundle_root: Option<PathBuf>,
+    #[serde(default)]
+    persist_bundle: bool,
 }
 fn run() -> Result<(String, bool), KeyUnavailable> {
     let mut raw = Vec::new();
@@ -42,7 +46,10 @@ fn run() -> Result<(String, bool), KeyUnavailable> {
     };
     let csr = key.csr_der(&identity)?;
     let mut tls_ready = false;
-    if !config.certificates.is_empty() {
+    if config.persist_bundle && (config.bundle_root.is_none() || config.certificates.is_empty()) {
+        return Err(KeyUnavailable);
+    }
+    if !config.certificates.is_empty() || config.bundle_root.is_some() {
         let roots = config
             .roots
             .iter()
@@ -58,7 +65,26 @@ fn run() -> Result<(String, bool), KeyUnavailable> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| KeyUnavailable)?
             .as_secs();
-        let certificate = key.verify_enrollment_certificate(&identity, &trust, chain, now)?;
+        let certificate = if chain.is_empty() {
+            key.reopen_enrollment_certificate(
+                config.bundle_root.as_ref().ok_or(KeyUnavailable)?,
+                &identity,
+                &trust,
+                now,
+            )?
+        } else {
+            let certificate = key.verify_enrollment_certificate(&identity, &trust, chain, now)?;
+            if config.persist_bundle {
+                key.persist_enrollment_certificate(
+                    config.bundle_root.as_ref().ok_or(KeyUnavailable)?,
+                    &identity,
+                    &trust,
+                    &certificate,
+                    now,
+                )?;
+            }
+            certificate
+        };
         let server = key.tls_server_from_enrollment(
             &identity,
             trust,
