@@ -12,6 +12,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     MachineKey,
@@ -146,6 +149,8 @@ impl Store {
             .mode(0o700)
             .create(root)
             .map_err(|_| KeyUnavailable)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::RootCreated)?;
         let directory = directory(root)?;
         let file = record_file(&directory, true, kind)?;
         let store = Self {
@@ -156,6 +161,8 @@ impl Store {
             hash: None,
         };
         store.check()?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::RecordCreated)?;
         Ok(store)
     }
     pub(super) fn reopen(root: &Path, kind: Kind) -> Result<Self, KeyUnavailable> {
@@ -209,18 +216,46 @@ impl Store {
         {
             return Err(KeyUnavailable);
         }
+        #[cfg(test)]
+        if tests::partial_write_requested() {
+            self.file
+                .write_all(&raw[..raw.len() / 2])
+                .map_err(|_| KeyUnavailable)?;
+            tests::checkpoint(tests::Stage::PartialWrite)?;
+            return Err(KeyUnavailable);
+        }
         self.file.write_all(raw).map_err(|_| KeyUnavailable)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::RecordWritten)?;
+        self.remember(raw);
+        self.seal()
+    }
+    /// Complete durability for validated bytes, including a complete record left
+    /// by a writer that died before its fsync/ACK. A successful parse is NOT a
+    /// durability fence. Callers must validate and remember the record first.
+    pub(super) fn seal(&mut self) -> Result<(), KeyUnavailable> {
+        self.unchanged()?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::BeforeFileSync)?;
         self.file.sync_all().map_err(|_| KeyUnavailable)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::FileSynced)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::BeforeDirectorySync)?;
         self.directory.sync_all().map_err(|_| KeyUnavailable)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::DirectorySynced)?;
         let parent = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.root.parent().ok_or(KeyUnavailable)?)
             .map_err(|_| KeyUnavailable)?;
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::BeforeParentSync)?;
         parent.sync_all().map_err(|_| KeyUnavailable)?;
-        self.check()?;
-        self.remember(raw);
-        Ok(())
+        #[cfg(test)]
+        tests::checkpoint(tests::Stage::ParentSynced)?;
+        self.unchanged()
     }
     pub(super) fn read(&mut self) -> Result<Zeroizing<Vec<u8>>, KeyUnavailable> {
         self.check()?;

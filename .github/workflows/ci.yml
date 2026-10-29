@@ -44,6 +44,11 @@ jobs:
           # location-free; traces make them actionable.
           RUST_BACKTRACE: 1
 
+      - name: Linux credential durability crash boundaries
+        if: matrix.os == 'ubuntu-24.04'
+        # Keep repeated fork/kill campaigns out of concurrent file-lock tests.
+        run: cargo test -p kw-management --locked --lib credentials::linux::tests::hard_process_loss_at_every_write_boundary -- --ignored --exact --test-threads=1
+
       - name: Smoke test the binary
         shell: bash
         run: |

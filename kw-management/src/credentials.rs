@@ -334,6 +334,7 @@ impl MachineKey {
             let raw = storage.read()?;
             let request = Request::decode(&raw, expected)?;
             storage.remember(&raw);
+            storage.seal()?;
             Ok(Self {
                 inner: Arc::new(Mutex::new(Inner {
                     request,

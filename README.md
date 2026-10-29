@@ -157,6 +157,25 @@ authoritative revocation must be delivered separately. Snapshot persistence does
 not implement service activation, renewal, selection between generations,
 privileged-owner rollback protection or Windows storage.
 
+Successful key/bundle reopen also completes a fresh file/root/parent fsync fence
+after validating and fingerprinting the record, with integrity checks before and
+after sync. A complete record left by a writer that died before fsync/ACK is not
+considered durable merely because it parses. Sync failure returns no reopened key
+or certificate; incomplete/corrupt state is never regenerated or repaired.
+
+The Linux hard-process-loss campaign covers seven write/durability boundaries for
+both record kinds (14 killed children), with separate injected sync-denial and
+lost-ack tests. Its hooks exist only in the library unit-test build, not production
+binaries. CI runs the fork/kill campaign separately from concurrent lock tests;
+run it explicitly with:
+
+```sh
+cargo test -p kw-management --locked --lib credentials::linux::tests::hard_process_loss_at_every_write_boundary -- --ignored --exact --test-threads=1
+```
+
+This is process-loss and injected boundary evidence, not a power-loss test or a
+guarantee about storage hardware honoring flushes.
+
 The opt-in API enrollment campaign uses the `key_probe` test executable:
 
 ```sh

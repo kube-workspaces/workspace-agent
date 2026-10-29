@@ -115,7 +115,7 @@ impl MachineKey {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let certificate = self.verify_enrollment_certificate(expected, trust, chain, now)?;
-            storage.unchanged()?;
+            storage.seal()?;
             Ok(certificate)
         }
         #[cfg(not(target_os = "linux"))]
