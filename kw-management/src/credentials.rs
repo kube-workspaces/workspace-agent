@@ -39,6 +39,9 @@ mod bundles;
 #[cfg(target_os = "linux")]
 mod linux;
 
+/// Read-only Windows directory/path preflight; does not enable Windows key storage.
+pub mod windows_custody;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyUnavailable;
 impl std::fmt::Display for KeyUnavailable {

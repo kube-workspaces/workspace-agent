@@ -194,6 +194,38 @@ Pass the printed absolute path as `KW_MANAGEMENT_RUST_KEY_PROBE` when running th
 API's `TestRustMachineKeyEnrollmentInterop`. Tests create only synthetic credentials
 in private temporary roots and never print the guest private key.
 
+### Windows custody preflight (not key storage)
+
+`credentials::windows_custody` provides a conservative `MachinePath` policy and
+read-only `DirectoryProbe`. Paths use an uppercase local DOS drive and a bounded
+ASCII component subset; UNC/device/extended namespaces, ADS, short-name syntax,
+reserved DOS devices, dot/trailing aliases and ambiguous separators are rejected.
+Case-insensitive overlap checks are component-bounded but do not resolve filesystem
+aliases. Parsing a path grants no trust or authority.
+
+On Windows, the probe opens each existing ancestor without following its final
+reparse point and retains directory handles without delete sharing. It checks
+disk/directory type, reparse flags, volume/file identity and normalized handle paths.
+The leaf must be on a fixed NTFS drive with persistent ACL support and an exact
+protected descriptor owned by Administrators or LocalSystem, granting full access
+only to LocalSystem and Administrators. Descriptor inspection uses the held handle,
+not a later path lookup; failed recheck permanently poisons that probe. No raw
+handles are exposed. Other platforms explicitly deny the native probe.
+
+This preflight neither creates nor repairs directories/ACLs and reads/writes no
+credential records. It **does not establish the full trusted-ancestor policy or
+implement Windows machine-key storage**. Handle-relative record creation, file
+ACL/link checks, locking, durability/recovery, key/CSR and TLS custody integration
+remain required. Windows `MachineKey` initialization/reopen still fail closed even
+after a successful probe; desktop identity files are never a fallback. There is
+no DPAPI/TPM protection, credential installation or execution authority here.
+
+Portable tests cover path/descriptor policy and unsupported-platform denial.
+Windows-only tests use synthetic temporary directories for read-only inspection,
+rename pinning, broad/unprotected ACL denial, live weakening/poisoning and file
+rejection. Cross-compiling/linking those tests is not native Windows runtime or
+guest acceptance; native tests must run on Windows.
+
 ## Linux GNOME/Wayland startup
 
 Bounded root command execution is independent of desktop startup; see
