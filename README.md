@@ -61,6 +61,20 @@ no private keys. This parser **does not check certificate signatures or chains**
 key possession, TLS negotiation or current peer authorization. Its `LeafProfile`
 is untrusted data, not permission to execute or accept a connection.
 
+`kw-management::trust::TrustStore` verifies certificate signatures/chains against
+explicit management DER roots, then enforces the exact expected identity,
+role-specific purpose/DNS and current time. It has no OS/web-PKI fallback. Limits
+are 16 roots, 8 intermediates, 64 KiB per certificate and 128 KiB per root/chain
+bundle. Configured root validity, EKU and path-length restrictions are retained;
+unsupported critical root constraints fail closed. Expired anchors are excluded
+on every check, allowing valid old/new roots to overlap during planned rotation.
+
+Certificate-chain verification is still **not a TLS handshake**, proof of live
+private-key possession or current authorization. No CRL/OCSP, enrollment route,
+listener or execution authority is provided by this module. The caller must use
+trusted provisioning/current state for expected identity and time, and complete
+TLS and fresh peer authorization before using any management grant or operation.
+
 ## Linux GNOME/Wayland startup
 
 Bounded root command execution is independent of desktop startup; see

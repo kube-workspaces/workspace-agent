@@ -16,6 +16,9 @@ pub mod identity;
 /// Untrusted management leaf profile inspection, not chain/TLS authentication.
 pub mod certificate;
 
+/// Explicit management-root chain verification, not live TLS/peer authority.
+pub mod trust;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};

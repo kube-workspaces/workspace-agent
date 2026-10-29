@@ -23,6 +23,10 @@ struct Case {
     #[serde(default)]
     uri: String,
     valid: bool,
+    #[serde(default)]
+    intermediates: Vec<String>,
+    #[serde(default, rename = "chain_valid")]
+    _chain_valid: Option<bool>,
 }
 
 fn vectors() -> Vectors {
@@ -40,6 +44,9 @@ fn shared_go_rust_leaf_profile_vectors() {
         Err(InvalidCertificate)
     );
     for case in vectors.cases {
+        for intermediate in &case.intermediates {
+            assert!(parse_leaf_profile(&STANDARD.decode(intermediate).unwrap()).is_err());
+        }
         let der = STANDARD.decode(&case.der).unwrap();
         let profile = parse_leaf_profile(&der);
         assert_eq!(profile.is_ok(), case.valid, "{}: {profile:?}", case.name);
