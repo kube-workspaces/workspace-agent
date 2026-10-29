@@ -165,7 +165,10 @@ impl Directory {
             let file = unsafe {
                 let raw = CreateFileW(
                     PCWSTR(name.as_ptr()),
-                    FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+                    // Attribute-only opens do not participate in Windows share
+                    // checks. Directory-read access makes no-delete sharing an
+                    // effective rename/delete fence without requesting writes.
+                    FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     None,
                     OPEN_EXISTING,
@@ -274,10 +277,18 @@ mod tests {
                 let mut dacl = std::ptr::null_mut();
                 GetSecurityDescriptorDacl(raw, &mut present, &mut dacl, &mut defaulted).unwrap();
                 assert!(present.as_bool());
+                let mut control = 0;
+                let mut revision = 0;
+                GetSecurityDescriptorControl(raw, &mut control, &mut revision).unwrap();
+                let protection = if control & SE_DACL_PROTECTED.0 != 0 {
+                    PROTECTED_DACL_SECURITY_INFORMATION
+                } else {
+                    UNPROTECTED_DACL_SECURITY_INFORMATION
+                };
                 SetNamedSecurityInfoW(
                     PCWSTR(name.as_ptr()),
                     SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    DACL_SECURITY_INFORMATION | protection,
                     PSID::default(),
                     PSID::default(),
                     Some(dacl),
@@ -319,14 +330,23 @@ mod tests {
     }
     #[test]
     fn broader_or_unprotected_acl_is_never_adopted_or_repaired() {
-        for sddl in [
+        for (case, sddl) in [
             "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)",
             "O:BAG:BAD:(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
-            "O:BAG:BAD:NO_ACCESS_CONTROL",
-        ] {
+            "O:BAG:BAD:PNO_ACCESS_CONTROL",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let temp = Temp::new();
             temp.create(sddl);
-            assert!(super::super::DirectoryProbe::open(&temp.path()).is_err());
+            // Establish the actual descriptor after Windows creation/inheritance
+            // normalization, rather than assuming the input SDDL survives it.
+            temp.set_acl(sddl);
+            assert!(
+                super::super::DirectoryProbe::open(&temp.path()).is_err(),
+                "ACL denial case {case}"
+            );
             assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 0);
         }
     }
